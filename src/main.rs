@@ -11,6 +11,7 @@ use gpui_kit::component::{
     input::{InputState, NumberInput},
     notification::Notification,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use lyon::tessellation::{LineCap, LineJoin};
 use std::cell::Cell;
@@ -170,6 +171,8 @@ struct PaintApp {
     canvas_size: Size<Pixels>,
     drawing: bool,
     resize_drag: Option<ResizeDrag>,
+    /// Canvas pixel under the mouse, shown in the status bar.
+    cursor_position: Option<Point<i32>>,
     focus_handle: FocusHandle,
     /// Canvas bounds in window coordinates from the last paint, used to map
     /// mouse positions to canvas coordinates.
@@ -219,6 +222,7 @@ impl PaintApp {
             canvas_size: DEFAULT_CANVAS_SIZE,
             drawing: false,
             resize_drag: None,
+            cursor_position: None,
             tool: Tool::Pen,
             focus_handle: cx.focus_handle(),
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -277,6 +281,23 @@ impl PaintApp {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let cursor_position = self
+            .canvas_bounds
+            .get()
+            .contains(&event.position)
+            .then(|| {
+                let position = self.to_canvas(event.position);
+                point(
+                    position.x.as_f32().floor() as i32,
+                    position.y.as_f32().floor() as i32,
+                )
+            });
+        // Only re-render when the pixel changes, not on every sub-pixel move
+        if cursor_position != self.cursor_position {
+            self.cursor_position = cursor_position;
+            cx.notify();
+        }
+
         if let Some(drag) = &self.resize_drag {
             let delta = event.position - drag.start_position;
             let (resize_width, resize_height) = drag.handle.axes();
@@ -618,12 +639,7 @@ impl Render for PaintApp {
             .child(
                 Button::new("canvas-size")
                     .outline()
-                    .label(format!(
-                        "{} × {}",
-                        self.canvas_size.width.as_f32(),
-                        self.canvas_size.height.as_f32()
-                    ))
-                    .tooltip("Canvas size")
+                    .label("Canvas Size")
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_canvas_size_dialog(window, cx)
                     })),
@@ -719,7 +735,30 @@ impl Render for PaintApp {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !hovered && this.cursor_position.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .child(canvas_area);
+
+        let status_bar = h_flex()
+            .gap_4()
+            .px_3()
+            .h(px(28.0))
+            .text_sm()
+            .text_color(theme.muted_foreground)
+            .bg(theme.background)
+            .border_t_1()
+            .border_color(theme.border)
+            .child(format!(
+                "{} × {}px",
+                self.canvas_size.width.as_f32(),
+                self.canvas_size.height.as_f32()
+            ))
+            .when_some(self.cursor_position, |this, position| {
+                this.child(format!("{}, {}px", position.x, position.y))
+            });
 
         v_flex()
             .key_context(KEY_CONTEXT)
@@ -731,6 +770,7 @@ impl Render for PaintApp {
             .text_color(theme.foreground)
             .child(toolbar)
             .child(viewport)
+            .child(status_bar)
     }
 }
 
