@@ -48,6 +48,49 @@ pub struct Floating {
     source: Option<IntRect>,
 }
 
+/// How a stroke's line is drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Brush {
+    /// A smooth, anti-aliased round line.
+    #[default]
+    Pen,
+    /// Hard-edged pixels with no anti-aliasing, for pixel art.
+    Pencil,
+    /// A flat-ended, half-transparent line.
+    Marker,
+    /// Dots sprayed at random around the line.
+    Airbrush,
+    /// A flat nib held at 45°, so the line is thick or thin by direction.
+    Calligraphy,
+}
+
+/// Brushes in toolbar order.
+pub const BRUSHES: [Brush; 5] = [
+    Brush::Pen,
+    Brush::Pencil,
+    Brush::Marker,
+    Brush::Airbrush,
+    Brush::Calligraphy,
+];
+
+impl Brush {
+    pub fn label(self) -> &'static str {
+        match self {
+            Brush::Pen => "Pen",
+            Brush::Pencil => "Pencil",
+            Brush::Marker => "Marker",
+            Brush::Airbrush => "Airbrush",
+            Brush::Calligraphy => "Calligraphy",
+        }
+    }
+}
+
+/// A stroke rendered on its own, to blend onto the canvas with its top-left at `at`.
+pub struct StrokeLayer {
+    pub pixels: Pixmap,
+    pub at: Point<i32>,
+}
+
 /// A reversible change to the canvas. Applying one returns its inverse.
 pub enum Change {
     /// Pixels to write back with their top-left at (`x`, `y`).
@@ -79,65 +122,67 @@ impl Canvas {
 
     /// Burns `stroke` into the canvas and returns the change that undoes it,
     /// or `None` when the stroke lies entirely outside the canvas.
-    ///
-    /// Strokes use round caps, and round joins unless `sharp_corners` is set,
-    /// to match the on-screen preview.
     pub fn draw_stroke(&mut self, stroke: &Stroke) -> Option<Change> {
-        let (first, rest) = stroke.points.split_first()?;
-        let mut builder = PathBuilder::new();
-        builder.move_to(first.x.as_f32(), first.y.as_f32());
-        if rest.is_empty() {
-            // Same tiny segment as the preview, so a single click leaves a dot
-            builder.line_to(first.x.as_f32() + 0.1, first.y.as_f32() + 0.1);
-        } else {
-            for p in rest {
-                builder.line_to(p.x.as_f32(), p.y.as_f32());
+        let layer = self.render_stroke(stroke)?;
+        self.stamp(&layer.pixels, layer.at)
+    }
+
+    /// Renders `stroke` on its own transparent layer, clipped to the canvas,
+    /// exactly as [`Self::draw_stroke`] will blend it in. Used to preview the
+    /// stroke being drawn.
+    ///
+    /// The whole stroke is drawn opaque and then made translucent at once, so
+    /// a translucent stroke does not darken where it crosses itself.
+    pub fn render_stroke(&self, stroke: &Stroke) -> Option<StrokeLayer> {
+        let width = stroke.width.as_f32();
+        // How far the brush reaches past the points it passes through.
+        // Anti-aliasing adds about a pixel; miter joins reach up to twice the
+        // width (tiny-skia's miter limit is 4)
+        let reach = match stroke.brush {
+            Brush::Airbrush => width,
+            Brush::Calligraphy => width / 2.0,
+            _ if stroke.sharp_corners => width * 2.0,
+            _ => width / 2.0,
+        } + 2.0;
+        let (mut left, mut top, mut right, mut bottom) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for p in &stroke.points {
+            left = left.min(p.x.as_f32());
+            top = top.min(p.y.as_f32());
+            right = right.max(p.x.as_f32());
+            bottom = bottom.max(p.y.as_f32());
+        }
+        let rect = self.clip(left - reach, top - reach, right + reach, bottom + reach)?;
+        let mut pixels = Pixmap::new(rect.width(), rect.height())?;
+        let transform = Transform::from_translate(-rect.x() as f32, -rect.y() as f32);
+
+        let color = to_skia_color(stroke.color);
+        let mut opaque = color;
+        opaque.set_alpha(1.0);
+        match stroke.brush {
+            Brush::Pen | Brush::Pencil | Brush::Marker => {
+                draw_line(&mut pixels, stroke, opaque, transform)
+            }
+            Brush::Airbrush => spray(&mut pixels, stroke, opaque, transform),
+            Brush::Calligraphy => draw_nib(&mut pixels, stroke, opaque, transform),
+        }
+
+        let opacity = color.alpha() * if stroke.brush == Brush::Marker { 0.5 } else { 1.0 };
+        if opacity < 1.0 {
+            for pixel in pixels.pixels_mut() {
+                let scale = |c: u8| (c as f32 * opacity).round() as u8;
+                *pixel = PremultipliedColorU8::from_rgba(
+                    scale(pixel.red()),
+                    scale(pixel.green()),
+                    scale(pixel.blue()),
+                    scale(pixel.alpha()),
+                )
+                .unwrap_or(*pixel);
             }
         }
-        if stroke.closed {
-            builder.close();
-        }
-        let path = builder.finish()?;
-
-        // Anti-aliasing reaches about a pixel past the stroke's edge, and
-        // miter joins up to twice the width (tiny-skia's miter limit is 4)
-        let reach = if stroke.sharp_corners { 2.0 } else { 0.5 };
-        let margin = stroke.width.as_f32() * reach + 2.0;
-        let bounds = path.bounds();
-        let rect = self.clip(
-            bounds.left() - margin,
-            bounds.top() - margin,
-            bounds.right() + margin,
-            bounds.bottom() + margin,
-        )?;
-        let undo = self.snapshot(rect)?;
-
-        let mut paint = Paint::default();
-        paint.set_color(to_skia_color(stroke.color));
-        paint.anti_alias = true;
-        if stroke.filled {
-            self.pixmap.fill_path(
-                &path,
-                &paint,
-                FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
-        }
-        let style = SkiaStroke {
-            width: stroke.width.as_f32(),
-            line_cap: LineCap::Round,
-            line_join: if stroke.sharp_corners {
-                LineJoin::Miter
-            } else {
-                LineJoin::Round
-            },
-            ..Default::default()
-        };
-        self.pixmap
-            .stroke_path(&path, &paint, &style, Transform::identity(), None);
-        self.version += 1;
-        Some(undo)
+        Some(StrokeLayer {
+            pixels,
+            at: Point::new(rect.x(), rect.y()),
+        })
     }
 
     /// Fills the region connected to `position` whose pixels have about the
@@ -523,6 +568,173 @@ fn render_scaled(
     out
 }
 
+/// Draws the pen, pencil or marker line, and the fill of closed shapes.
+fn draw_line(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Transform) {
+    let Some((first, rest)) = stroke.points.split_first() else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.set_color(color);
+    // The pencil draws whole pixels only
+    paint.anti_alias = stroke.brush != Brush::Pencil;
+
+    if rest.is_empty() && stroke.brush == Brush::Pencil {
+        // A click colors the square of pixels under the brush
+        let side = stroke.width.as_f32().round().max(1.0);
+        let x = (first.x.as_f32() - side / 2.0).round();
+        let y = (first.y.as_f32() - side / 2.0).round();
+        if let Some(rect) = tiny_skia::Rect::from_xywh(x, y, side, side) {
+            pixels.fill_rect(rect, &paint, transform, None);
+        }
+        return;
+    }
+
+    let mut builder = PathBuilder::new();
+    builder.move_to(first.x.as_f32(), first.y.as_f32());
+    if rest.is_empty() {
+        // A tiny segment, so a single click leaves a round dot
+        builder.line_to(first.x.as_f32() + 0.1, first.y.as_f32() + 0.1);
+    } else {
+        for p in rest {
+            builder.line_to(p.x.as_f32(), p.y.as_f32());
+        }
+    }
+    if stroke.closed {
+        builder.close();
+    }
+    let Some(path) = builder.finish() else {
+        return;
+    };
+    if stroke.filled {
+        pixels.fill_path(&path, &paint, FillRule::Winding, transform, None);
+    }
+    let style = SkiaStroke {
+        width: stroke.width.as_f32(),
+        // Markers have flat tips; round caps make the rest join smoothly
+        line_cap: if stroke.brush == Brush::Marker {
+            LineCap::Square
+        } else {
+            LineCap::Round
+        },
+        line_join: if stroke.sharp_corners {
+            LineJoin::Miter
+        } else {
+            LineJoin::Round
+        },
+        ..Default::default()
+    };
+    pixels.stroke_path(&path, &paint, &style, transform, None);
+}
+
+/// Sprays one-pixel dots within `width` of the line. Dots are placed at
+/// fixed steps along it and seeded per step from the stroke's seed, so the
+/// part already drawn stays the same as the stroke grows.
+fn spray(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Transform) {
+    let radius = stroke.width.as_f32().max(1.0);
+    let spacing = (radius / 2.0).max(1.0);
+    let dots_per_step = (radius * radius * 0.1).ceil().clamp(1.0, 200.0) as usize;
+    let mut paint = Paint::default();
+    paint.set_color(color);
+    paint.anti_alias = false;
+
+    let mut spray_at = |step: u64, x: f32, y: f32| {
+        let mut random = Random(stroke.seed ^ step.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        for _ in 0..dots_per_step {
+            let angle = random.next() * std::f32::consts::TAU;
+            // sqrt spreads the dots evenly over the disc instead of bunching at the center
+            let distance = random.next().sqrt() * radius;
+            let dot_x = (x + angle.cos() * distance).floor();
+            let dot_y = (y + angle.sin() * distance).floor();
+            if let Some(rect) = tiny_skia::Rect::from_xywh(dot_x, dot_y, 1.0, 1.0) {
+                pixels.fill_rect(rect, &paint, transform, None);
+            }
+        }
+    };
+
+    let Some(first) = stroke.points.first() else {
+        return;
+    };
+    let mut step = 0;
+    spray_at(step, first.x.as_f32(), first.y.as_f32());
+    // Distance along the line since the last step
+    let mut travelled = 0.0;
+    for pair in stroke.points.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        let (dx, dy) = ((to.x - from.x).as_f32(), (to.y - from.y).as_f32());
+        let length = (dx * dx + dy * dy).sqrt();
+        let mut along = spacing - travelled;
+        while along <= length {
+            step += 1;
+            let t = along / length;
+            spray_at(step, from.x.as_f32() + dx * t, from.y.as_f32() + dy * t);
+            along += spacing;
+        }
+        travelled = length - (along - spacing);
+    }
+}
+
+/// Sweeps a flat nib, `width` long and tilted 45°, along the line.
+fn draw_nib(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Transform) {
+    let half = stroke.width.as_f32() / 2.0 * std::f32::consts::FRAC_1_SQRT_2;
+    // From the nib's center to its upper-right end
+    let (nx, ny) = (half, -half);
+    let mut paint = Paint::default();
+    paint.set_color(color);
+    paint.anti_alias = true;
+
+    let xy = |p: &Point<Pixels>| (p.x.as_f32(), p.y.as_f32());
+    let segments: Vec<((f32, f32), (f32, f32))> = match stroke.points.as_slice() {
+        [] => return,
+        // A click prints the nib itself, one pixel wide
+        [only] => {
+            let (x, y) = xy(only);
+            vec![((x - 0.5, y - 0.5), (x + 0.5, y + 0.5))]
+        }
+        points => points.windows(2).map(|pair| (xy(&pair[0]), xy(&pair[1]))).collect(),
+    };
+
+    // One path for the whole stroke, so neighboring segments merge instead
+    // of leaving faint seams where their anti-aliased edges meet. Every
+    // segment's quad winds the same way, so overlaps add up rather than
+    // cancel out under the nonzero fill rule
+    let mut builder = PathBuilder::new();
+    for (a, b) in segments {
+        let mut corners = [
+            (a.0 + nx, a.1 + ny),
+            (b.0 + nx, b.1 + ny),
+            (b.0 - nx, b.1 - ny),
+            (a.0 - nx, a.1 - ny),
+        ];
+        let cross = (b.0 - a.0) * ny - (b.1 - a.1) * nx;
+        if cross < 0.0 {
+            corners.reverse();
+        }
+        builder.move_to(corners[0].0, corners[0].1);
+        for corner in &corners[1..] {
+            builder.line_to(corner.0, corner.1);
+        }
+        builder.close();
+    }
+    if let Some(path) = builder.finish() {
+        pixels.fill_path(&path, &paint, FillRule::Winding, transform, None);
+    }
+}
+
+/// A small deterministic random number generator (SplitMix64).
+struct Random(u64);
+
+impl Random {
+    /// Returns a number in `0.0..1.0`.
+    fn next(&mut self) -> f32 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        (z >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
 fn blank(width: u32, height: u32, background: Color) -> Result<Pixmap> {
     let mut pixmap =
         Pixmap::new(width, height).ok_or_else(|| anyhow!("invalid canvas size {width}x{height}"))?;
@@ -818,6 +1030,133 @@ mod tests {
         assert_eq!(rgb_at(&canvas, 3, 2), (0, 0, 0));
         canvas.apply(undo);
         assert_eq!(rgb_at(&canvas, 2, 2), (0, 0, 0));
+    }
+
+    fn brush_stroke(brush: Brush, points: &[(f32, f32)], width: f32) -> Stroke {
+        Stroke {
+            brush,
+            seed: 7,
+            ..stroke(points, 0x000000, width)
+        }
+    }
+
+    /// Distinct non-white colors on the canvas.
+    fn shades(canvas: &Canvas) -> std::collections::BTreeSet<(u8, u8, u8)> {
+        canvas
+            .pixmap
+            .pixels()
+            .iter()
+            .map(|p| (p.red(), p.green(), p.blue()))
+            .filter(|&c| c != (255, 255, 255))
+            .collect()
+    }
+
+    #[test]
+    fn pencil_draws_only_solid_pixels() {
+        let mut pencil = canvas(40, 40);
+        pencil.draw_stroke(&brush_stroke(Brush::Pencil, &[(3.0, 5.0), (35.0, 31.0)], 1.0));
+        // No anti-aliased in-between shades, unlike the pen
+        assert_eq!(shades(&pencil), [(0, 0, 0)].into());
+
+        let mut pen = canvas(40, 40);
+        pen.draw_stroke(&brush_stroke(Brush::Pen, &[(3.0, 5.0), (35.0, 31.0)], 1.0));
+        assert!(shades(&pen).len() > 1);
+    }
+
+    #[test]
+    fn pencil_click_colors_one_pixel() {
+        let mut canvas = canvas(10, 10);
+        canvas.draw_stroke(&brush_stroke(Brush::Pencil, &[(4.5, 4.5)], 1.0));
+        let colored = canvas.pixmap.pixels().iter().filter(|p| p.red() == 0).count();
+        assert_eq!(colored, 1);
+        assert_eq!(rgb_at(&canvas, 4, 4), (0, 0, 0));
+    }
+
+    #[test]
+    fn marker_is_translucent_and_does_not_darken_where_it_overlaps() {
+        let mut canvas = canvas(40, 40);
+        // Crosses itself at (20, 20)
+        let x = brush_stroke(
+            Brush::Marker,
+            &[(5.0, 5.0), (35.0, 35.0), (35.0, 5.0), (5.0, 35.0)],
+            6.0,
+        );
+        canvas.draw_stroke(&x);
+        let crossing = rgb_at(&canvas, 20, 20);
+        let single = rgb_at(&canvas, 10, 10);
+        assert_eq!(crossing, single);
+        assert!(crossing.0 > 100 && crossing.0 < 160, "{crossing:?} is not half gray");
+    }
+
+    #[test]
+    fn airbrush_sprays_sparse_dots_within_its_radius() {
+        let mut canvas = canvas(60, 60);
+        let spray = brush_stroke(Brush::Airbrush, &[(30.0, 30.0)], 10.0);
+        canvas.draw_stroke(&spray);
+        let dots: Vec<_> = (0..60u32)
+            .flat_map(|y| (0..60u32).map(move |x| (x, y)))
+            .filter(|&(x, y)| rgb_at(&canvas, x, y) != (255, 255, 255))
+            .collect();
+        assert!(!dots.is_empty());
+        // Far fewer dots than the disc's area
+        assert!(dots.len() < 100);
+        for (x, y) in dots {
+            let distance = ((x as f32 - 30.0).powi(2) + (y as f32 - 30.0).powi(2)).sqrt();
+            assert!(distance <= 12.0, "dot at ({x}, {y}) is outside the radius");
+        }
+    }
+
+    #[test]
+    fn airbrush_keeps_earlier_dots_as_the_stroke_grows() {
+        let canvas = canvas(100, 40);
+        let short = brush_stroke(Brush::Airbrush, &[(10.0, 20.0), (40.0, 20.0)], 6.0);
+        let long = brush_stroke(Brush::Airbrush, &[(10.0, 20.0), (40.0, 20.0), (90.0, 20.0)], 6.0);
+        let short = canvas.render_stroke(&short).unwrap();
+        let long = canvas.render_stroke(&long).unwrap();
+        // Compare the columns both layers cover, left of where the stroke grew
+        for y in 0..short.pixels.height() {
+            for x in 0..30 {
+                let a = short.pixels.pixel(x, y).unwrap().alpha();
+                let b = long.pixels.pixel(x, y).unwrap().alpha();
+                assert_eq!(a, b, "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn calligraphy_is_thick_or_thin_by_direction() {
+        let thickness = |points: &[(f32, f32)], probe: (u32, u32), step: (i32, i32)| {
+            let mut canvas = canvas(60, 60);
+            canvas.draw_stroke(&brush_stroke(Brush::Calligraphy, points, 12.0));
+            // Count dark pixels across the line through `probe`
+            (-20..=20)
+                .filter(|i| {
+                    let x = probe.0 as i32 + step.0 * i;
+                    let y = probe.1 as i32 + step.1 * i;
+                    (0..60).contains(&x) && (0..60).contains(&y)
+                        && rgb_at(&canvas, x as u32, y as u32).0 < 128
+                })
+                .count()
+        };
+        // The nib runs from lower-left to upper-right, so a stroke along
+        // that diagonal is a hairline and one across it is full width
+        let along_nib = thickness(&[(10.0, 50.0), (50.0, 10.0)], (30, 30), (1, 1));
+        let across_nib = thickness(&[(10.0, 10.0), (50.0, 50.0)], (30, 30), (1, -1));
+        assert!(along_nib <= 2, "{along_nib}");
+        assert!(across_nib >= 7, "{across_nib}");
+    }
+
+    #[test]
+    fn calligraphy_has_no_seams_between_segments() {
+        let mut canvas = canvas(60, 60);
+        // Many short segments across the nib, as a slow mouse drag makes
+        let points: Vec<_> = (0..=40).map(|i| (10.0 + i as f32, 10.0 + i as f32)).collect();
+        canvas.draw_stroke(&brush_stroke(Brush::Calligraphy, &points, 12.0));
+        // Down the middle of the stroke every pixel is fully covered
+        for i in 5..35 {
+            let (x, y) = (10 + i, 10 + i);
+            assert_eq!(rgb_at(&canvas, x, y), (0, 0, 0), "seam at ({x}, {y})");
+        }
     }
 
     #[test]

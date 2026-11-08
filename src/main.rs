@@ -14,7 +14,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use canvas::{Canvas, Change, Floating, PixelRect};
+use canvas::{BRUSHES, Brush, Canvas, Change, Floating, PixelRect, StrokeLayer};
 use image::{Frame, RgbaImage};
 use lyon::tessellation::{LineCap, LineJoin};
 use std::cell::{Cell, RefCell};
@@ -102,6 +102,9 @@ struct Stroke {
     filled: bool,
     /// Miter joins instead of round ones, for rectangles and polygons.
     sharp_corners: bool,
+    brush: Brush,
+    /// Seeds the airbrush's spray pattern.
+    seed: u64,
 }
 
 /// The selected rectangle, in canvas pixels.
@@ -194,6 +197,7 @@ struct ShapeDrag {
 enum Tool {
     /// Selects a rectangle to move, copy, cut or delete.
     Select,
+    /// Draws freehand with the brush chosen in the toolbar.
     Pen,
     /// Paints with the canvas background color, so erasing is undoable like any stroke.
     Eraser,
@@ -222,7 +226,7 @@ impl Tool {
     fn label(self) -> &'static str {
         match self {
             Tool::Select => "Select",
-            Tool::Pen => "Pen",
+            Tool::Pen => "Brush",
             Tool::Eraser => "Eraser",
             Tool::Eyedropper => "Eyedropper",
             Tool::Fill => "Fill",
@@ -276,6 +280,14 @@ struct PaintApp {
     canvas_size: Size<Pixels>,
     /// The stroke being drawn, not yet burned into `canvas`.
     current_stroke: Option<Stroke>,
+    /// `current_stroke` rendered as it will be burned in, to preview it.
+    stroke_preview: Option<StrokeLayer>,
+    /// Bumped whenever the stroke preview changes, to refresh its cached image.
+    stroke_preview_id: u64,
+    stroke_cache: Rc<RefCell<ViewCache>>,
+    brush: Brush,
+    /// Strokes made so far, to give each airbrush stroke its own spray pattern.
+    stroke_count: u64,
     shape_kind: ShapeKind,
     /// Whether rectangles, ellipses and polygons are filled with the brush color.
     shape_filled: bool,
@@ -382,6 +394,11 @@ impl PaintApp {
             redo_stack: Vec::new(),
             canvas_size: DEFAULT_CANVAS_SIZE,
             current_stroke: None,
+            stroke_preview: None,
+            stroke_preview_id: 0,
+            stroke_cache: Rc::default(),
+            brush: Brush::Pen,
+            stroke_count: 0,
             shape_kind: ShapeKind::Rectangle,
             shape_filled: false,
             shape_drag: None,
@@ -432,10 +449,10 @@ impl PaintApp {
             return;
         }
         let position = self.to_canvas(event.position);
-        let color = match self.tool {
+        let (color, brush) = match self.tool {
             Tool::Select => return,
-            Tool::Pen => self.color,
-            Tool::Eraser => rgb(CANVAS_BACKGROUND).into(),
+            Tool::Pen => (self.color, self.brush),
+            Tool::Eraser => (rgb(CANVAS_BACKGROUND).into(), Brush::Pen),
             Tool::Eyedropper => {
                 self.pick_color(position, window, cx);
                 return;
@@ -453,12 +470,24 @@ impl PaintApp {
                 return;
             }
         };
+        self.stroke_count += 1;
         self.current_stroke = Some(Stroke {
             points: vec![position],
             color,
             width: self.width,
+            brush,
+            seed: self.stroke_count,
             ..Default::default()
         });
+        self.update_stroke_preview(cx);
+    }
+
+    fn update_stroke_preview(&mut self, cx: &mut Context<Self>) {
+        self.stroke_preview = self
+            .current_stroke
+            .as_ref()
+            .and_then(|stroke| self.canvas.render_stroke(stroke));
+        self.stroke_preview_id += 1;
         cx.notify();
     }
 
@@ -606,6 +635,7 @@ impl PaintApp {
             closed: finished,
             filled: finished && self.shape_filled,
             sharp_corners: true,
+            ..Default::default()
         }
     }
 
@@ -993,7 +1023,7 @@ impl PaintApp {
         let position = self.to_canvas(event.position);
         if let Some(stroke) = &mut self.current_stroke {
             stroke.points.push(position);
-            cx.notify();
+            self.update_stroke_preview(cx);
         }
     }
 
@@ -1005,6 +1035,7 @@ impl PaintApp {
         {
             self.record(undo, cx);
         }
+        self.stroke_preview = None;
         if let Some(stroke) = self.current_stroke.take()
             && let Some(undo) = self.canvas.draw_stroke(&stroke)
         {
@@ -1263,6 +1294,23 @@ impl Render for PaintApp {
                         }
                     })),
             )
+            .when(self.tool == Tool::Pen, |this| {
+                this.child(
+                    ButtonGroup::new("brush")
+                        .outline()
+                        .children(BRUSHES.map(|brush| {
+                            Button::new(brush.label())
+                                .label(brush.label())
+                                .selected(self.brush == brush)
+                        }))
+                        .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
+                            if let Some(&brush) = clicks.first().and_then(|ix| BRUSHES.get(*ix)) {
+                                this.brush = brush;
+                                cx.notify();
+                            }
+                        })),
+                )
+            })
             .when(self.tool == Tool::Shape, |this| {
                 this.child(
                     ButtonGroup::new("shape")
@@ -1368,7 +1416,8 @@ impl Render for PaintApp {
         let view_cache = self.view_cache.clone();
         let floating_cache = self.floating_cache.clone();
         let text_cache = self.text_cache.clone();
-        let preview = self.current_stroke.clone().or_else(|| self.shape_preview());
+        let stroke_cache = self.stroke_cache.clone();
+        let preview = self.shape_preview();
         let app = cx.entity();
 
         let zoom = self.zoom();
@@ -1460,6 +1509,21 @@ impl Render for PaintApp {
                                     at,
                                     zoom,
                                     &mut text_cache.borrow_mut(),
+                                );
+                            }
+                            if let Some(layer) = &app.stroke_preview {
+                                let at = bounds.origin
+                                    + point(
+                                        px(layer.at.x as f32 * zoom),
+                                        px(layer.at.y as f32 * zoom),
+                                    );
+                                paint_floating(
+                                    window,
+                                    &layer.pixels,
+                                    app.stroke_preview_id,
+                                    at,
+                                    zoom,
+                                    &mut stroke_cache.borrow_mut(),
                                 );
                             }
                             if let Some(stroke) = &preview {
