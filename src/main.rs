@@ -5,7 +5,12 @@ use gpui_kit::component::{
     slider::{Slider, SliderEvent, SliderState, SliderValue},
     v_flex,
 };
-use gpui_kit::component::{WindowExt as _, notification::Notification};
+use gpui_kit::component::{
+    WindowExt as _,
+    dialog::DialogFooter,
+    input::{InputState, NumberInput},
+    notification::Notification,
+};
 use gpui_kit::*;
 use lyon::tessellation::{LineCap, LineJoin};
 use std::cell::Cell;
@@ -20,6 +25,9 @@ const DEFAULT_CANVAS_SIZE: Size<Pixels> = Size {
     width: px(800.0),
     height: px(600.0),
 };
+/// Largest canvas side in pixels. Fill and eyedropper rasterize the canvas at
+/// the screen's scale factor, so a 2x screen needs about 4 * 8192^2 bytes.
+const MAX_CANVAS_SIDE: u32 = 4096;
 const KEY_CONTEXT: &str = "PaintApp";
 const CANVAS_BACKGROUND: u32 = 0xffffff;
 
@@ -78,6 +86,8 @@ enum HistoryEntry {
     Add,
     /// The canvas was cleared; holds the items that were removed.
     Clear(Vec<Item>),
+    /// The canvas was resized; holds the size before the change.
+    Resize(Size<Pixels>),
 }
 
 /// A change that was undone and can be reapplied.
@@ -86,6 +96,8 @@ enum RedoEntry {
     Add(Item),
     /// Clears the canvas again.
     Clear,
+    /// Holds the size to resize the canvas to again.
+    Resize(Size<Pixels>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -305,6 +317,9 @@ impl PaintApp {
                 self.items = removed;
                 RedoEntry::Clear
             }
+            Some(HistoryEntry::Resize(size)) => {
+                RedoEntry::Resize(std::mem::replace(&mut self.canvas_size, size))
+            }
             None => return,
         };
         self.redo_stack.push(redo);
@@ -321,10 +336,112 @@ impl PaintApp {
                 HistoryEntry::Add
             }
             Some(RedoEntry::Clear) => HistoryEntry::Clear(std::mem::take(&mut self.items)),
+            Some(RedoEntry::Resize(size)) => {
+                HistoryEntry::Resize(std::mem::replace(&mut self.canvas_size, size))
+            }
             None => return,
         };
         self.history.push(entry);
         cx.notify();
+    }
+
+    /// Resizes the canvas, keeping the drawing anchored at the top-left.
+    ///
+    /// Items outside the new size are hidden, not removed, so enlarging the
+    /// canvas again brings them back.
+    fn resize_canvas(&mut self, size: Size<Pixels>, cx: &mut Context<Self>) {
+        if size == self.canvas_size {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.canvas_size, size);
+        self.history.push(HistoryEntry::Resize(previous));
+        self.redo_stack.clear();
+        cx.notify();
+    }
+
+    fn open_canvas_size_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let side_input = |side: Pixels, window: &mut Window, cx: &mut Context<Self>| {
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(format!("{}", side.as_f32()))
+                    .validate(|text, _| text.chars().all(|c| c.is_ascii_digit()))
+                    .min(1.0)
+                    .max(MAX_CANVAS_SIDE as f64)
+            })
+        };
+        let width_input = side_input(self.canvas_size.width, window, cx);
+        let height_input = side_input(self.canvas_size.height, window, cx);
+        width_input.update(cx, |input, cx| input.focus(window, cx));
+
+        let this = cx.entity().downgrade();
+        // Returns whether the dialog should close
+        let apply: Rc<dyn Fn(&mut Window, &mut App) -> bool> = Rc::new({
+            let width_input = width_input.clone();
+            let height_input = height_input.clone();
+            move |window, cx| {
+                let parse = |input: &Entity<InputState>| {
+                    input
+                        .read(cx)
+                        .value()
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|side| (1..=MAX_CANVAS_SIDE).contains(side))
+                };
+                let (Some(width), Some(height)) = (parse(&width_input), parse(&height_input))
+                else {
+                    window.push_notification(
+                        Notification::error(format!(
+                            "Width and height must be between 1 and {MAX_CANVAS_SIDE}"
+                        )),
+                        cx,
+                    );
+                    return false;
+                };
+                let size = size(px(width as f32), px(height as f32));
+                this.update(cx, |this, cx| this.resize_canvas(size, cx)).ok();
+                true
+            }
+        });
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            let row = |label: &'static str, input: &Entity<InputState>| {
+                h_flex()
+                    .gap_3()
+                    .child(div().w(px(56.0)).child(label))
+                    .child(NumberInput::new(input).suffix("px").flex_1())
+            };
+            let on_ok = apply.clone();
+            let ok = apply.clone();
+            dialog
+                .title("Canvas Size")
+                .w(px(320.0))
+                .on_ok(move |_, window, cx| on_ok(window, cx))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(row("Width", &width_input))
+                        .child(row("Height", &height_input)),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("cancel")
+                                .outline()
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("ok")
+                                .primary()
+                                .label("OK")
+                                .on_click(move |_, window, cx| {
+                                    if ok(window, cx) {
+                                        window.close_dialog(cx);
+                                    }
+                                }),
+                        ),
+                )
+        });
     }
 
     fn save_png(&mut self, _: &SavePng, window: &mut Window, cx: &mut Context<Self>) {
@@ -420,6 +537,19 @@ impl Render for PaintApp {
                     .outline()
                     .label("Clear")
                     .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
+            )
+            .child(
+                Button::new("canvas-size")
+                    .outline()
+                    .label(format!(
+                        "{} × {}",
+                        self.canvas_size.width.as_f32(),
+                        self.canvas_size.height.as_f32()
+                    ))
+                    .tooltip("Canvas size")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_canvas_size_dialog(window, cx)
+                    })),
             )
             .child(
                 Button::new("save")
