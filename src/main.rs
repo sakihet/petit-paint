@@ -34,6 +34,7 @@ actions!(
         Redo,
         OpenImage,
         SavePng,
+        CloseWindow,
         SelectAll,
         CopySelection,
         CutSelection,
@@ -295,6 +296,12 @@ struct PaintApp {
     erase_base: Option<Pixmap>,
     /// The PNG file last opened or saved, suggested when saving.
     document_path: Option<PathBuf>,
+    /// `canvas.version()` when the drawing was last opened or saved.
+    saved_version: u64,
+    /// Set once the user agreed to close with unsaved changes.
+    close_confirmed: bool,
+    /// Whether the save-changes prompt is showing; gpui allows only one at a time.
+    confirming: bool,
     /// Restores what the eraser stroke so far has removed.
     erase_undo: Option<Change>,
     shape_kind: ShapeKind,
@@ -361,6 +368,13 @@ impl PaintApp {
                 .default_value(DEFAULT_FONT_SIZE)
         });
 
+        // Ask before closing the window over unsaved changes
+        let this = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            this.update(cx, |this, cx| this.should_close(window, cx))
+                .unwrap_or(true)
+        });
+
         let _subscriptions = vec![
             cx.subscribe_in(&color_picker, window, |this, _, event, _, cx| {
                 let ColorPickerEvent::Change(Some(color)) = event else {
@@ -411,6 +425,9 @@ impl PaintApp {
             stroke_count: 0,
             erase_base: None,
             document_path: None,
+            saved_version: 0,
+            close_confirmed: false,
+            confirming: false,
             erase_undo: None,
             shape_kind: ShapeKind::Rectangle,
             shape_filled: false,
@@ -1262,9 +1279,100 @@ impl PaintApp {
         });
     }
 
+    /// Whether the drawing has changes that were not saved. Undoing back to
+    /// the saved state still counts as changed.
+    fn is_dirty(&self) -> bool {
+        let floating = self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.floating.is_some());
+        let typing = self
+            .text_edit
+            .as_ref()
+            .is_some_and(|edit| edit.preview.is_some());
+        self.canvas.version() != self.saved_version || floating || typing
+    }
+
+    fn document_name(&self) -> String {
+        self.document_path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map_or("Untitled".into(), |name| name.to_string_lossy().into_owned())
+    }
+
+    /// Runs `then` right away when there are no unsaved changes. Otherwise
+    /// asks whether to save them first, and runs it unless the user cancels
+    /// or the save does not happen.
+    fn confirm_discard(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        if !self.is_dirty() {
+            then(self, window, cx);
+            return;
+        }
+        if self.confirming {
+            return;
+        }
+        self.confirming = true;
+        let message = format!("Do you want to save changes to {}?", self.document_name());
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            Some("Your changes will be lost if you don't save them."),
+            &["Save", "Don't Save", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = answer.await;
+            this.update(cx, |this, _| this.confirming = false).ok();
+            let Ok(answer) = answer else {
+                return;
+            };
+            let proceed = match answer {
+                0 => match this.update_in(cx, |this, window, cx| this.save(window, cx)) {
+                    Ok(saved) => saved.await,
+                    Err(_) => false,
+                },
+                1 => true,
+                _ => false,
+            };
+            if proceed {
+                this.update_in(cx, |this, window, cx| then(this, window, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Whether the window may close now. With unsaved changes it asks first
+    /// and closes the window itself once the user decides.
+    fn should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.close_confirmed || !self.is_dirty() {
+            return true;
+        }
+        self.confirm_discard(window, cx, |this, window, _| {
+            this.close_confirmed = true;
+            window.remove_window();
+        });
+        false
+    }
+
+    fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
+        if self.should_close(window, cx) {
+            window.remove_window();
+        }
+    }
+
+    fn open_image(&mut self, _: &OpenImage, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_discard(window, cx, |this, window, cx| this.choose_image(window, cx));
+    }
+
     /// Opens a PNG file as the canvas, at its size and with its transparency.
     /// Replacing the canvas is one undo step, so an accidental open can be undone.
-    fn open_image(&mut self, _: &OpenImage, window: &mut Window, cx: &mut Context<Self>) {
+    fn choose_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -1314,15 +1422,23 @@ impl PaintApp {
         self.record(undo, cx);
         self.canvas_size = self.canvas.size();
         self.document_path = Some(path);
+        self.saved_version = self.canvas.version();
         cx.notify();
     }
 
     fn save_png(&mut self, _: &SavePng, window: &mut Window, cx: &mut Context<Self>) {
+        self.save(window, cx).detach();
+    }
+
+    /// Asks where to save and writes the PNG there. The task resolves to
+    /// whether the drawing was saved.
+    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
         // Include floating pixels, and encode now so the image reflects the
         // drawing at the time of the request
         self.commit_selection(cx);
         self.commit_text(cx);
         let png = self.canvas.encode_png();
+        let version = self.canvas.version();
         // Suggest the file last opened or saved, so saving again overwrites it
         let directory = self
             .document_path
@@ -1348,20 +1464,27 @@ impl PaintApp {
             }
             .await;
 
-            let notification = match result {
+            let (notification, saved) = match result {
                 Ok(Some(path)) => {
                     let notification = Notification::success(format!("Saved {}", path.display()));
-                    this.update(cx, |this, _| this.document_path = Some(path))
-                        .ok();
-                    notification
+                    this.update(cx, |this, _| {
+                        this.document_path = Some(path);
+                        // Changes made while the dialog was open are still unsaved
+                        this.saved_version = version;
+                    })
+                    .ok();
+                    (notification, true)
                 }
-                Ok(None) => return,
-                Err(err) => Notification::error(format!("Failed to save PNG: {err:#}")),
+                Ok(None) => return false,
+                Err(err) => (
+                    Notification::error(format!("Failed to save PNG: {err:#}")),
+                    false,
+                ),
             };
             cx.update(|window, cx| window.push_notification(notification, cx))
                 .ok();
+            saved
         })
-        .detach();
     }
 }
 
@@ -1775,6 +1898,7 @@ impl Render for PaintApp {
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::save_png))
             .on_action(cx.listener(Self::open_image))
+            .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::cut_selection))
@@ -1991,6 +2115,7 @@ fn main() {
             KeyBinding::new(with_modifier!("shift-z"), Redo, context),
             KeyBinding::new(with_modifier!("s"), SavePng, context),
             KeyBinding::new(with_modifier!("o"), OpenImage, context),
+            KeyBinding::new(with_modifier!("w"), CloseWindow, context),
             KeyBinding::new(with_modifier!("a"), SelectAll, context),
             KeyBinding::new(with_modifier!("c"), CopySelection, context),
             KeyBinding::new(with_modifier!("x"), CutSelection, context),
@@ -2023,6 +2148,13 @@ fn main() {
             },
         )
         .expect("failed to open window");
+        // Quit with the last window, as there is no way to open another
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
         cx.activate(true);
     });
 }
