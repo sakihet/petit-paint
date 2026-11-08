@@ -5,9 +5,14 @@ use gpui_kit::component::{
     slider::{Slider, SliderEvent, SliderState, SliderValue},
     v_flex,
 };
+use gpui_kit::component::{WindowExt as _, notification::Notification};
 use gpui_kit::*;
+use std::cell::Cell;
+use std::rc::Rc;
 
-actions!(petit_paint, [Undo, Redo]);
+mod export;
+
+actions!(petit_paint, [Undo, Redo, SavePng]);
 
 const DEFAULT_WIDTH: f32 = 4.0;
 const KEY_CONTEXT: &str = "PaintApp";
@@ -18,10 +23,14 @@ const CANVAS_BACKGROUND: u32 = 0xffffff;
 const UNDO_KEYS: &[&str] = &["cmd-z"];
 #[cfg(target_os = "macos")]
 const REDO_KEYS: &[&str] = &["cmd-shift-z"];
+#[cfg(target_os = "macos")]
+const SAVE_KEY: &str = "cmd-s";
 #[cfg(not(target_os = "macos"))]
 const UNDO_KEYS: &[&str] = &["ctrl-z"];
 #[cfg(not(target_os = "macos"))]
 const REDO_KEYS: &[&str] = &["ctrl-shift-z", "ctrl-y"];
+#[cfg(not(target_os = "macos"))]
+const SAVE_KEY: &str = "ctrl-s";
 
 /// A single brush stroke. Points are stored in window coordinates.
 struct Stroke {
@@ -60,6 +69,8 @@ struct PaintApp {
     redo_stack: Vec<RedoEntry>,
     drawing: bool,
     focus_handle: FocusHandle,
+    /// Canvas bounds from the last paint, used to crop the PNG export.
+    canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
     color: Hsla,
     width: Pixels,
     color_picker: Entity<ColorPickerState>,
@@ -105,6 +116,7 @@ impl PaintApp {
             drawing: false,
             tool: Tool::Pen,
             focus_handle: cx.focus_handle(),
+            canvas_bounds: Rc::new(Cell::new(Bounds::default())),
             color,
             width: px(DEFAULT_WIDTH),
             color_picker,
@@ -195,6 +207,38 @@ impl PaintApp {
         self.history.push(entry);
         cx.notify();
     }
+
+    fn save_png(&mut self, _: &SavePng, window: &mut Window, cx: &mut Context<Self>) {
+        // Encode now so the image reflects the drawing at the time of the request
+        let png = export::encode_png(
+            &self.strokes,
+            self.canvas_bounds.get(),
+            rgb(CANVAS_BACKGROUND).into(),
+            window.scale_factor(),
+        );
+        let directory = std::env::home_dir().unwrap_or_default();
+        let path = cx.prompt_for_new_path(&directory, Some("untitled.png"));
+
+        cx.spawn_in(window, async move |_, cx| {
+            let result = async {
+                let Some(path) = path.await?? else {
+                    return Ok(None);
+                };
+                std::fs::write(&path, png?)?;
+                anyhow::Ok(Some(path))
+            }
+            .await;
+
+            let notification = match result {
+                Ok(Some(path)) => Notification::success(format!("Saved {}", path.display())),
+                Ok(None) => return,
+                Err(err) => Notification::error(format!("Failed to save PNG: {err:#}")),
+            };
+            cx.update(|window, cx| window.push_notification(notification, cx))
+                .ok();
+        })
+        .detach();
+    }
 }
 
 impl Render for PaintApp {
@@ -266,7 +310,18 @@ impl Render for PaintApp {
                     .outline()
                     .label("Clear")
                     .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
+            )
+            .child(
+                Button::new("save")
+                    .outline()
+                    .label("Save PNG")
+                    .tooltip_with_action("Save as PNG", &SavePng, Some(KEY_CONTEXT))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.save_png(&SavePng, window, cx)),
+                    ),
             );
+
+        let canvas_bounds = self.canvas_bounds.clone();
 
         let canvas_area = div()
             .flex_1()
@@ -280,6 +335,7 @@ impl Render for PaintApp {
                 canvas(
                     |_, _, _| {},
                     move |bounds, _, window, _| {
+                        canvas_bounds.set(bounds);
                         window.paint_layer(bounds, |window| {
                             for (points, color, width) in &strokes {
                                 paint_stroke(window, points, *color, *width);
@@ -295,6 +351,7 @@ impl Render for PaintApp {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
+            .on_action(cx.listener(Self::save_png))
             .size_full()
             .text_color(theme.foreground)
             .child(toolbar)
@@ -332,7 +389,8 @@ fn main() {
                     REDO_KEYS
                         .iter()
                         .map(|key| KeyBinding::new(key, Redo, Some(KEY_CONTEXT))),
-                ),
+                )
+                .chain([KeyBinding::new(SAVE_KEY, SavePng, Some(KEY_CONTEXT))]),
         );
         let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
         gpui_kit::open_window(
