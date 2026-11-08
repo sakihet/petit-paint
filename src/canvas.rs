@@ -7,6 +7,22 @@ use tiny_skia::{
 
 use crate::Stroke;
 
+/// Grid lines drawn over the canvas view.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Grid {
+    /// Lines between pixels, shown once pixels are large enough to see them apart.
+    pub pixels: bool,
+    /// Lines every this many pixels, for tiles and sprite sheets.
+    pub tile: Option<u32>,
+}
+
+/// Displayed pixels must be at least this many device pixels wide for the
+/// pixel grid to show; smaller, the lines would cover the drawing.
+const MIN_PIXEL_GRID_SPACING: f32 = 4.0;
+/// Grid line colors as (gray level, opacity out of 255).
+const PIXEL_GRID_LINE: (u8, u8) = (128, 80);
+const TILE_GRID_LINE: (u8, u8) = (0, 160);
+
 /// Checkerboard shades behind transparent pixels.
 const CHECKER_LIGHT: u8 = 0xff;
 const CHECKER_DARK: u8 = 0xdd;
@@ -463,13 +479,15 @@ impl Canvas {
     /// for example while a resize drag is enlarging it, show the background.
     ///
     /// Transparency shows as a checkerboard of `checker_size` device pixel
-    /// squares, which stay the same size on screen at any zoom.
+    /// squares, which stay the same size on screen at any zoom, and `grid`
+    /// lines are drawn on top.
     pub fn render_view(
         &self,
         origin: Point<u32>,
         region: Size<u32>,
         pixels_per_canvas_pixel: f32,
         checker_size: f32,
+        grid: Grid,
     ) -> Vec<u8> {
         let background = bgra(self.background.premultiply().to_color_u8());
         let mut bytes = render_scaled(
@@ -499,7 +517,70 @@ impl Canvas {
             }
             pixel[3] = 255;
         }
+        self.draw_grid(&mut bytes, origin, region, pixels_per_canvas_pixel, grid);
         bytes
+    }
+
+    /// Darkens the device pixels where a canvas pixel or tile begins, so each
+    /// line is one device pixel wide. The canvas's own edges need no line.
+    fn draw_grid(
+        &self,
+        bytes: &mut [u8],
+        origin: Point<u32>,
+        region: Size<u32>,
+        pixels_per_canvas_pixel: f32,
+        grid: Grid,
+    ) {
+        let show_pixels = grid.pixels && pixels_per_canvas_pixel >= MIN_PIXEL_GRID_SPACING;
+        if !show_pixels && grid.tile.is_none() {
+            return;
+        }
+        // The canvas pixel each device pixel samples, as in `render_scaled`
+        let index = |device: u32| ((device as f32 + 0.5) / pixels_per_canvas_pixel) as u32;
+        // Which line, if any, runs along device pixel `device`
+        let line = |device: u32| {
+            let current = index(device);
+            // The canvas's first pixel lies on its edge
+            let starts_pixel = current > 0 && index(device - 1) != current;
+            if !starts_pixel {
+                return None;
+            }
+            let on_tile = grid.tile.is_some_and(|tile| current % tile == 0);
+            if on_tile {
+                Some(TILE_GRID_LINE)
+            } else if show_pixels {
+                Some(PIXEL_GRID_LINE)
+            } else {
+                None
+            }
+        };
+        let (width, height) = (self.pixmap.width(), self.pixmap.height());
+        let columns: Vec<_> = (origin.x..origin.x + region.width)
+            .map(|x| line(x))
+            .collect();
+        for (row, y) in (origin.y..origin.y + region.height).enumerate() {
+            let row_line = line(y);
+            // No lines past the canvas, as while a resize drag enlarges it
+            let row_inside = index(y) < height;
+            for (column, x) in columns.iter().enumerate() {
+                let inside = row_inside && index(origin.x + column as u32) < width;
+                // The tile line wins where it crosses a pixel line
+                let color = match (row_line, *x) {
+                    (Some(a), Some(b)) => Some(if a.1 >= b.1 { a } else { b }),
+                    (a, b) => a.or(b),
+                };
+                let Some((gray, alpha)) = color.filter(|_| inside) else {
+                    continue;
+                };
+                let pixel = &mut bytes[(row * region.width as usize + column) * 4..][..3];
+                for channel in pixel {
+                    *channel = ((*channel as u16 * (255 - alpha as u16)
+                        + gray as u16 * alpha as u16
+                        + 127)
+                        / 255) as u8;
+                }
+            }
+        }
     }
 
     /// The canvas image.
@@ -1281,7 +1362,7 @@ mod tests {
     fn transparency_shows_as_a_checkerboard() {
         let canvas = transparent_canvas(4, 1);
         // Squares of 2 device pixels
-        let view = canvas.render_view(point(0, 0), size(4, 1), 1.0, 2.0);
+        let view = canvas.render_view(point(0, 0), size(4, 1), 1.0, 2.0, Grid::default());
         let shade = |x: usize| view[x * 4];
         assert_eq!(shade(0), CHECKER_LIGHT);
         assert_eq!(shade(1), CHECKER_LIGHT);
@@ -1306,6 +1387,51 @@ mod tests {
         assert_eq!(canvas.size(), size(px(80.0), px(60.0)));
     }
 
+    /// Which of the first `count` device columns of row 1 the grid darkened.
+    fn grid_columns(canvas: &Canvas, scale: f32, grid: Grid, count: u32) -> Vec<u32> {
+        let plain = canvas.render_view(point(0, 1), size(count, 1), scale, 1000.0, Grid::default());
+        let view = canvas.render_view(point(0, 1), size(count, 1), scale, 1000.0, grid);
+        (0..count)
+            .filter(|&x| view[x as usize * 4] != plain[x as usize * 4])
+            .collect()
+    }
+
+    #[test]
+    fn pixel_grid_lines_each_pixel_once_it_is_large_enough() {
+        let canvas = canvas(8, 8);
+        let grid = Grid {
+            pixels: true,
+            tile: None,
+        };
+        // At 4 device pixels per canvas pixel, a line starts each pixel after the first
+        assert_eq!(grid_columns(&canvas, 4.0, grid, 16), vec![4, 8, 12]);
+        // At 2x the lines would bury the drawing, so none show
+        assert!(grid_columns(&canvas, 2.0, grid, 16).is_empty());
+    }
+
+    #[test]
+    fn tile_grid_shows_at_any_zoom() {
+        let canvas = canvas(32, 32);
+        let grid = Grid {
+            pixels: false,
+            tile: Some(8),
+        };
+        assert_eq!(grid_columns(&canvas, 1.0, grid, 32), vec![8, 16, 24]);
+        assert_eq!(grid_columns(&canvas, 2.0, grid, 40), vec![16, 32]);
+    }
+
+    #[test]
+    fn tile_lines_are_darker_than_pixel_lines() {
+        let canvas = canvas(16, 16);
+        let grid = Grid {
+            pixels: true,
+            tile: Some(2),
+        };
+        let view = canvas.render_view(point(0, 1), size(16, 1), 4.0, 1000.0, grid);
+        // Device column 4 starts pixel 1 (a pixel line), column 8 starts pixel 2 (a tile line)
+        assert!(view[8 * 4] < view[4 * 4]);
+    }
+
     #[test]
     fn png_is_exactly_the_canvas_size() {
         let canvas = canvas(80, 60);
@@ -1319,7 +1445,7 @@ mod tests {
         canvas.pixmap.pixels_mut()[0] = PremultipliedColorU8::from_rgba(255, 0, 0, 255).unwrap();
 
         // At 2x each canvas pixel covers 2x2 device pixels; column 4+ is past the canvas
-        let view = canvas.render_view(point(0, 0), size(5, 2), 2.0, 16.0);
+        let view = canvas.render_view(point(0, 0), size(5, 2), 2.0, 16.0, Grid::default());
         let pixel = |x: usize, y: usize| &view[(y * 5 + x) * 4..][..4];
         let red = [0, 0, 255, 255];
         let white = [255, 255, 255, 255];

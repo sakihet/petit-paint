@@ -14,7 +14,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use canvas::{BRUSHES, Brush, Canvas, Change, Floating, PixelRect, StrokeLayer};
+use canvas::{BRUSHES, Brush, Canvas, Change, Floating, Grid, PixelRect, StrokeLayer};
 use image::{Frame, RgbaImage};
 use lyon::tessellation::{LineCap, LineJoin};
 use std::cell::{Cell, RefCell};
@@ -128,10 +128,14 @@ enum SelectDrag {
     Move { grab: Point<i32> },
 }
 
+/// Tile grid sizes offered in the status bar, in canvas pixels.
+const TILE_SIZES: [u32; 4] = [8, 16, 32, 64];
+
 /// What the cached view image was rendered from.
 #[derive(Clone, Copy, PartialEq)]
 struct ViewKey {
     version: u64,
+    grid: Grid,
     /// Device pixels per canvas pixel, as bits so the key can be compared exactly.
     pixels_per_canvas_pixel: u32,
     origin: Point<u32>,
@@ -331,6 +335,7 @@ struct PaintApp {
     /// the last paint. Pasted pixels land at its top-left.
     visible_bounds: Rc<Cell<Bounds<Pixels>>>,
     zoom_index: usize,
+    grid: Grid,
     /// Scroll or pinch input not yet turned into a zoom step.
     zoom_input: f32,
     scroll_handle: ScrollHandle,
@@ -448,6 +453,7 @@ impl PaintApp {
             floating_cache: Rc::default(),
             visible_bounds: Rc::default(),
             zoom_index: DEFAULT_ZOOM_INDEX,
+            grid: Grid::default(),
             zoom_input: 0.0,
             scroll_handle: ScrollHandle::new(),
             resize_drag: None,
@@ -1710,6 +1716,7 @@ impl Render for PaintApp {
                                 &app.canvas,
                                 bounds,
                                 zoom,
+                                app.grid,
                                 &mut view_cache.borrow_mut(),
                             );
                             if let Some(selection) = &app.selection
@@ -1857,6 +1864,39 @@ impl Render for PaintApp {
             })
             .child(div().flex_1())
             .child(
+                Checkbox::new("pixel-grid")
+                    .label("Pixel grid")
+                    .tooltip("Lines between pixels, from 400% zoom")
+                    .checked(self.grid.pixels)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.grid.pixels = *checked;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child("Tiles")
+                    .child(
+                        ButtonGroup::new("tile-grid")
+                            .outline()
+                            .xsmall()
+                            .child(Button::new("tiles-off").label("Off").selected(self.grid.tile.is_none()))
+                            .children(TILE_SIZES.map(|tile| {
+                                Button::new(("tiles", tile as usize))
+                                    .label(tile.to_string())
+                                    .selected(self.grid.tile == Some(tile))
+                            }))
+                            .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
+                                if let Some(&ix) = clicks.first() {
+                                    // The first button turns the tile grid off
+                                    this.grid.tile = ix.checked_sub(1).and_then(|ix| TILE_SIZES.get(ix).copied());
+                                    cx.notify();
+                                }
+                            })),
+                    ),
+            )
+            .child(
                 h_flex()
                     .gap_1()
                     .child(
@@ -1998,6 +2038,7 @@ fn paint_floating(
     let pixels_per_canvas_pixel = scale * zoom;
     let key = ViewKey {
         version: id,
+        grid: Grid::default(),
         pixels_per_canvas_pixel: pixels_per_canvas_pixel.to_bits(),
         origin: point(0, 0),
         size: size(pixels.width(), pixels.height()),
@@ -2049,6 +2090,7 @@ fn paint_view(
     canvas: &Canvas,
     bounds: Bounds<Pixels>,
     zoom: f32,
+    grid: Grid,
     cache: &mut ViewCache,
 ) {
     let scale = window.scale_factor();
@@ -2069,13 +2111,20 @@ fn paint_view(
     }
     let key = ViewKey {
         version: canvas.version(),
+        grid,
         pixels_per_canvas_pixel: (scale * zoom).to_bits(),
         origin: point(left as u32, top as u32),
         size: size((right - left) as u32, (bottom - top) as u32),
     };
 
     if cache.key != Some(key) {
-        let bytes = canvas.render_view(key.origin, key.size, scale * zoom, CHECKER_SIZE * scale);
+        let bytes = canvas.render_view(
+            key.origin,
+            key.size,
+            scale * zoom,
+            CHECKER_SIZE * scale,
+            grid,
+        );
         let Some(frame) = RgbaImage::from_raw(key.size.width, key.size.height, bytes) else {
             return;
         };
