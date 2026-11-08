@@ -1,6 +1,7 @@
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Selectable as _, h_flex,
     button::*,
+    checkbox::Checkbox,
     color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
     slider::{Slider, SliderEvent, SliderState, SliderValue},
     v_flex,
@@ -35,6 +36,7 @@ actions!(
         Paste,
         DeleteSelection,
         Deselect,
+        FinishPolygon,
         ZoomIn,
         ZoomOut,
         ResetZoom,
@@ -57,6 +59,9 @@ const DEFAULT_ZOOM_INDEX: usize = 2;
 /// Scroll distance with Cmd/Ctrl held, or pinch amount, per zoom step.
 const SCROLL_PER_ZOOM_STEP: f32 = 50.0;
 const PINCH_PER_ZOOM_STEP: f32 = 0.15;
+/// How close, in displayed pixels, a click must be to a polygon's first
+/// point to close it.
+const POLYGON_CLOSE_DISTANCE: f32 = 8.0;
 /// Side length of the square handles for resizing the canvas.
 const HANDLE_SIZE: Pixels = px(8.0);
 const KEY_CONTEXT: &str = "PaintApp";
@@ -78,15 +83,22 @@ macro_rules! with_modifier {
     };
 }
 
-/// A single brush stroke. Points are in canvas coordinates, with the origin at its top-left.
+/// A line through `points`: a brush stroke or a shape's outline. Points are
+/// in canvas coordinates, with the origin at its top-left.
 ///
-/// While the mouse is held the stroke is previewed as a vector path; on
-/// release it is burned into the canvas pixels.
-#[derive(Clone)]
+/// While it is being drawn it is previewed as a vector path; when finished
+/// it is burned into the canvas pixels.
+#[derive(Clone, Default)]
 struct Stroke {
     points: Vec<Point<Pixels>>,
     color: Hsla,
     width: Pixels,
+    /// Connects the last point back to the first.
+    closed: bool,
+    /// Fills the inside with `color` as well.
+    filled: bool,
+    /// Miter joins instead of round ones, for rectangles and polygons.
+    sharp_corners: bool,
 }
 
 /// The selected rectangle, in canvas pixels.
@@ -125,6 +137,47 @@ struct ViewCache {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+enum ShapeKind {
+    Line,
+    Rectangle,
+    Ellipse,
+    /// Built by clicking each corner; closes on a double-click, Enter, or a
+    /// click on the first corner.
+    Polygon,
+}
+
+/// Shapes in toolbar order.
+const SHAPES: [ShapeKind; 4] = [
+    ShapeKind::Line,
+    ShapeKind::Rectangle,
+    ShapeKind::Ellipse,
+    ShapeKind::Polygon,
+];
+
+impl ShapeKind {
+    fn label(self) -> &'static str {
+        match self {
+            ShapeKind::Line => "Line",
+            ShapeKind::Rectangle => "Rectangle",
+            ShapeKind::Ellipse => "Ellipse",
+            ShapeKind::Polygon => "Polygon",
+        }
+    }
+
+    /// Whether the shape has an inside that can be filled.
+    fn fillable(self) -> bool {
+        self != ShapeKind::Line
+    }
+}
+
+/// A line, rectangle or ellipse being dragged out, in canvas coordinates.
+#[derive(Clone, Copy)]
+struct ShapeDrag {
+    start: Point<Pixels>,
+    end: Point<Pixels>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum Tool {
     /// Selects a rectangle to move, copy, cut or delete.
     Select,
@@ -135,15 +188,18 @@ enum Tool {
     Eyedropper,
     /// Fills the region of matching color under the cursor with the brush color.
     Fill,
+    /// Draws the shape chosen in the toolbar.
+    Shape,
 }
 
 /// Tools in toolbar order.
-const TOOLS: [Tool; 5] = [
+const TOOLS: [Tool; 6] = [
     Tool::Select,
     Tool::Pen,
     Tool::Eraser,
     Tool::Eyedropper,
     Tool::Fill,
+    Tool::Shape,
 ];
 
 impl Tool {
@@ -154,6 +210,7 @@ impl Tool {
             Tool::Eraser => "Eraser",
             Tool::Eyedropper => "Eyedropper",
             Tool::Fill => "Fill",
+            Tool::Shape => "Shape",
         }
     }
 }
@@ -202,6 +259,14 @@ struct PaintApp {
     canvas_size: Size<Pixels>,
     /// The stroke being drawn, not yet burned into `canvas`.
     current_stroke: Option<Stroke>,
+    shape_kind: ShapeKind,
+    /// Whether rectangles, ellipses and polygons are filled with the brush color.
+    shape_filled: bool,
+    shape_drag: Option<ShapeDrag>,
+    /// Corners of the polygon being built, in canvas coordinates.
+    polygon: Vec<Point<Pixels>>,
+    /// Where the mouse is while building a polygon, for previewing the next edge.
+    polygon_hover: Option<Point<Pixels>>,
     view_cache: Rc<RefCell<ViewCache>>,
     selection: Option<Selection>,
     select_drag: Option<SelectDrag>,
@@ -273,6 +338,11 @@ impl PaintApp {
             redo_stack: Vec::new(),
             canvas_size: DEFAULT_CANVAS_SIZE,
             current_stroke: None,
+            shape_kind: ShapeKind::Rectangle,
+            shape_filled: false,
+            shape_drag: None,
+            polygon: Vec::new(),
+            polygon_hover: None,
             view_cache: Rc::default(),
             selection: None,
             select_drag: None,
@@ -323,12 +393,128 @@ impl PaintApp {
                 self.fill_at(position, cx);
                 return;
             }
+            Tool::Shape => {
+                self.start_shape(position, event.click_count, cx);
+                return;
+            }
         };
         self.current_stroke = Some(Stroke {
             points: vec![position],
             color,
             width: self.width,
+            ..Default::default()
         });
+        cx.notify();
+    }
+
+    fn start_shape(&mut self, position: Point<Pixels>, click_count: usize, cx: &mut Context<Self>) {
+        if self.shape_kind != ShapeKind::Polygon {
+            self.shape_drag = Some(ShapeDrag {
+                start: position,
+                end: position,
+            });
+            cx.notify();
+            return;
+        }
+        let closes = self.polygon.first().is_some_and(|first| {
+            let distance = (position - *first).magnitude() as f32 * self.zoom();
+            self.polygon.len() >= 3 && distance <= POLYGON_CLOSE_DISTANCE
+        });
+        // The first click of a double-click already added this corner
+        if click_count >= 2 || closes {
+            self.finish_polygon(cx);
+            return;
+        }
+        self.polygon.push(position);
+        cx.notify();
+    }
+
+    /// The outline of a shape dragged from `start` to `end`.
+    fn shape_stroke(&self, start: Point<Pixels>, end: Point<Pixels>) -> Stroke {
+        let base = Stroke {
+            color: self.color,
+            width: self.width,
+            filled: self.shape_filled && self.shape_kind.fillable(),
+            ..Default::default()
+        };
+        let (left, right) = (start.x.min(end.x), start.x.max(end.x));
+        let (top, bottom) = (start.y.min(end.y), start.y.max(end.y));
+        match self.shape_kind {
+            ShapeKind::Line | ShapeKind::Polygon => Stroke {
+                points: vec![start, end],
+                ..base
+            },
+            ShapeKind::Rectangle => Stroke {
+                points: vec![
+                    point(left, top),
+                    point(right, top),
+                    point(right, bottom),
+                    point(left, bottom),
+                ],
+                closed: true,
+                sharp_corners: true,
+                ..base
+            },
+            ShapeKind::Ellipse => {
+                let center = point((left + right) / 2.0, (top + bottom) / 2.0);
+                let (rx, ry) = ((right - left) / 2.0, (bottom - top) / 2.0);
+                // Enough segments that edges stay smooth at the largest zoom
+                let segments = ((rx + ry).as_f32() * 2.0).clamp(24.0, 720.0) as usize;
+                let points = (0..segments)
+                    .map(|i| {
+                        let angle = i as f32 / segments as f32 * std::f32::consts::TAU;
+                        center + point(rx * angle.cos(), ry * angle.sin())
+                    })
+                    .collect();
+                Stroke {
+                    points,
+                    closed: true,
+                    ..base
+                }
+            }
+        }
+    }
+
+    /// The polygon so far, with an edge to the mouse, or the finished polygon.
+    fn polygon_stroke(&self, finished: bool) -> Stroke {
+        let mut points = self.polygon.clone();
+        if !finished {
+            points.extend(self.polygon_hover);
+        }
+        Stroke {
+            points,
+            color: self.color,
+            width: self.width,
+            closed: finished,
+            filled: finished && self.shape_filled,
+            sharp_corners: true,
+        }
+    }
+
+    /// The shape being drawn, to preview over the canvas.
+    fn shape_preview(&self) -> Option<Stroke> {
+        if let Some(drag) = self.shape_drag {
+            return Some(self.shape_stroke(drag.start, drag.end));
+        }
+        (!self.polygon.is_empty()).then(|| self.polygon_stroke(false))
+    }
+
+    fn finish_polygon(&mut self, cx: &mut Context<Self>) {
+        if self.polygon.len() >= 3
+            && let Some(undo) = self.canvas.draw_stroke(&self.polygon_stroke(true))
+        {
+            self.record(undo, cx);
+        }
+        self.cancel_polygon(cx);
+    }
+
+    fn on_finish_polygon(&mut self, _: &FinishPolygon, _: &mut Window, cx: &mut Context<Self>) {
+        self.finish_polygon(cx);
+    }
+
+    fn cancel_polygon(&mut self, cx: &mut Context<Self>) {
+        self.polygon.clear();
+        self.polygon_hover = None;
         cx.notify();
     }
 
@@ -435,6 +621,7 @@ impl PaintApp {
         if tool != Tool::Select {
             self.deselect(cx);
         }
+        self.cancel_polygon(cx);
         self.tool = tool;
         cx.notify();
     }
@@ -512,7 +699,12 @@ impl PaintApp {
         }
     }
 
+    /// Escape: cancels a polygon being built, or drops the selection.
     fn on_deselect(&mut self, _: &Deselect, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.polygon.is_empty() {
+            self.cancel_polygon(cx);
+            return;
+        }
         self.deselect(cx);
     }
 
@@ -616,6 +808,23 @@ impl PaintApp {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.shape_drag.is_some() {
+            let end = self.to_canvas(event.position);
+            let kind = self.shape_kind;
+            if let Some(drag) = &mut self.shape_drag {
+                drag.end = if event.modifiers.shift {
+                    constrain(kind, drag.start, end)
+                } else {
+                    end
+                };
+            }
+            cx.notify();
+        }
+        if !self.polygon.is_empty() {
+            self.polygon_hover = Some(self.to_canvas(event.position));
+            cx.notify();
+        }
+
         let cursor_position = self
             .canvas_bounds
             .get()
@@ -665,6 +874,12 @@ impl PaintApp {
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.select_drag = None;
+        if let Some(drag) = self.shape_drag.take()
+            && drag.start != drag.end
+            && let Some(undo) = self.canvas.draw_stroke(&self.shape_stroke(drag.start, drag.end))
+        {
+            self.record(undo, cx);
+        }
         if let Some(stroke) = self.current_stroke.take()
             && let Some(undo) = self.canvas.draw_stroke(&stroke)
         {
@@ -719,11 +934,19 @@ impl PaintApp {
     /// Whether a mouse drag is in progress, during which undo and redo would
     /// conflict with the stroke or resize being made.
     fn dragging(&self) -> bool {
-        self.current_stroke.is_some() || self.resize_drag.is_some() || self.select_drag.is_some()
+        self.current_stroke.is_some()
+            || self.resize_drag.is_some()
+            || self.select_drag.is_some()
+            || self.shape_drag.is_some()
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
         if self.dragging() {
+            return;
+        }
+        // Undo first takes back an unfinished polygon
+        if !self.polygon.is_empty() {
+            self.cancel_polygon(cx);
             return;
         }
         // Dropping floating pixels records their move, which this then undoes
@@ -909,6 +1132,34 @@ impl Render for PaintApp {
                         }
                     })),
             )
+            .when(self.tool == Tool::Shape, |this| {
+                this.child(
+                    ButtonGroup::new("shape")
+                        .outline()
+                        .children(SHAPES.map(|shape| {
+                            Button::new(shape.label())
+                                .label(shape.label())
+                                .selected(self.shape_kind == shape)
+                        }))
+                        .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
+                            if let Some(&shape) = clicks.first().and_then(|ix| SHAPES.get(*ix)) {
+                                this.cancel_polygon(cx);
+                                this.shape_kind = shape;
+                                cx.notify();
+                            }
+                        })),
+                )
+                .child(
+                    Checkbox::new("shape-filled")
+                        .label("Filled")
+                        .checked(self.shape_filled)
+                        .disabled(!self.shape_kind.fillable())
+                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                            this.shape_filled = *checked;
+                            cx.notify();
+                        })),
+                )
+            })
             .child(ColorPicker::new(&self.color_picker))
             .child(
                 h_flex()
@@ -961,7 +1212,7 @@ impl Render for PaintApp {
         let visible_bounds = self.visible_bounds.clone();
         let view_cache = self.view_cache.clone();
         let floating_cache = self.floating_cache.clone();
-        let preview = self.current_stroke.clone();
+        let preview = self.current_stroke.clone().or_else(|| self.shape_preview());
         let app = cx.entity();
 
         let zoom = self.zoom();
@@ -1167,6 +1418,7 @@ impl Render for PaintApp {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::delete_selection))
             .on_action(cx.listener(Self::on_deselect))
+            .on_action(cx.listener(Self::on_finish_polygon))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::reset_zoom))
@@ -1181,32 +1433,67 @@ impl Render for PaintApp {
 /// Paints `stroke` with the canvas top-left at `origin`, in window
 /// coordinates, scaled by `zoom`.
 fn paint_stroke(window: &mut Window, stroke: &Stroke, origin: Point<Pixels>, zoom: f32) {
-    let Stroke {
-        points,
-        color,
-        width,
-    } = stroke;
-    let Some(first) = points.first() else {
+    let Some(first) = stroke.points.first() else {
         return;
     };
-    // Round caps turn a single click into a dot; round joins avoid miter spikes on sharp turns
     let to_window = |p: Point<Pixels>| origin + point(p.x * zoom, p.y * zoom);
-    let options = StrokeOptions::default()
-        .with_line_width(width.as_f32() * zoom)
-        .with_line_cap(LineCap::Round)
-        .with_line_join(LineJoin::Round);
-    let mut builder = PathBuilder::default().with_style(PathStyle::Stroke(options));
-    builder.move_to(to_window(*first));
-    if points.len() == 1 {
-        // Draw a tiny segment so a single click still leaves a visible dot
-        builder.line_to(to_window(*first + Point::new(px(0.1), px(0.1))));
-    } else {
-        for p in &points[1..] {
-            builder.line_to(to_window(*p));
+    let trace = |builder: &mut PathBuilder| {
+        builder.move_to(to_window(*first));
+        if stroke.points.len() == 1 {
+            // Draw a tiny segment so a single click still leaves a visible dot
+            builder.line_to(to_window(*first + Point::new(px(0.1), px(0.1))));
+        } else {
+            for p in &stroke.points[1..] {
+                builder.line_to(to_window(*p));
+            }
+        }
+        if stroke.closed {
+            builder.close();
+        }
+    };
+
+    if stroke.filled {
+        let mut builder = PathBuilder::fill();
+        trace(&mut builder);
+        if let Ok(path) = builder.build() {
+            window.paint_path(path, stroke.color);
         }
     }
+    // Round caps turn a single click into a dot; round joins avoid miter
+    // spikes on sharp turns of freehand strokes
+    let join = if stroke.sharp_corners {
+        LineJoin::Miter
+    } else {
+        LineJoin::Round
+    };
+    let options = StrokeOptions::default()
+        .with_line_width(stroke.width.as_f32() * zoom)
+        .with_line_cap(LineCap::Round)
+        .with_line_join(join);
+    let mut builder = PathBuilder::default().with_style(PathStyle::Stroke(options));
+    trace(&mut builder);
     if let Ok(path) = builder.build() {
-        window.paint_path(path, *color);
+        window.paint_path(path, stroke.color);
+    }
+}
+
+/// Snaps a dragged shape so lines run at multiples of 45° and rectangles and
+/// ellipses come out square and circular, as Shift does in most paint apps.
+fn constrain(kind: ShapeKind, start: Point<Pixels>, end: Point<Pixels>) -> Point<Pixels> {
+    let delta = end - start;
+    match kind {
+        ShapeKind::Line | ShapeKind::Polygon => {
+            let angle = delta.y.as_f32().atan2(delta.x.as_f32());
+            let step = std::f32::consts::FRAC_PI_4;
+            let angle = (angle / step).round() * step;
+            let length = delta.magnitude() as f32;
+            start + point(px(length * angle.cos()), px(length * angle.sin()))
+        }
+        ShapeKind::Rectangle | ShapeKind::Ellipse => {
+            let side = delta.x.abs().max(delta.y.abs());
+            let signed = |d: Pixels| if d < px(0.0) { -side } else { side };
+            start + point(signed(delta.x), signed(delta.y))
+        }
     }
 }
 
@@ -1350,6 +1637,7 @@ fn main() {
             KeyBinding::new("backspace", DeleteSelection, context),
             KeyBinding::new("delete", DeleteSelection, context),
             KeyBinding::new("escape", Deselect, context),
+            KeyBinding::new("enter", FinishPolygon, context),
         ];
         // Windows and Linux apps also redo with Ctrl+Y
         if cfg!(not(target_os = "macos")) {

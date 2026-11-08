@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result, anyhow};
 use gpui_kit::{Hsla, Pixels, Point, Rgba, Size, px, size};
 use tiny_skia::{
-    Color, ColorU8, IntRect, LineCap, LineJoin, Paint, PathBuilder, Pixmap, PixmapPaint,
+    Color, ColorU8, FillRule, IntRect, LineCap, LineJoin, Paint, PathBuilder, Pixmap, PixmapPaint,
     PremultipliedColorU8, Stroke as SkiaStroke, Transform,
 };
 
@@ -80,7 +80,8 @@ impl Canvas {
     /// Burns `stroke` into the canvas and returns the change that undoes it,
     /// or `None` when the stroke lies entirely outside the canvas.
     ///
-    /// Strokes use round caps and joins to match the on-screen preview.
+    /// Strokes use round caps, and round joins unless `sharp_corners` is set,
+    /// to match the on-screen preview.
     pub fn draw_stroke(&mut self, stroke: &Stroke) -> Option<Change> {
         let (first, rest) = stroke.points.split_first()?;
         let mut builder = PathBuilder::new();
@@ -93,10 +94,15 @@ impl Canvas {
                 builder.line_to(p.x.as_f32(), p.y.as_f32());
             }
         }
+        if stroke.closed {
+            builder.close();
+        }
         let path = builder.finish()?;
 
-        // Anti-aliasing reaches about a pixel past the stroke's edge
-        let margin = stroke.width.as_f32() / 2.0 + 2.0;
+        // Anti-aliasing reaches about a pixel past the stroke's edge, and
+        // miter joins up to twice the width (tiny-skia's miter limit is 4)
+        let reach = if stroke.sharp_corners { 2.0 } else { 0.5 };
+        let margin = stroke.width.as_f32() * reach + 2.0;
         let bounds = path.bounds();
         let rect = self.clip(
             bounds.left() - margin,
@@ -109,10 +115,23 @@ impl Canvas {
         let mut paint = Paint::default();
         paint.set_color(to_skia_color(stroke.color));
         paint.anti_alias = true;
+        if stroke.filled {
+            self.pixmap.fill_path(
+                &path,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
         let style = SkiaStroke {
             width: stroke.width.as_f32(),
             line_cap: LineCap::Round,
-            line_join: LineJoin::Round,
+            line_join: if stroke.sharp_corners {
+                LineJoin::Miter
+            } else {
+                LineJoin::Round
+            },
             ..Default::default()
         };
         self.pixmap
@@ -527,6 +546,7 @@ mod tests {
             points: points.iter().map(|&(x, y)| point(px(x), px(y))).collect(),
             color: rgb(color).into(),
             width: px(width),
+            ..Default::default()
         }
     }
 
@@ -555,6 +575,37 @@ mod tests {
         canvas.draw_stroke(&stroke(&[(10.0, 25.0), (90.0, 25.0)], 0xff0000, 6.0));
         assert_eq!(rgb_at(&canvas, 50, 25), (255, 0, 0));
         assert_eq!(rgb_at(&canvas, 50, 5), (255, 255, 255));
+    }
+
+    #[test]
+    fn filled_closed_stroke_paints_its_inside() {
+        let mut canvas = canvas(40, 40);
+        let triangle = Stroke {
+            closed: true,
+            filled: true,
+            sharp_corners: true,
+            ..stroke(&[(5.0, 5.0), (35.0, 5.0), (5.0, 35.0)], 0x00ff00, 1.0)
+        };
+        canvas.draw_stroke(&triangle);
+        assert_eq!(rgb_at(&canvas, 10, 10), (0, 255, 0));
+        // Past the diagonal edge stays white
+        assert_eq!(rgb_at(&canvas, 30, 30), (255, 255, 255));
+    }
+
+    #[test]
+    fn closed_outline_without_fill_leaves_the_inside() {
+        let mut canvas = canvas(40, 40);
+        let square = Stroke {
+            closed: true,
+            sharp_corners: true,
+            ..stroke(&[(5.0, 5.0), (35.0, 5.0), (35.0, 35.0), (5.0, 35.0)], 0x000000, 2.0)
+        };
+        canvas.draw_stroke(&square);
+        assert_eq!(rgb_at(&canvas, 20, 20), (255, 255, 255));
+        // The closing edge from (5, 35) back to (5, 5) is drawn
+        assert_eq!(rgb_at(&canvas, 5, 20), (0, 0, 0));
+        // Miter joins keep the corner square
+        assert_eq!(rgb_at(&canvas, 4, 4), (0, 0, 0));
     }
 
     #[test]
