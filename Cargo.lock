@@ -4512,6 +4512,7 @@ dependencies = [
  "anyhow",
  "gpui-kit",
  "gpui-pre-platform",
+ "image",
  "lyon",
  "tiny-skia 0.12.0",
 ]

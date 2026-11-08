@@ -13,11 +13,14 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use canvas::{Canvas, Change};
+use image::{Frame, RgbaImage};
 use lyon::tessellation::{LineCap, LineJoin};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 
-mod raster;
+mod canvas;
 
 actions!(petit_paint, [Undo, Redo, SavePng]);
 
@@ -26,9 +29,11 @@ const DEFAULT_CANVAS_SIZE: Size<Pixels> = Size {
     width: px(800.0),
     height: px(600.0),
 };
-/// Largest canvas side in pixels. Fill and eyedropper rasterize the canvas at
-/// the screen's scale factor, so a 2x screen needs about 4 * 8192^2 bytes.
+/// Largest canvas side in pixels. Undo steps that replace the whole canvas
+/// (clear, resize) keep a full copy of it, 64MB each at this size.
 const MAX_CANVAS_SIDE: u32 = 4096;
+/// Number of undo steps kept; older ones are dropped.
+const MAX_HISTORY: usize = 100;
 /// Side length of the square handles for resizing the canvas.
 const HANDLE_SIZE: Pixels = px(8.0);
 const KEY_CONTEXT: &str = "PaintApp";
@@ -49,6 +54,9 @@ const REDO_KEYS: &[&str] = &["ctrl-shift-z", "ctrl-y"];
 const SAVE_KEY: &str = "ctrl-s";
 
 /// A single brush stroke. Points are in canvas coordinates, with the origin at its top-left.
+///
+/// While the mouse is held the stroke is previewed as a vector path; on
+/// release it is burned into the canvas pixels.
 #[derive(Clone)]
 struct Stroke {
     points: Vec<Point<Pixels>>,
@@ -56,51 +64,21 @@ struct Stroke {
     width: Pixels,
 }
 
-/// A flood-filled region, stored as rectangles of device pixels.
-#[derive(Clone)]
-struct Fill {
-    color: Hsla,
-    /// Window scale factor when the fill was made; `rects` are in its device pixels.
-    scale: f32,
-    rects: Rc<Vec<raster::PixelRect>>,
+/// What the cached view image was rendered from.
+#[derive(Clone, Copy, PartialEq)]
+struct ViewKey {
+    version: u64,
+    scale: u32,
+    origin: Point<u32>,
+    size: Size<u32>,
 }
 
-impl Fill {
-    /// Returns `rect` in canvas coordinates.
-    fn bounds(&self, rect: &raster::PixelRect) -> Bounds<Pixels> {
-        let to_pixels = |device: u32| px(device as f32 / self.scale);
-        Bounds::new(
-            point(to_pixels(rect.x), to_pixels(rect.y)),
-            size(to_pixels(rect.width), to_pixels(rect.height)),
-        )
-    }
-}
-
-/// Something drawn on the canvas, painted in order.
-#[derive(Clone)]
-enum Item {
-    Stroke(Stroke),
-    Fill(Fill),
-}
-
-/// An undoable change to the drawing.
-enum HistoryEntry {
-    /// An item was appended to the end of `items`.
-    Add,
-    /// The canvas was cleared; holds the items that were removed.
-    Clear(Vec<Item>),
-    /// The canvas was resized; holds the size before the change.
-    Resize(Size<Pixels>),
-}
-
-/// A change that was undone and can be reapplied.
-enum RedoEntry {
-    /// Holds the item that was removed by undo.
-    Add(Item),
-    /// Clears the canvas again.
-    Clear,
-    /// Holds the size to resize the canvas to again.
-    Resize(Size<Pixels>),
+/// The visible part of the canvas as a GPU image, re-rendered only when the
+/// canvas changes or a different part of it becomes visible.
+#[derive(Default)]
+struct ViewCache {
+    key: Option<ViewKey>,
+    image: Option<Arc<RenderImage>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -165,11 +143,14 @@ struct ResizeDrag {
 
 struct PaintApp {
     tool: Tool,
-    items: Vec<Item>,
-    history: Vec<HistoryEntry>,
-    redo_stack: Vec<RedoEntry>,
+    canvas: Canvas,
+    undo_stack: Vec<Change>,
+    redo_stack: Vec<Change>,
+    /// Displayed canvas size. Matches `canvas` except while a resize handle is dragged.
     canvas_size: Size<Pixels>,
-    drawing: bool,
+    /// The stroke being drawn, not yet burned into `canvas`.
+    current_stroke: Option<Stroke>,
+    view_cache: Rc<RefCell<ViewCache>>,
     resize_drag: Option<ResizeDrag>,
     /// Canvas pixel under the mouse, shown in the status bar.
     cursor_position: Option<Point<i32>>,
@@ -215,12 +196,20 @@ impl PaintApp {
             }),
         ];
 
+        let canvas = Canvas::new(
+            DEFAULT_CANVAS_SIZE.width.as_f32() as u32,
+            DEFAULT_CANVAS_SIZE.height.as_f32() as u32,
+            rgb(CANVAS_BACKGROUND).into(),
+        )
+        .expect("default canvas size is valid");
+
         Self {
-            items: Vec::new(),
-            history: Vec::new(),
+            canvas,
+            undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             canvas_size: DEFAULT_CANVAS_SIZE,
-            drawing: false,
+            current_stroke: None,
+            view_cache: Rc::default(),
             resize_drag: None,
             cursor_position: None,
             tool: Tool::Pen,
@@ -254,28 +243,28 @@ impl PaintApp {
                 return;
             }
             Tool::Fill => {
-                self.fill_at(position, window, cx);
+                self.fill_at(position, cx);
                 return;
             }
         };
-        self.drawing = true;
-        self.push_item(
-            Item::Stroke(Stroke {
-                points: vec![position],
-                color,
-                width: self.width,
-            }),
-            cx,
-        );
+        self.current_stroke = Some(Stroke {
+            points: vec![position],
+            color,
+            width: self.width,
+        });
+        cx.notify();
     }
 
     fn to_canvas(&self, position: Point<Pixels>) -> Point<Pixels> {
         position - self.canvas_bounds.get().origin
     }
 
-    fn push_item(&mut self, item: Item, cx: &mut Context<Self>) {
-        self.items.push(item);
-        self.history.push(HistoryEntry::Add);
+    /// Records `undo`, the change that reverts an edit just made to the canvas.
+    fn record(&mut self, undo: Change, cx: &mut Context<Self>) {
+        self.undo_stack.push(undo);
+        if self.undo_stack.len() > MAX_HISTORY {
+            self.undo_stack.remove(0);
+        }
         self.redo_stack.clear();
         cx.notify();
     }
@@ -316,22 +305,21 @@ impl PaintApp {
             cx.notify();
             return;
         }
-        if !self.drawing {
-            return;
-        }
         let position = self.to_canvas(event.position);
-        if let Some(Item::Stroke(stroke)) = self.items.last_mut() {
+        if let Some(stroke) = &mut self.current_stroke {
             stroke.points.push(position);
             cx.notify();
         }
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.drawing = false;
-        if let Some(drag) = self.resize_drag.take() {
-            // Put the start size back so resize_canvas records it for undo
-            let size = std::mem::replace(&mut self.canvas_size, drag.start_size);
-            self.resize_canvas(size, cx);
+        if let Some(stroke) = self.current_stroke.take()
+            && let Some(undo) = self.canvas.draw_stroke(&stroke)
+        {
+            self.record(undo, cx);
+        }
+        if self.resize_drag.take().is_some() {
+            self.resize_canvas(self.canvas_size, cx);
         }
         cx.notify();
     }
@@ -352,14 +340,7 @@ impl PaintApp {
     }
 
     fn pick_color(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let color = raster::color_at(
-            &self.items,
-            self.canvas_size,
-            rgb(CANVAS_BACKGROUND).into(),
-            window.scale_factor(),
-            position,
-        );
-        let Ok(Some(color)) = color else {
+        let Some(color) = self.canvas.color_at(position) else {
             return;
         };
         self.color = color;
@@ -370,90 +351,60 @@ impl PaintApp {
         cx.notify();
     }
 
-    fn fill_at(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let scale = window.scale_factor();
-        let rects = raster::flood_fill(
-            &self.items,
-            self.canvas_size,
-            rgb(CANVAS_BACKGROUND).into(),
-            scale,
-            position,
-            self.color,
-        );
-        let Ok(Some(rects)) = rects else {
-            return;
-        };
-        let fill = Fill {
-            color: self.color,
-            scale,
-            rects: Rc::new(rects),
-        };
-        self.push_item(Item::Fill(fill), cx);
+    fn fill_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if let Some(undo) = self.canvas.flood_fill(position, self.color) {
+            self.record(undo, cx);
+        }
     }
 
     fn clear(&mut self, cx: &mut Context<Self>) {
-        if self.items.is_empty() {
-            return;
+        if let Ok(undo) = self.canvas.clear() {
+            self.record(undo, cx);
         }
-        let removed = std::mem::take(&mut self.items);
-        self.history.push(HistoryEntry::Clear(removed));
-        self.redo_stack.clear();
-        cx.notify();
+    }
+
+    /// Whether a mouse drag is in progress, during which undo and redo would
+    /// conflict with the stroke or resize being made.
+    fn dragging(&self) -> bool {
+        self.current_stroke.is_some() || self.resize_drag.is_some()
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        // Undoing mid-drag would pop the stroke being drawn or fight the resize
-        if self.drawing || self.resize_drag.is_some() {
+        if self.dragging() {
             return;
         }
-        let redo = match self.history.pop() {
-            Some(HistoryEntry::Add) => match self.items.pop() {
-                Some(item) => RedoEntry::Add(item),
-                None => return,
-            },
-            Some(HistoryEntry::Clear(removed)) => {
-                self.items = removed;
-                RedoEntry::Clear
-            }
-            Some(HistoryEntry::Resize(size)) => {
-                RedoEntry::Resize(std::mem::replace(&mut self.canvas_size, size))
-            }
-            None => return,
+        let Some(change) = self.undo_stack.pop() else {
+            return;
         };
-        self.redo_stack.push(redo);
+        self.redo_stack.push(self.canvas.apply(change));
+        self.canvas_size = self.canvas.size();
         cx.notify();
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        if self.drawing || self.resize_drag.is_some() {
+        if self.dragging() {
             return;
         }
-        let entry = match self.redo_stack.pop() {
-            Some(RedoEntry::Add(item)) => {
-                self.items.push(item);
-                HistoryEntry::Add
-            }
-            Some(RedoEntry::Clear) => HistoryEntry::Clear(std::mem::take(&mut self.items)),
-            Some(RedoEntry::Resize(size)) => {
-                HistoryEntry::Resize(std::mem::replace(&mut self.canvas_size, size))
-            }
-            None => return,
+        let Some(change) = self.redo_stack.pop() else {
+            return;
         };
-        self.history.push(entry);
+        self.undo_stack.push(self.canvas.apply(change));
+        self.canvas_size = self.canvas.size();
         cx.notify();
     }
 
     /// Resizes the canvas, keeping the drawing anchored at the top-left.
-    ///
-    /// Items outside the new size are hidden, not removed, so enlarging the
-    /// canvas again brings them back.
+    /// Growing adds background; shrinking crops, which undo brings back.
     fn resize_canvas(&mut self, size: Size<Pixels>, cx: &mut Context<Self>) {
-        if size == self.canvas_size {
-            return;
+        if size != self.canvas.size()
+            && let Ok(undo) = self.canvas.resize(
+                size.width.as_f32() as u32,
+                size.height.as_f32() as u32,
+            )
+        {
+            self.record(undo, cx);
         }
-        let previous = std::mem::replace(&mut self.canvas_size, size);
-        self.history.push(HistoryEntry::Resize(previous));
-        self.redo_stack.clear();
+        self.canvas_size = self.canvas.size();
         cx.notify();
     }
 
@@ -544,13 +495,7 @@ impl PaintApp {
 
     fn save_png(&mut self, _: &SavePng, window: &mut Window, cx: &mut Context<Self>) {
         // Encode now so the image reflects the drawing at the time of the request
-        let png = raster::encode_png(
-            &self.items,
-            self.canvas_size,
-            rgb(CANVAS_BACKGROUND).into(),
-            // One image pixel per canvas pixel, so the PNG is exactly the canvas size
-            1.0,
-        );
+        let png = self.canvas.encode_png();
         let directory = std::env::home_dir().unwrap_or_default();
         let path = cx.prompt_for_new_path(&directory, Some("untitled.png"));
 
@@ -578,9 +523,6 @@ impl PaintApp {
 
 impl Render for PaintApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Copy the items so they can be moved into the paint closure
-        let items = self.items.clone();
-
         let theme = cx.theme();
 
         let toolbar = h_flex()
@@ -619,7 +561,7 @@ impl Render for PaintApp {
                     .outline()
                     .label("Undo")
                     .tooltip_with_action("Undo", &Undo, Some(KEY_CONTEXT))
-                    .disabled(self.history.is_empty())
+                    .disabled(self.undo_stack.is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.undo(&Undo, window, cx))),
             )
             .child(
@@ -655,6 +597,9 @@ impl Render for PaintApp {
             );
 
         let canvas_bounds = self.canvas_bounds.clone();
+        let view_cache = self.view_cache.clone();
+        let preview = self.current_stroke.clone();
+        let app = cx.entity();
 
         let canvas_size = self.canvas_size;
         let handle = |handle: ResizeHandle, cx: &Context<Self>| {
@@ -701,18 +646,15 @@ impl Render for PaintApp {
             .child(
                 canvas(
                     |_, _, _| {},
-                    move |bounds, _, window, _| {
+                    move |bounds, _, window, cx| {
                         canvas_bounds.set(bounds);
                         // Keep strokes that run past the edge from drawing outside the canvas
                         let mask = ContentMask { bounds };
                         window.with_content_mask(Some(mask), |window| {
-                            for item in &items {
-                                match item {
-                                    Item::Stroke(stroke) => {
-                                        paint_stroke(window, stroke, bounds.origin)
-                                    }
-                                    Item::Fill(fill) => paint_fill(window, fill, bounds.origin),
-                                }
+                            let canvas = &app.read(cx).canvas;
+                            paint_view(window, canvas, bounds, &mut view_cache.borrow_mut());
+                            if let Some(stroke) = &preview {
+                                paint_stroke(window, stroke, bounds.origin);
                             }
                         });
                     },
@@ -804,13 +746,65 @@ fn paint_stroke(window: &mut Window, stroke: &Stroke, origin: Point<Pixels>) {
     }
 }
 
-/// Paints `fill` with the canvas top-left at `origin`, in window coordinates.
-fn paint_fill(window: &mut Window, fill: &Fill, origin: Point<Pixels>) {
-    for rect in fill.rects.iter() {
-        let bounds = fill.bounds(rect);
-        let bounds = Bounds::new(origin + bounds.origin, bounds.size);
-        window.paint_quad(gpui_kit::fill(bounds, fill.color));
+/// Paints the visible part of `canvas`, displayed at `bounds` in window coordinates.
+///
+/// gpui samples images with linear filtering, which would blur pixels when
+/// the canvas is scaled up. So the view is rendered on the CPU at exactly the
+/// device resolution and drawn 1:1.
+fn paint_view(window: &mut Window, canvas: &Canvas, bounds: Bounds<Pixels>, cache: &mut ViewCache) {
+    let scale = window.scale_factor();
+    let visible = bounds.intersect(&window.content_mask().bounds);
+    if visible.size.width <= px(0.0) || visible.size.height <= px(0.0) {
+        return;
     }
+    // Device pixels relative to the canvas's top-left, snapped to whole pixels
+    let to_device = |pixels: Pixels| pixels.as_f32() * scale;
+    let canvas_x = to_device(bounds.origin.x).round();
+    let canvas_y = to_device(bounds.origin.y).round();
+    let left = (to_device(visible.origin.x).floor() - canvas_x).max(0.0);
+    let top = (to_device(visible.origin.y).floor() - canvas_y).max(0.0);
+    let right = to_device(visible.origin.x + visible.size.width).ceil() - canvas_x;
+    let bottom = to_device(visible.origin.y + visible.size.height).ceil() - canvas_y;
+    if right <= left || bottom <= top {
+        return;
+    }
+    let key = ViewKey {
+        version: canvas.version(),
+        scale: scale.to_bits(),
+        origin: point(left as u32, top as u32),
+        size: size((right - left) as u32, (bottom - top) as u32),
+    };
+
+    if cache.key != Some(key) {
+        let bytes = canvas.render_view(key.origin, key.size, scale);
+        let Some(frame) = RgbaImage::from_raw(key.size.width, key.size.height, bytes) else {
+            return;
+        };
+        let image = Arc::new(RenderImage::new(vec![Frame::new(frame)]));
+        // Free the previous view's GPU texture
+        if let Some(previous) = cache.image.replace(image) {
+            window.drop_image(previous).ok();
+        }
+        cache.key = Some(key);
+    }
+    let Some(image) = cache.image.clone() else {
+        return;
+    };
+
+    let image_bounds = Bounds::new(
+        point(px((canvas_x + left) / scale), px((canvas_y + top) / scale)),
+        size(px((right - left) / scale), px((bottom - top) / scale)),
+    );
+    window
+        .paint_image(
+            image_bounds,
+            image_bounds,
+            Corners::default(),
+            image,
+            0,
+            false,
+        )
+        .ok();
 }
 
 fn main() {
