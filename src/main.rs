@@ -25,10 +25,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 use text::{FONTS, FontChoice, TextRenderer};
 use tiny_skia::Pixmap;
+use tool::{SHAPES, ShapeKind, TOOLS, Tool, brush_icon};
 
 mod assets;
 mod canvas;
 mod text;
+mod tool;
 
 actions!(
     petit_paint,
@@ -163,49 +165,6 @@ struct ViewCache {
     image: Option<Arc<RenderImage>>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum ShapeKind {
-    Line,
-    Rectangle,
-    Ellipse,
-    /// Built by clicking each corner; closes on a double-click, Enter, or a
-    /// click on the first corner.
-    Polygon,
-}
-
-/// Shapes in toolbar order.
-const SHAPES: [ShapeKind; 4] = [
-    ShapeKind::Line,
-    ShapeKind::Rectangle,
-    ShapeKind::Ellipse,
-    ShapeKind::Polygon,
-];
-
-impl ShapeKind {
-    fn label(self) -> &'static str {
-        match self {
-            ShapeKind::Line => "Line",
-            ShapeKind::Rectangle => "Rectangle",
-            ShapeKind::Ellipse => "Ellipse",
-            ShapeKind::Polygon => "Polygon",
-        }
-    }
-
-    fn icon(self) -> IconName {
-        match self {
-            ShapeKind::Line => IconName::Slash,
-            ShapeKind::Rectangle => IconName::Square,
-            ShapeKind::Ellipse => IconName::Circle,
-            ShapeKind::Polygon => IconName::Pentagon,
-        }
-    }
-
-    /// Whether the shape has an inside that can be filled.
-    fn fillable(self) -> bool {
-        self != ShapeKind::Line
-    }
-}
-
 /// Text being typed, previewed on the canvas until it is placed.
 struct TextEdit {
     /// Canvas pixel where the text starts.
@@ -221,61 +180,6 @@ struct TextEdit {
 struct ShapeDrag {
     start: Point<Pixels>,
     end: Point<Pixels>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Tool {
-    /// Selects a rectangle to move, copy, cut or delete.
-    Select,
-    /// Draws freehand with the brush chosen in the toolbar.
-    Pen,
-    /// Erases to transparency.
-    Eraser,
-    /// Picks the brush color from the canvas, then switches back to the pen.
-    Eyedropper,
-    /// Fills the region of matching color under the cursor with the brush color.
-    Fill,
-    /// Draws the shape chosen in the toolbar.
-    Shape,
-    /// Types text onto the canvas at the clicked point.
-    Text,
-}
-
-/// Tools in toolbar order.
-const TOOLS: [Tool; 7] = [
-    Tool::Select,
-    Tool::Pen,
-    Tool::Eraser,
-    Tool::Eyedropper,
-    Tool::Fill,
-    Tool::Shape,
-    Tool::Text,
-];
-
-impl Tool {
-    fn icon(self) -> IconName {
-        match self {
-            Tool::Select => IconName::SquareDashed,
-            Tool::Pen => IconName::Paintbrush,
-            Tool::Eraser => IconName::Eraser,
-            Tool::Eyedropper => IconName::Pipette,
-            Tool::Fill => IconName::PaintBucket,
-            Tool::Shape => IconName::Shapes,
-            Tool::Text => IconName::Type,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Tool::Select => "Select",
-            Tool::Pen => "Brush",
-            Tool::Eraser => "Eraser",
-            Tool::Eyedropper => "Eyedropper",
-            Tool::Fill => "Fill",
-            Tool::Shape => "Shape",
-            Tool::Text => "Text",
-        }
-    }
 }
 
 /// A handle on the canvas edge that resizes it when dragged.
@@ -2224,16 +2128,6 @@ impl Render for PaintApp {
                     .child(viewport),
             )
             .child(status_bar)
-    }
-}
-
-fn brush_icon(brush: Brush) -> IconName {
-    match brush {
-        Brush::Pen => IconName::Pen,
-        Brush::Pencil => IconName::Pencil,
-        Brush::Marker => IconName::Highlighter,
-        Brush::Airbrush => IconName::SprayCan,
-        Brush::Calligraphy => IconName::PenTool,
     }
 }
 
