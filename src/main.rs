@@ -1,8 +1,13 @@
-use gpui::{
-    canvas, div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Hsla,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
-    Window, WindowBounds, WindowOptions,
+use gpui_kit::component::{
+    ActiveTheme as _, h_flex,
+    button::*,
+    color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
+    slider::{Slider, SliderEvent, SliderState, SliderValue},
+    v_flex,
 };
+use gpui_kit::*;
+
+const DEFAULT_WIDTH: f32 = 4.0;
 
 /// A single brush stroke. Points are stored in window coordinates.
 struct Stroke {
@@ -16,15 +21,50 @@ struct PaintApp {
     drawing: bool,
     color: Hsla,
     width: Pixels,
+    color_picker: Entity<ColorPickerState>,
+    width_slider: Entity<SliderState>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl PaintApp {
-    fn new() -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let color: Hsla = rgb(0x222222).into();
+        let color_picker = cx.new(|cx| ColorPickerState::new(window, cx).default_value(color));
+        let width_slider = cx.new(|_| {
+            SliderState::new()
+                .min(1.0)
+                .max(32.0)
+                .step(1.0)
+                .default_value(DEFAULT_WIDTH)
+        });
+
+        let _subscriptions = vec![
+            cx.subscribe_in(&color_picker, window, |this, _, event, _, cx| {
+                let ColorPickerEvent::Change(Some(color)) = event else {
+                    return;
+                };
+                this.color = *color;
+                cx.notify();
+            }),
+            cx.subscribe_in(&width_slider, window, |this, _, event, _, cx| {
+                let (SliderEvent::Change(SliderValue::Single(width))
+                | SliderEvent::Release(SliderValue::Single(width))) = event
+                else {
+                    return;
+                };
+                this.width = px(*width);
+                cx.notify();
+            }),
+        ];
+
         Self {
             strokes: Vec::new(),
             drawing: false,
-            color: rgb(0x222222).into(),
-            width: px(4.0),
+            color,
+            width: px(DEFAULT_WIDTH),
+            color_picker,
+            width_slider,
+            _subscriptions,
         }
     }
 
@@ -68,28 +108,28 @@ impl Render for PaintApp {
             .map(|s| (s.points.clone(), s.color, s.width))
             .collect();
 
-        let toolbar = div()
-            .flex()
-            .items_center()
-            .gap_2()
+        let theme = cx.theme();
+
+        let toolbar = h_flex()
+            .gap_3()
             .px_3()
-            .h(px(40.0))
-            .bg(rgb(0xeeeeee))
+            .h(px(44.0))
+            .bg(theme.background)
             .border_b_1()
-            .border_color(rgb(0xcccccc))
+            .border_color(theme.border)
             .child("petit-paint")
+            .child(ColorPicker::new(&self.color_picker))
             .child(
-                div()
-                    .id("clear")
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(rgb(0xffffff))
-                    .border_1()
-                    .border_color(rgb(0xbbbbbb))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0xf5f5f5)))
-                    .child("Clear")
+                h_flex()
+                    .gap_2()
+                    .child("Width")
+                    .child(div().w(px(160.0)).child(Slider::new(&self.width_slider)))
+                    .child(div().w(px(24.0)).child(format!("{}", self.width.as_f32()))),
+            )
+            .child(
+                Button::new("clear")
+                    .outline()
+                    .label("Clear")
                     .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
             );
 
@@ -115,11 +155,9 @@ impl Render for PaintApp {
                 .size_full(),
             );
 
-        div()
-            .flex()
-            .flex_col()
+        v_flex()
             .size_full()
-            .text_color(rgb(0x333333))
+            .text_color(theme.foreground)
             .child(toolbar)
             .child(canvas_area)
     }
@@ -145,16 +183,18 @@ fn paint_stroke(window: &mut Window, points: &[Point<Pixels>], color: Hsla, widt
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    gpui_kit::application().run(|cx| {
+        gpui_kit::init(cx);
         let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
-        cx.open_window(
+        gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| PaintApp::new()),
+            cx,
+            |window, cx| cx.new(|cx| PaintApp::new(window, cx)),
         )
-        .unwrap();
+        .expect("failed to open window");
         cx.activate(true);
     });
 }
