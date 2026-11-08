@@ -14,7 +14,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use canvas::{BRUSHES, Brush, Canvas, Change, Floating, Grid, PixelRect, StrokeLayer};
+use canvas::{
+    BRUSHES, Brush, Canvas, Change, Floating, Grid, Orientation, PixelRect, StrokeLayer,
+};
 use image::{Frame, RgbaImage};
 use lyon::tessellation::{LineCap, LineJoin};
 use std::cell::{Cell, RefCell};
@@ -1264,6 +1266,37 @@ impl PaintApp {
         cx.notify();
     }
 
+    /// Flips or turns the selection, or the whole canvas when nothing is selected.
+    fn reorient(&mut self, orientation: Orientation, cx: &mut Context<Self>) {
+        if self.dragging() {
+            return;
+        }
+        self.commit_text(cx);
+        self.cancel_polygon(cx);
+        if let Some(selection) = &mut self.selection {
+            // Lift the selection so the change is one undo step with any move
+            if selection.floating.is_none() {
+                selection.floating = self.canvas.lift(selection.rect);
+            }
+            if let Some(floating) = &mut selection.floating {
+                floating.reorient(orientation);
+                let (width, height) = (floating.pixels.width(), floating.pixels.height());
+                // Turn about the selection's center
+                let rect = &mut selection.rect;
+                rect.x += (rect.width as i32 - width as i32) / 2;
+                rect.y += (rect.height as i32 - height as i32) / 2;
+                rect.width = width;
+                rect.height = height;
+                self.floating_id += 1;
+            }
+            cx.notify();
+            return;
+        }
+        let undo = self.canvas.reorient(orientation);
+        self.record(undo, cx);
+        self.canvas_size = self.canvas.size();
+    }
+
     /// Resizes the canvas, keeping the drawing anchored at the top-left.
     /// Growing adds background; shrinking crops, which undo brings back.
     fn resize_canvas(&mut self, size: Size<Pixels>, cx: &mut Context<Self>) {
@@ -1708,6 +1741,32 @@ impl Render for PaintApp {
                     .label("Canvas Size")
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_canvas_size_dialog(window, cx)
+                    })),
+            )
+            .child(
+                ButtonGroup::new("orientation")
+                    .outline()
+                    .child(Button::new("flip-horizontal").label("Flip ↔").tooltip(
+                        "Flip left to right: the selection, or the whole image",
+                    ))
+                    .child(Button::new("flip-vertical").label("Flip ↕").tooltip(
+                        "Flip top to bottom: the selection, or the whole image",
+                    ))
+                    .child(Button::new("rotate-left").label("↺ 90°").tooltip(
+                        "Turn counterclockwise: the selection, or the whole image",
+                    ))
+                    .child(Button::new("rotate-right").label("↻ 90°").tooltip(
+                        "Turn clockwise: the selection, or the whole image",
+                    ))
+                    .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
+                        let orientation = match clicks.first() {
+                            Some(0) => Orientation::FlipHorizontal,
+                            Some(1) => Orientation::FlipVertical,
+                            Some(2) => Orientation::RotateCounterClockwise,
+                            Some(3) => Orientation::RotateClockwise,
+                            _ => return,
+                        };
+                        this.reorient(orientation, cx);
                     })),
             )
             .child(

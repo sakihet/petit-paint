@@ -58,9 +58,46 @@ impl PixelRect {
     }
 }
 
+/// A flip or quarter turn of an image.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Orientation {
+    FlipHorizontal,
+    FlipVertical,
+    RotateClockwise,
+    RotateCounterClockwise,
+}
+
+/// Returns `pixmap` flipped or turned. Quarter turns swap width and height.
+pub fn reoriented(pixmap: &Pixmap, orientation: Orientation) -> Pixmap {
+    let (width, height) = (pixmap.width(), pixmap.height());
+    let (new_width, new_height) = match orientation {
+        Orientation::FlipHorizontal | Orientation::FlipVertical => (width, height),
+        Orientation::RotateClockwise | Orientation::RotateCounterClockwise => (height, width),
+    };
+    let mut out = Pixmap::new(new_width, new_height).expect("same area as a valid pixmap");
+    let source = pixmap.pixels();
+    let target = out.pixels_mut();
+    for y in 0..height {
+        for x in 0..width {
+            // Where pixel (x, y) lands
+            let (nx, ny) = match orientation {
+                Orientation::FlipHorizontal => (width - 1 - x, y),
+                Orientation::FlipVertical => (x, height - 1 - y),
+                Orientation::RotateClockwise => (height - 1 - y, x),
+                Orientation::RotateCounterClockwise => (y, width - 1 - x),
+            };
+            target[(ny * new_width + nx) as usize] = source[(y * width + x) as usize];
+        }
+    }
+    out
+}
+
 /// Pixels lifted off the canvas or pasted, which float above it until dropped.
 pub struct Floating {
     pub pixels: Pixmap,
+    /// Whether the pixels were flipped or turned since they were lifted, so
+    /// dropping them back in place still changes the canvas.
+    reoriented: bool,
     /// The canvas before the pixels were lifted or pasted, so the whole move
     /// is recorded as one undo step when they are dropped.
     before: Pixmap,
@@ -109,6 +146,13 @@ impl Brush {
 pub struct StrokeLayer {
     pub pixels: Pixmap,
     pub at: Point<i32>,
+}
+
+impl Floating {
+    pub fn reorient(&mut self, orientation: Orientation) {
+        self.pixels = reoriented(&self.pixels, orientation);
+        self.reoriented = true;
+    }
 }
 
 /// A reversible change to the canvas. Applying one returns its inverse.
@@ -323,6 +367,12 @@ impl Canvas {
         Ok(self.apply(Change::Replace(resized)))
     }
 
+    /// Flips or turns the whole canvas, and returns the change that undoes it.
+    pub fn reorient(&mut self, orientation: Orientation) -> Change {
+        let pixels = reoriented(&self.pixmap, orientation);
+        self.replace(pixels)
+    }
+
     /// Replaces the whole canvas with `pixels`, taking on their size, and
     /// returns the change that undoes it.
     pub fn replace(&mut self, pixels: Pixmap) -> Change {
@@ -405,6 +455,7 @@ impl Canvas {
         self.erase(rect);
         Some(Floating {
             pixels,
+            reoriented: false,
             before,
             source: Some(source),
         })
@@ -414,6 +465,7 @@ impl Canvas {
     pub fn float(&self, pixels: Pixmap) -> Floating {
         Floating {
             pixels,
+            reoriented: false,
             before: self.pixmap.clone(),
             source: None,
         }
@@ -449,7 +501,7 @@ impl Canvas {
             );
             self.version += 1;
         }
-        if keep && target == floating.source {
+        if keep && target == floating.source && !floating.reoriented {
             return None;
         }
         // Restore both where the pixels came from and where they landed
@@ -1430,6 +1482,71 @@ mod tests {
         let view = canvas.render_view(point(0, 1), size(16, 1), 4.0, 1000.0, grid);
         // Device column 4 starts pixel 1 (a pixel line), column 8 starts pixel 2 (a tile line)
         assert!(view[8 * 4] < view[4 * 4]);
+    }
+
+    /// A 3x2 image whose pixels are numbered 1-6 in their red channel.
+    fn numbered() -> Pixmap {
+        let mut pixmap = Pixmap::new(3, 2).unwrap();
+        for (i, pixel) in pixmap.pixels_mut().iter_mut().enumerate() {
+            *pixel = PremultipliedColorU8::from_rgba(i as u8 + 1, 0, 0, 255).unwrap();
+        }
+        pixmap
+    }
+
+    fn numbers(pixmap: &Pixmap) -> (u32, u32, Vec<u8>) {
+        let reds = pixmap.pixels().iter().map(|p| p.red()).collect();
+        (pixmap.width(), pixmap.height(), reds)
+    }
+
+    #[test]
+    fn reorienting_moves_pixels_as_expected() {
+        // 1 2 3
+        // 4 5 6
+        let image = numbered();
+        let result = |o| numbers(&reoriented(&image, o));
+        assert_eq!(result(Orientation::FlipHorizontal), (3, 2, vec![3, 2, 1, 6, 5, 4]));
+        assert_eq!(result(Orientation::FlipVertical), (3, 2, vec![4, 5, 6, 1, 2, 3]));
+        // 4 1
+        // 5 2
+        // 6 3
+        assert_eq!(result(Orientation::RotateClockwise), (2, 3, vec![4, 1, 5, 2, 6, 3]));
+        // 3 6
+        // 2 5
+        // 1 4
+        assert_eq!(result(Orientation::RotateCounterClockwise), (2, 3, vec![3, 6, 2, 5, 1, 4]));
+    }
+
+    #[test]
+    fn four_quarter_turns_restore_the_image() {
+        let mut image = numbered();
+        for _ in 0..4 {
+            image = reoriented(&image, Orientation::RotateClockwise);
+        }
+        assert_eq!(numbers(&image), numbers(&numbered()));
+    }
+
+    #[test]
+    fn rotating_the_canvas_swaps_its_size_and_can_be_undone() {
+        let mut canvas = canvas(80, 60);
+        let undo = canvas.reorient(Orientation::RotateClockwise);
+        assert_eq!(canvas.size(), size(px(60.0), px(80.0)));
+        canvas.apply(undo);
+        assert_eq!(canvas.size(), size(px(80.0), px(60.0)));
+    }
+
+    #[test]
+    fn flipping_a_selection_in_place_is_recorded() {
+        let mut canvas = canvas_with_block();
+        // Lift the left half of the block plus empty space to its left
+        let mut floating = canvas.lift(rect(0, 2, 4, 4)).unwrap();
+        floating.reorient(Orientation::FlipHorizontal);
+        let undo = canvas.drop_floating(floating, point(0, 2), true).unwrap();
+        // The block's left half (columns 2-3) now sits at columns 0-1
+        assert_eq!(rgb_at(&canvas, 0, 3), (0, 0, 0));
+        assert_eq!(rgb_at(&canvas, 2, 3), (255, 255, 255));
+        canvas.apply(undo);
+        assert_eq!(rgb_at(&canvas, 0, 3), (255, 255, 255));
+        assert_eq!(rgb_at(&canvas, 2, 3), (0, 0, 0));
     }
 
     #[test]
