@@ -1,5 +1,5 @@
 use gpui_kit::component::{
-    ActiveTheme as _, h_flex,
+    ActiveTheme as _, Disableable as _, h_flex,
     button::*,
     color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
     slider::{Slider, SliderEvent, SliderState, SliderValue},
@@ -7,7 +7,16 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 
+actions!(petit_paint, [Undo]);
+
 const DEFAULT_WIDTH: f32 = 4.0;
+const KEY_CONTEXT: &str = "PaintApp";
+
+// KeyBinding::new cannot resolve "secondary-", so pick the modifier per OS
+#[cfg(target_os = "macos")]
+const UNDO_KEY: &str = "cmd-z";
+#[cfg(not(target_os = "macos"))]
+const UNDO_KEY: &str = "ctrl-z";
 
 /// A single brush stroke. Points are stored in window coordinates.
 struct Stroke {
@@ -16,9 +25,19 @@ struct Stroke {
     width: Pixels,
 }
 
+/// An undoable change to the drawing.
+enum HistoryEntry {
+    /// A stroke was appended to the end of `strokes`.
+    Stroke,
+    /// The canvas was cleared; holds the strokes that were removed.
+    Clear(Vec<Stroke>),
+}
+
 struct PaintApp {
     strokes: Vec<Stroke>,
+    history: Vec<HistoryEntry>,
     drawing: bool,
+    focus_handle: FocusHandle,
     color: Hsla,
     width: Pixels,
     color_picker: Entity<ColorPickerState>,
@@ -59,7 +78,9 @@ impl PaintApp {
 
         Self {
             strokes: Vec::new(),
+            history: Vec::new(),
             drawing: false,
+            focus_handle: cx.focus_handle(),
             color,
             width: px(DEFAULT_WIDTH),
             color_picker,
@@ -68,13 +89,21 @@ impl PaintApp {
         }
     }
 
-    fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Take focus back from toolbar inputs so shortcuts reach the canvas
+        window.focus(&self.focus_handle, cx);
         self.drawing = true;
         self.strokes.push(Stroke {
             points: vec![event.position],
             color: self.color,
             width: self.width,
         });
+        self.history.push(HistoryEntry::Stroke);
         cx.notify();
     }
 
@@ -94,7 +123,26 @@ impl PaintApp {
     }
 
     fn clear(&mut self, cx: &mut Context<Self>) {
-        self.strokes.clear();
+        if self.strokes.is_empty() {
+            return;
+        }
+        let removed = std::mem::take(&mut self.strokes);
+        self.history.push(HistoryEntry::Clear(removed));
+        cx.notify();
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        // Undoing mid-drag would pop the stroke being drawn
+        if self.drawing {
+            return;
+        }
+        match self.history.pop() {
+            Some(HistoryEntry::Stroke) => {
+                self.strokes.pop();
+            }
+            Some(HistoryEntry::Clear(removed)) => self.strokes = removed,
+            None => return,
+        }
         cx.notify();
     }
 }
@@ -127,6 +175,14 @@ impl Render for PaintApp {
                     .child(div().w(px(24.0)).child(format!("{}", self.width.as_f32()))),
             )
             .child(
+                Button::new("undo")
+                    .outline()
+                    .label("Undo")
+                    .tooltip_with_action("Undo", &Undo, Some(KEY_CONTEXT))
+                    .disabled(self.history.is_empty())
+                    .on_click(cx.listener(|this, _, window, cx| this.undo(&Undo, window, cx))),
+            )
+            .child(
                 Button::new("clear")
                     .outline()
                     .label("Clear")
@@ -156,6 +212,9 @@ impl Render for PaintApp {
             );
 
         v_flex()
+            .key_context(KEY_CONTEXT)
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::undo))
             .size_full()
             .text_color(theme.foreground)
             .child(toolbar)
@@ -185,6 +244,7 @@ fn paint_stroke(window: &mut Window, points: &[Point<Pixels>], color: Hsla, widt
 fn main() {
     gpui_kit::application().run(|cx| {
         gpui_kit::init(cx);
+        cx.bind_keys([KeyBinding::new(UNDO_KEY, Undo, Some(KEY_CONTEXT))]);
         let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
         gpui_kit::open_window(
             WindowOptions {
@@ -192,7 +252,12 @@ fn main() {
                 ..Default::default()
             },
             cx,
-            |window, cx| cx.new(|cx| PaintApp::new(window, cx)),
+            |window, cx| {
+                let app = cx.new(|cx| PaintApp::new(window, cx));
+                let focus_handle = app.read(cx).focus_handle.clone();
+                window.focus(&focus_handle, cx);
+                app
+            },
         )
         .expect("failed to open window");
         cx.activate(true);
