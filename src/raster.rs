@@ -366,6 +366,29 @@ mod tests {
     }
 
     #[test]
+    fn fill_made_on_a_retina_screen_exports_at_canvas_size() {
+        let canvas = size(px(100.0), px(100.0));
+        let white: Hsla = rgb(0xffffff).into();
+        let red: Hsla = rgb(0xff0000).into();
+        let rects = flood_fill(&[], canvas, white, 2.0, point(px(50.0), px(50.0)), red)
+            .unwrap()
+            .unwrap();
+        let items = [Item::Fill(Fill {
+            color: red,
+            scale: 2.0,
+            rects: Rc::new(rects),
+        })];
+
+        let png = encode_png(&items, canvas, white, 1.0).unwrap();
+        let pixmap = Pixmap::decode_png(&png).unwrap();
+
+        assert_eq!((pixmap.width(), pixmap.height()), (100, 100));
+        for (x, y) in [(0, 0), (50, 50), (99, 99)] {
+            assert_eq!(rgb_at(&pixmap, x, y), (255, 0, 0), "({x}, {y})");
+        }
+    }
+
+    #[test]
     fn flood_fill_with_the_same_color_does_nothing() {
         let canvas = size(px(10.0), px(10.0));
         let white: Hsla = rgb(0xffffff).into();

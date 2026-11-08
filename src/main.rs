@@ -244,7 +244,7 @@ impl PaintApp {
     fn pick_color(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let color = raster::color_at(
             &self.items,
-            self.canvas_bounds.get().size,
+            self.canvas_size,
             rgb(CANVAS_BACKGROUND).into(),
             window.scale_factor(),
             position,
@@ -264,7 +264,7 @@ impl PaintApp {
         let scale = window.scale_factor();
         let rects = raster::flood_fill(
             &self.items,
-            self.canvas_bounds.get().size,
+            self.canvas_size,
             rgb(CANVAS_BACKGROUND).into(),
             scale,
             position,
@@ -331,9 +331,10 @@ impl PaintApp {
         // Encode now so the image reflects the drawing at the time of the request
         let png = raster::encode_png(
             &self.items,
-            self.canvas_bounds.get().size,
+            self.canvas_size,
             rgb(CANVAS_BACKGROUND).into(),
-            window.scale_factor(),
+            // One image pixel per canvas pixel, so the PNG is exactly the canvas size
+            1.0,
         );
         let directory = std::env::home_dir().unwrap_or_default();
         let path = cx.prompt_for_new_path(&directory, Some("untitled.png"));
