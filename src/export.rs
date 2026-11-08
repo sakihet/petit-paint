@@ -1,14 +1,16 @@
 use anyhow::{Context as _, Result, anyhow};
 use gpui_kit::{Bounds, Hsla, Pixels};
-use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Stroke as SkiaStroke, Transform};
+use tiny_skia::{
+    Color, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke as SkiaStroke, Transform,
+};
 
 use crate::Stroke;
 
 /// Rasterizes the strokes inside `bounds` and encodes them as PNG.
 ///
 /// `scale` is the window's scale factor, so the image matches the on-screen
-/// resolution. The stroke style follows gpui's defaults (butt caps, miter
-/// joins), which are also tiny-skia's defaults.
+/// resolution. Strokes use round caps and joins to match the on-screen
+/// rendering.
 pub fn encode_png(
     strokes: &[Stroke],
     bounds: Bounds<Pixels>,
@@ -51,6 +53,8 @@ pub fn encode_png(
         paint.anti_alias = true;
         let style = SkiaStroke {
             width: stroke.width.as_f32(),
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
             ..Default::default()
         };
         pixmap.stroke_path(&path, &paint, &style, transform, None);
@@ -92,5 +96,25 @@ mod tests {
             (background.red(), background.green(), background.blue()),
             (255, 255, 255)
         );
+    }
+
+    #[test]
+    fn single_click_exports_a_round_dot() {
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(40.0), px(40.0)));
+        let strokes = [Stroke {
+            points: vec![point(px(20.0), px(20.0))],
+            color: rgb(0x000000).into(),
+            width: px(10.0),
+        }];
+
+        let png = encode_png(&strokes, bounds, rgb(0xffffff).into(), 1.0).unwrap();
+        let pixmap = Pixmap::decode_png(&png).unwrap();
+
+        // 3px from the center is inside the 5px radius, in every direction
+        for (x, y) in [(23, 20), (17, 20), (20, 23), (20, 17)] {
+            assert_eq!(pixmap.pixel(x, y).unwrap().red(), 0, "({x}, {y})");
+        }
+        // The corner of the bounding square stays white because the cap is round
+        assert_eq!(pixmap.pixel(15, 15).unwrap().red(), 255);
     }
 }

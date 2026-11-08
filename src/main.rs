@@ -7,6 +7,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::component::{WindowExt as _, notification::Notification};
 use gpui_kit::*;
+use lyon::tessellation::{LineCap, LineJoin};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -363,7 +364,12 @@ fn paint_stroke(window: &mut Window, points: &[Point<Pixels>], color: Hsla, widt
     let Some(first) = points.first() else {
         return;
     };
-    let mut builder = PathBuilder::stroke(width);
+    // Round caps turn a single click into a dot; round joins avoid miter spikes on sharp turns
+    let options = StrokeOptions::default()
+        .with_line_width(width.as_f32())
+        .with_line_cap(LineCap::Round)
+        .with_line_join(LineJoin::Round);
+    let mut builder = PathBuilder::default().with_style(PathStyle::Stroke(options));
     builder.move_to(*first);
     if points.len() == 1 {
         // Draw a tiny segment so a single click still leaves a visible dot
