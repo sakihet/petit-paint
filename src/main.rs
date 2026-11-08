@@ -33,7 +33,7 @@ const REDO_KEYS: &[&str] = &["ctrl-shift-z", "ctrl-y"];
 #[cfg(not(target_os = "macos"))]
 const SAVE_KEY: &str = "ctrl-s";
 
-/// A single brush stroke. Points are stored in window coordinates.
+/// A single brush stroke. Points are in canvas coordinates, with the origin at its top-left.
 #[derive(Clone)]
 struct Stroke {
     points: Vec<Point<Pixels>>,
@@ -45,21 +45,17 @@ struct Stroke {
 #[derive(Clone)]
 struct Fill {
     color: Hsla,
-    /// Canvas origin in window coordinates when the fill was made.
-    origin: Point<Pixels>,
     /// Window scale factor when the fill was made; `rects` are in its device pixels.
     scale: f32,
     rects: Rc<Vec<raster::PixelRect>>,
 }
 
 impl Fill {
-    fn window_bounds(&self, rect: &raster::PixelRect) -> Bounds<Pixels> {
+    /// Returns `rect` in canvas coordinates.
+    fn bounds(&self, rect: &raster::PixelRect) -> Bounds<Pixels> {
         let to_pixels = |device: u32| px(device as f32 / self.scale);
         Bounds::new(
-            point(
-                self.origin.x + to_pixels(rect.x),
-                self.origin.y + to_pixels(rect.y),
-            ),
+            point(to_pixels(rect.x), to_pixels(rect.y)),
             size(to_pixels(rect.width), to_pixels(rect.height)),
         )
     }
@@ -120,7 +116,8 @@ struct PaintApp {
     redo_stack: Vec<RedoEntry>,
     drawing: bool,
     focus_handle: FocusHandle,
-    /// Canvas bounds from the last paint, used to crop the PNG export.
+    /// Canvas bounds in window coordinates from the last paint, used to map
+    /// mouse positions to canvas coordinates.
     canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
     color: Hsla,
     width: Pixels,
@@ -184,27 +181,32 @@ impl PaintApp {
     ) {
         // Take focus back from toolbar inputs so shortcuts reach the canvas
         window.focus(&self.focus_handle, cx);
+        let position = self.to_canvas(event.position);
         let color = match self.tool {
             Tool::Pen => self.color,
             Tool::Eraser => rgb(CANVAS_BACKGROUND).into(),
             Tool::Eyedropper => {
-                self.pick_color(event.position, window, cx);
+                self.pick_color(position, window, cx);
                 return;
             }
             Tool::Fill => {
-                self.fill_at(event.position, window, cx);
+                self.fill_at(position, window, cx);
                 return;
             }
         };
         self.drawing = true;
         self.push_item(
             Item::Stroke(Stroke {
-                points: vec![event.position],
+                points: vec![position],
                 color,
                 width: self.width,
             }),
             cx,
         );
+    }
+
+    fn to_canvas(&self, position: Point<Pixels>) -> Point<Pixels> {
+        position - self.canvas_bounds.get().origin
     }
 
     fn push_item(&mut self, item: Item, cx: &mut Context<Self>) {
@@ -218,8 +220,9 @@ impl PaintApp {
         if !self.drawing {
             return;
         }
+        let position = self.to_canvas(event.position);
         if let Some(Item::Stroke(stroke)) = self.items.last_mut() {
-            stroke.points.push(event.position);
+            stroke.points.push(position);
             cx.notify();
         }
     }
@@ -232,7 +235,7 @@ impl PaintApp {
     fn pick_color(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let color = raster::color_at(
             &self.items,
-            self.canvas_bounds.get(),
+            self.canvas_bounds.get().size,
             rgb(CANVAS_BACKGROUND).into(),
             window.scale_factor(),
             position,
@@ -249,11 +252,10 @@ impl PaintApp {
     }
 
     fn fill_at(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let bounds = self.canvas_bounds.get();
         let scale = window.scale_factor();
         let rects = raster::flood_fill(
             &self.items,
-            bounds,
+            self.canvas_bounds.get().size,
             rgb(CANVAS_BACKGROUND).into(),
             scale,
             position,
@@ -264,7 +266,6 @@ impl PaintApp {
         };
         let fill = Fill {
             color: self.color,
-            origin: bounds.origin,
             scale,
             rects: Rc::new(rects),
         };
@@ -321,7 +322,7 @@ impl PaintApp {
         // Encode now so the image reflects the drawing at the time of the request
         let png = raster::encode_png(
             &self.items,
-            self.canvas_bounds.get(),
+            self.canvas_bounds.get().size,
             rgb(CANVAS_BACKGROUND).into(),
             window.scale_factor(),
         );
@@ -438,8 +439,10 @@ impl Render for PaintApp {
                         window.paint_layer(bounds, |window| {
                             for item in &items {
                                 match item {
-                                    Item::Stroke(stroke) => paint_stroke(window, stroke),
-                                    Item::Fill(fill) => paint_fill(window, fill),
+                                    Item::Stroke(stroke) => {
+                                        paint_stroke(window, stroke, bounds.origin)
+                                    }
+                                    Item::Fill(fill) => paint_fill(window, fill, bounds.origin),
                                 }
                             }
                         });
@@ -461,7 +464,8 @@ impl Render for PaintApp {
     }
 }
 
-fn paint_stroke(window: &mut Window, stroke: &Stroke) {
+/// Paints `stroke` with the canvas top-left at `origin`, in window coordinates.
+fn paint_stroke(window: &mut Window, stroke: &Stroke, origin: Point<Pixels>) {
     let Stroke {
         points,
         color,
@@ -476,13 +480,13 @@ fn paint_stroke(window: &mut Window, stroke: &Stroke) {
         .with_line_cap(LineCap::Round)
         .with_line_join(LineJoin::Round);
     let mut builder = PathBuilder::default().with_style(PathStyle::Stroke(options));
-    builder.move_to(*first);
+    builder.move_to(origin + *first);
     if points.len() == 1 {
         // Draw a tiny segment so a single click still leaves a visible dot
-        builder.line_to(*first + Point::new(px(0.1), px(0.1)));
+        builder.line_to(origin + *first + Point::new(px(0.1), px(0.1)));
     } else {
         for p in &points[1..] {
-            builder.line_to(*p);
+            builder.line_to(origin + *p);
         }
     }
     if let Ok(path) = builder.build() {
@@ -490,9 +494,12 @@ fn paint_stroke(window: &mut Window, stroke: &Stroke) {
     }
 }
 
-fn paint_fill(window: &mut Window, fill: &Fill) {
+/// Paints `fill` with the canvas top-left at `origin`, in window coordinates.
+fn paint_fill(window: &mut Window, fill: &Fill, origin: Point<Pixels>) {
     for rect in fill.rects.iter() {
-        window.paint_quad(gpui_kit::fill(fill.window_bounds(rect), fill.color));
+        let bounds = fill.bounds(rect);
+        let bounds = Bounds::new(origin + bounds.origin, bounds.size);
+        window.paint_quad(gpui_kit::fill(bounds, fill.color));
     }
 }
 
