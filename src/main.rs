@@ -1,4 +1,5 @@
 use canvas::{BRUSHES, Brush, Canvas, Change, Floating, Grid, Orientation, PixelRect, StrokeLayer};
+use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _,
     button::*,
@@ -25,6 +26,7 @@ use std::sync::Arc;
 use text::{FONTS, FontChoice, TextRenderer};
 use tiny_skia::Pixmap;
 
+mod assets;
 mod canvas;
 mod text;
 
@@ -189,6 +191,15 @@ impl ShapeKind {
         }
     }
 
+    fn icon(self) -> IconName {
+        match self {
+            ShapeKind::Line => IconName::Slash,
+            ShapeKind::Rectangle => IconName::Square,
+            ShapeKind::Ellipse => IconName::Circle,
+            ShapeKind::Polygon => IconName::Pentagon,
+        }
+    }
+
     /// Whether the shape has an inside that can be filled.
     fn fillable(self) -> bool {
         self != ShapeKind::Line
@@ -242,6 +253,18 @@ const TOOLS: [Tool; 7] = [
 ];
 
 impl Tool {
+    fn icon(self) -> IconName {
+        match self {
+            Tool::Select => IconName::SquareDashed,
+            Tool::Pen => IconName::Paintbrush,
+            Tool::Eraser => IconName::Eraser,
+            Tool::Eyedropper => IconName::Pipette,
+            Tool::Fill => IconName::PaintBucket,
+            Tool::Shape => IconName::Shapes,
+            Tool::Text => IconName::Type,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Tool::Select => "Select",
@@ -1611,38 +1634,41 @@ impl Render for PaintApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
-        let toolbar = h_flex()
-            // Wrap instead of clipping buttons when the window is narrow
-            .flex_wrap()
-            .gap_3()
-            .px_3()
-            .py_1p5()
-            .min_h(px(44.0))
+        // Tools, as a column of icons left of the canvas
+        let tool_bar = v_flex()
+            .gap_1()
+            .p_1()
             .bg(theme.background)
-            .border_b_1()
+            .border_r_1()
             .border_color(theme.border)
-            .child("petit-paint")
-            .child(
-                ButtonGroup::new("tool")
-                    .outline()
-                    .children(TOOLS.map(|tool| {
-                        Button::new(tool.label())
-                            .label(tool.label())
-                            .selected(self.tool == tool)
-                    }))
-                    .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
-                        if let Some(&tool) = clicks.first().and_then(|ix| TOOLS.get(*ix)) {
-                            this.set_tool(tool, cx);
-                        }
-                    })),
-            )
+            .children(TOOLS.map(|tool| {
+                Button::new(tool.label())
+                    .ghost()
+                    .icon(tool.icon())
+                    .tooltip(tool.label())
+                    .selected(self.tool == tool)
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_tool(tool, cx)))
+            }));
+
+        let icon_button = |id: &'static str, icon: IconName| Button::new(id).ghost().icon(icon);
+        let separator = || div().w(px(1.0)).h(px(20.0)).mx_1().bg(theme.border);
+        let uses_width = matches!(self.tool, Tool::Pen | Tool::Eraser | Tool::Shape);
+
+        // The current tool's options, which give way to the actions when the
+        // window is too narrow for both
+        let tool_options = h_flex()
+            .gap_3()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
             .when(self.tool == Tool::Pen, |this| {
                 this.child(
                     ButtonGroup::new("brush")
                         .outline()
                         .children(BRUSHES.map(|brush| {
                             Button::new(brush.label())
-                                .label(brush.label())
+                                .icon(brush_icon(brush))
+                                .tooltip(brush.label())
                                 .selected(self.brush == brush)
                         }))
                         .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
@@ -1659,7 +1685,8 @@ impl Render for PaintApp {
                         .outline()
                         .children(SHAPES.map(|shape| {
                             Button::new(shape.label())
-                                .label(shape.label())
+                                .icon(shape.icon())
+                                .tooltip(shape.label())
                                 .selected(self.shape_kind == shape)
                         }))
                         .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
@@ -1703,99 +1730,117 @@ impl Render for PaintApp {
                         .child("Size")
                         .child(
                             div()
-                                .w(px(120.0))
+                                .w(px(100.0))
                                 .child(Slider::new(&self.font_size_slider)),
                         )
                         .child(div().w(px(28.0)).child(format!("{}", self.font_size))),
                 )
             })
+            .when(uses_width, |this| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .child("Width")
+                        .child(div().w(px(120.0)).child(Slider::new(&self.width_slider)))
+                        .child(div().w(px(24.0)).child(format!("{}", self.width.as_f32()))),
+                )
+            });
+
+        // Tool options on the left, actions on the right
+        let options_bar = h_flex()
+            .gap_3()
+            .px_3()
+            .h(px(44.0))
+            .flex_none()
+            .bg(theme.background)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(tool_options)
             .child(
                 h_flex()
-                    .gap_2()
-                    .child("Width")
-                    .child(div().w(px(160.0)).child(Slider::new(&self.width_slider)))
-                    .child(div().w(px(24.0)).child(format!("{}", self.width.as_f32()))),
-            )
-            .child(
-                Button::new("undo")
-                    .outline()
-                    .label("Undo")
-                    .tooltip_with_action("Undo", &Undo, Some(KEY_CONTEXT))
-                    .disabled(self.undo_stack.is_empty())
-                    .on_click(cx.listener(|this, _, window, cx| this.undo(&Undo, window, cx))),
-            )
-            .child(
-                Button::new("redo")
-                    .outline()
-                    .label("Redo")
-                    .tooltip_with_action("Redo", &Redo, Some(KEY_CONTEXT))
-                    .disabled(self.redo_stack.is_empty())
-                    .on_click(cx.listener(|this, _, window, cx| this.redo(&Redo, window, cx))),
-            )
-            .child(
-                Button::new("clear")
-                    .outline()
-                    .label("Clear")
-                    .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
-            )
-            .child(
-                Button::new("canvas-size")
-                    .outline()
-                    .label("Canvas Size")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_canvas_size_dialog(window, cx)),
-                    ),
-            )
-            .child(
-                ButtonGroup::new("orientation")
-                    .outline()
+                    .flex_none()
+                    .gap_1()
                     .child(
-                        Button::new("flip-horizontal")
-                            .label("Flip ↔")
-                            .tooltip("Flip left to right: the selection, or the whole image"),
+                        icon_button("undo", IconName::Undo2)
+                            .tooltip_with_action("Undo", &Undo, Some(KEY_CONTEXT))
+                            .disabled(self.undo_stack.is_empty())
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.undo(&Undo, window, cx)),
+                            ),
                     )
                     .child(
-                        Button::new("flip-vertical")
-                            .label("Flip ↕")
-                            .tooltip("Flip top to bottom: the selection, or the whole image"),
+                        icon_button("redo", IconName::Redo2)
+                            .tooltip_with_action("Redo", &Redo, Some(KEY_CONTEXT))
+                            .disabled(self.redo_stack.is_empty())
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.redo(&Redo, window, cx)),
+                            ),
+                    )
+                    .child(separator())
+                    .children(
+                        [
+                            (
+                                "flip-horizontal",
+                                IconName::FlipHorizontal2,
+                                "Flip left to right",
+                                Orientation::FlipHorizontal,
+                            ),
+                            (
+                                "flip-vertical",
+                                IconName::FlipVertical2,
+                                "Flip top to bottom",
+                                Orientation::FlipVertical,
+                            ),
+                            (
+                                "rotate-left",
+                                IconName::RotateCcw,
+                                "Turn counterclockwise",
+                                Orientation::RotateCounterClockwise,
+                            ),
+                            (
+                                "rotate-right",
+                                IconName::RotateCw,
+                                "Turn clockwise",
+                                Orientation::RotateClockwise,
+                            ),
+                        ]
+                        .map(|(id, icon, tooltip, orientation)| {
+                            icon_button(id, icon)
+                                .tooltip(format!("{tooltip}: the selection, or the whole image"))
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.reorient(orientation, cx)
+                                    }),
+                                )
+                        }),
+                    )
+                    .child(separator())
+                    .child(
+                        icon_button("canvas-size", IconName::Scaling)
+                            .tooltip("Canvas size")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_canvas_size_dialog(window, cx)
+                            })),
                     )
                     .child(
-                        Button::new("rotate-left")
-                            .label("↺ 90°")
-                            .tooltip("Turn counterclockwise: the selection, or the whole image"),
+                        icon_button("clear", IconName::Trash)
+                            .tooltip("Clear the canvas")
+                            .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
+                    )
+                    .child(separator())
+                    .child(
+                        icon_button("open", IconName::FolderOpen)
+                            .tooltip_with_action("Open a PNG image", &OpenImage, Some(KEY_CONTEXT))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_image(&OpenImage, window, cx)
+                            })),
                     )
                     .child(
-                        Button::new("rotate-right")
-                            .label("↻ 90°")
-                            .tooltip("Turn clockwise: the selection, or the whole image"),
-                    )
-                    .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
-                        let orientation = match clicks.first() {
-                            Some(0) => Orientation::FlipHorizontal,
-                            Some(1) => Orientation::FlipVertical,
-                            Some(2) => Orientation::RotateCounterClockwise,
-                            Some(3) => Orientation::RotateClockwise,
-                            _ => return,
-                        };
-                        this.reorient(orientation, cx);
-                    })),
-            )
-            .child(
-                Button::new("open")
-                    .outline()
-                    .label("Open")
-                    .tooltip_with_action("Open a PNG image", &OpenImage, Some(KEY_CONTEXT))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_image(&OpenImage, window, cx)),
-                    ),
-            )
-            .child(
-                Button::new("save")
-                    .outline()
-                    .label("Save PNG")
-                    .tooltip_with_action("Save as PNG", &SavePng, Some(KEY_CONTEXT))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.save_png(&SavePng, window, cx)),
+                        icon_button("save", IconName::Save)
+                            .tooltip_with_action("Save as PNG", &SavePng, Some(KEY_CONTEXT))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_png(&SavePng, window, cx)
+                            })),
                     ),
             );
 
@@ -2168,10 +2213,27 @@ impl Render for PaintApp {
             .on_action(cx.listener(Self::reset_zoom))
             .size_full()
             .text_color(theme.foreground)
-            .child(toolbar)
+            .child(options_bar)
             .child(palette_bar)
-            .child(viewport)
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(tool_bar)
+                    .child(viewport),
+            )
             .child(status_bar)
+    }
+}
+
+fn brush_icon(brush: Brush) -> IconName {
+    match brush {
+        Brush::Pen => IconName::Pen,
+        Brush::Pencil => IconName::Pencil,
+        Brush::Marker => IconName::Highlighter,
+        Brush::Airbrush => IconName::SprayCan,
+        Brush::Calligraphy => IconName::PenTool,
     }
 }
 
@@ -2382,9 +2444,10 @@ fn paint_view(
 }
 
 fn main() {
-    // The icons gpui-kit's components draw, such as the checkbox's check mark
+    // The toolbar's icons and those gpui-kit's components draw, such as the
+    // checkbox's check mark
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(assets::AppAssets)
         .run(|cx| {
             gpui_kit::init(cx);
             let context = Some(KEY_CONTEXT);
