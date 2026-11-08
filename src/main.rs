@@ -1,5 +1,5 @@
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, h_flex,
+    ActiveTheme as _, Disableable as _, Selectable as _, h_flex,
     button::*,
     color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
     slider::{Slider, SliderEvent, SliderState, SliderValue},
@@ -11,6 +11,7 @@ actions!(petit_paint, [Undo, Redo]);
 
 const DEFAULT_WIDTH: f32 = 4.0;
 const KEY_CONTEXT: &str = "PaintApp";
+const CANVAS_BACKGROUND: u32 = 0xffffff;
 
 // KeyBinding::new cannot resolve "secondary-", so pick the modifier per OS
 #[cfg(target_os = "macos")]
@@ -45,7 +46,15 @@ enum RedoEntry {
     Clear,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Tool {
+    Pen,
+    /// Paints with the canvas background color, so erasing is undoable like any stroke.
+    Eraser,
+}
+
 struct PaintApp {
+    tool: Tool,
     strokes: Vec<Stroke>,
     history: Vec<HistoryEntry>,
     redo_stack: Vec<RedoEntry>,
@@ -94,6 +103,7 @@ impl PaintApp {
             history: Vec::new(),
             redo_stack: Vec::new(),
             drawing: false,
+            tool: Tool::Pen,
             focus_handle: cx.focus_handle(),
             color,
             width: px(DEFAULT_WIDTH),
@@ -114,7 +124,10 @@ impl PaintApp {
         self.drawing = true;
         self.strokes.push(Stroke {
             points: vec![event.position],
-            color: self.color,
+            color: match self.tool {
+                Tool::Pen => self.color,
+                Tool::Eraser => rgb(CANVAS_BACKGROUND).into(),
+            },
             width: self.width,
         });
         self.history.push(HistoryEntry::Stroke);
@@ -203,6 +216,27 @@ impl Render for PaintApp {
             .border_b_1()
             .border_color(theme.border)
             .child("petit-paint")
+            .child(
+                ButtonGroup::new("tool")
+                    .outline()
+                    .child(
+                        Button::new("pen")
+                            .label("Pen")
+                            .selected(self.tool == Tool::Pen),
+                    )
+                    .child(
+                        Button::new("eraser")
+                            .label("Eraser")
+                            .selected(self.tool == Tool::Eraser),
+                    )
+                    .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
+                        this.tool = match clicks.first() {
+                            Some(1) => Tool::Eraser,
+                            _ => Tool::Pen,
+                        };
+                        cx.notify();
+                    })),
+            )
             .child(ColorPicker::new(&self.color_picker))
             .child(
                 h_flex()
@@ -237,7 +271,7 @@ impl Render for PaintApp {
         let canvas_area = div()
             .flex_1()
             .size_full()
-            .bg(rgb(0xffffff))
+            .bg(rgb(CANVAS_BACKGROUND))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
