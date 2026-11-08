@@ -2382,56 +2382,59 @@ fn paint_view(
 }
 
 fn main() {
-    gpui_kit::application().run(|cx| {
-        gpui_kit::init(cx);
-        let context = Some(KEY_CONTEXT);
-        let mut bindings = vec![
-            KeyBinding::new(with_modifier!("z"), Undo, context),
-            KeyBinding::new(with_modifier!("shift-z"), Redo, context),
-            KeyBinding::new(with_modifier!("s"), SavePng, context),
-            KeyBinding::new(with_modifier!("o"), OpenImage, context),
-            KeyBinding::new(with_modifier!("w"), CloseWindow, context),
-            KeyBinding::new(with_modifier!("a"), SelectAll, context),
-            KeyBinding::new(with_modifier!("c"), CopySelection, context),
-            KeyBinding::new(with_modifier!("x"), CutSelection, context),
-            KeyBinding::new(with_modifier!("v"), Paste, context),
-            KeyBinding::new(with_modifier!("="), ZoomIn, context),
-            KeyBinding::new(with_modifier!("-"), ZoomOut, context),
-            KeyBinding::new(with_modifier!("0"), ResetZoom, context),
-            KeyBinding::new("backspace", DeleteSelection, context),
-            KeyBinding::new("delete", DeleteSelection, context),
-            KeyBinding::new("escape", Deselect, context),
-            KeyBinding::new("enter", FinishPolygon, context),
-        ];
-        // Windows and Linux apps also redo with Ctrl+Y
-        if cfg!(not(target_os = "macos")) {
-            bindings.push(KeyBinding::new("ctrl-y", Redo, context));
-        }
-        cx.bind_keys(bindings);
-        let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
-        gpui_kit::open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            cx,
-            |window, cx| {
-                let app = cx.new(|cx| PaintApp::new(window, cx));
-                let focus_handle = app.read(cx).focus_handle.clone();
-                window.focus(&focus_handle, cx);
-                app
-            },
-        )
-        .expect("failed to open window");
-        // Quit with the last window, as there is no way to open another
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                cx.quit();
+    // The icons gpui-kit's components draw, such as the checkbox's check mark
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
+        .run(|cx| {
+            gpui_kit::init(cx);
+            let context = Some(KEY_CONTEXT);
+            let mut bindings = vec![
+                KeyBinding::new(with_modifier!("z"), Undo, context),
+                KeyBinding::new(with_modifier!("shift-z"), Redo, context),
+                KeyBinding::new(with_modifier!("s"), SavePng, context),
+                KeyBinding::new(with_modifier!("o"), OpenImage, context),
+                KeyBinding::new(with_modifier!("w"), CloseWindow, context),
+                KeyBinding::new(with_modifier!("a"), SelectAll, context),
+                KeyBinding::new(with_modifier!("c"), CopySelection, context),
+                KeyBinding::new(with_modifier!("x"), CutSelection, context),
+                KeyBinding::new(with_modifier!("v"), Paste, context),
+                KeyBinding::new(with_modifier!("="), ZoomIn, context),
+                KeyBinding::new(with_modifier!("-"), ZoomOut, context),
+                KeyBinding::new(with_modifier!("0"), ResetZoom, context),
+                KeyBinding::new("backspace", DeleteSelection, context),
+                KeyBinding::new("delete", DeleteSelection, context),
+                KeyBinding::new("escape", Deselect, context),
+                KeyBinding::new("enter", FinishPolygon, context),
+            ];
+            // Windows and Linux apps also redo with Ctrl+Y
+            if cfg!(not(target_os = "macos")) {
+                bindings.push(KeyBinding::new("ctrl-y", Redo, context));
             }
-        })
-        .detach();
-        cx.activate(true);
-    });
+            cx.bind_keys(bindings);
+            let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    let app = cx.new(|cx| PaintApp::new(window, cx));
+                    let focus_handle = app.read(cx).focus_handle.clone();
+                    window.focus(&focus_handle, cx);
+                    app
+                },
+            )
+            .expect("failed to open window");
+            // Quit with the last window, as there is no way to open another
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            cx.activate(true);
+        });
 }
 
 #[cfg(test)]
