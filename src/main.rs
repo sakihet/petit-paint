@@ -128,6 +128,16 @@ enum SelectDrag {
     Move { grab: Point<i32> },
 }
 
+/// Colors in the palette bar, after Windows Paint's default palette.
+const PALETTE: [u32; 20] = [
+    0x000000, 0x7f7f7f, 0x880015, 0xed1c24, 0xff7f27, 0xfff200, 0x22b14c, 0x00a2e8, 0x3f48cc,
+    0xa349a4, 0xffffff, 0xc3c3c3, 0xb97a57, 0xffaec9, 0xffc90e, 0xefe4b0, 0xb5e61d, 0x99d9ea,
+    0x7092be, 0xc8bfe7,
+];
+/// How many recently used colors the palette bar keeps.
+const MAX_RECENT_COLORS: usize = 10;
+const SWATCH_SIZE: Pixels = px(18.0);
+
 /// Tile grid sizes offered in the status bar, in canvas pixels.
 const TILE_SIZES: [u32; 4] = [8, 16, 32, 64];
 
@@ -346,9 +356,17 @@ struct PaintApp {
     /// Canvas bounds in window coordinates from the last paint, used to map
     /// mouse positions to canvas coordinates.
     canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// Color 1, drawn with the left mouse button.
     color: Hsla,
+    /// Color 2, drawn with the right mouse button.
+    secondary_color: Hsla,
+    /// Whether the current mouse press is with the right button, using color 2.
+    use_secondary: bool,
+    /// Colors drawn with, most recent first.
+    recent_colors: Vec<Hsla>,
     width: Pixels,
     color_picker: Entity<ColorPickerState>,
+    secondary_picker: Entity<ColorPickerState>,
     width_slider: Entity<SliderState>,
     _subscriptions: Vec<Subscription>,
 }
@@ -357,6 +375,9 @@ impl PaintApp {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let color: Hsla = rgb(0x222222).into();
         let color_picker = cx.new(|cx| ColorPickerState::new(window, cx).default_value(color));
+        let secondary_color: Hsla = rgb(0xffffff).into();
+        let secondary_picker =
+            cx.new(|cx| ColorPickerState::new(window, cx).default_value(secondary_color));
         let width_slider = cx.new(|_| {
             SliderState::new()
                 .min(1.0)
@@ -387,6 +408,13 @@ impl PaintApp {
                 };
                 this.color = *color;
                 this.update_text_preview(cx);
+                cx.notify();
+            }),
+            cx.subscribe_in(&secondary_picker, window, |this, _, event, _, cx| {
+                let ColorPickerEvent::Change(Some(color)) = event else {
+                    return;
+                };
+                this.secondary_color = *color;
                 cx.notify();
             }),
             cx.subscribe_in(&font_size_slider, window, |this, _, event, _, cx| {
@@ -464,6 +492,10 @@ impl PaintApp {
             color,
             width: px(DEFAULT_WIDTH),
             color_picker,
+            secondary_picker,
+            secondary_color,
+            use_secondary: false,
+            recent_colors: Vec::new(),
             width_slider,
             _subscriptions,
         }
@@ -477,6 +509,11 @@ impl PaintApp {
     ) {
         // Take focus back from toolbar inputs so shortcuts reach the canvas
         window.focus(&self.focus_handle, cx);
+        self.use_secondary = event.button == MouseButton::Right;
+        // The right button only paints; it neither selects nor types
+        if self.use_secondary && matches!(self.tool, Tool::Select | Tool::Text) {
+            return;
+        }
         if self.tool == Tool::Select {
             self.start_select(event.position, cx);
             return;
@@ -487,7 +524,7 @@ impl PaintApp {
         let position = self.to_canvas(event.position);
         let (color, brush) = match self.tool {
             Tool::Select => return,
-            Tool::Pen => (self.color, self.brush),
+            Tool::Pen => (self.active_color(), self.brush),
             Tool::Eraser => {
                 // The eraser's shape is all that matters; it removes what is under it
                 self.erase_base = Some(self.canvas.pixels().clone());
@@ -520,6 +557,42 @@ impl PaintApp {
             ..Default::default()
         });
         self.update_stroke_preview(cx);
+    }
+
+    /// The color the current mouse press draws with: color 2 for the right button.
+    fn active_color(&self) -> Hsla {
+        if self.use_secondary {
+            self.secondary_color
+        } else {
+            self.color
+        }
+    }
+
+    /// Notes `color` as just drawn with, for the recent colors in the palette bar.
+    fn remember_color(&mut self, color: Hsla) {
+        remember_color(&mut self.recent_colors, color);
+    }
+
+    fn set_primary(&mut self, color: Hsla, window: &mut Window, cx: &mut Context<Self>) {
+        self.color = color;
+        // set_value does not emit a change event, so the color is set above
+        self.color_picker
+            .update(cx, |state, cx| state.set_value(color, window, cx));
+        self.update_text_preview(cx);
+        cx.notify();
+    }
+
+    fn set_secondary(&mut self, color: Hsla, window: &mut Window, cx: &mut Context<Self>) {
+        self.secondary_color = color;
+        self.secondary_picker
+            .update(cx, |state, cx| state.set_value(color, window, cx));
+        cx.notify();
+    }
+
+    fn swap_colors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (primary, secondary) = (self.color, self.secondary_color);
+        self.set_primary(secondary, window, cx);
+        self.set_secondary(primary, window, cx);
     }
 
     fn update_stroke_preview(&mut self, cx: &mut Context<Self>) {
@@ -594,6 +667,7 @@ impl PaintApp {
             let at = point(edit.anchor.x - *margin as i32, edit.anchor.y);
             if let Some(undo) = self.canvas.stamp(pixels, at) {
                 self.record(undo, cx);
+                self.remember_color(self.color);
             }
         }
         cx.notify();
@@ -624,7 +698,7 @@ impl PaintApp {
     /// The outline of a shape dragged from `start` to `end`.
     fn shape_stroke(&self, start: Point<Pixels>, end: Point<Pixels>) -> Stroke {
         let base = Stroke {
-            color: self.color,
+            color: self.active_color(),
             width: self.width,
             filled: self.shape_filled && self.shape_kind.fillable(),
             ..Default::default()
@@ -675,7 +749,7 @@ impl PaintApp {
         }
         Stroke {
             points,
-            color: self.color,
+            color: self.active_color(),
             width: self.width,
             closed: finished,
             filled: finished && self.shape_filled,
@@ -697,6 +771,7 @@ impl PaintApp {
             && let Some(undo) = self.canvas.draw_stroke(&self.polygon_stroke(true))
         {
             self.record(undo, cx);
+            self.remember_color(self.active_color());
         }
         self.cancel_polygon(cx);
     }
@@ -1079,6 +1154,7 @@ impl PaintApp {
             && let Some(undo) = self.canvas.draw_stroke(&self.shape_stroke(drag.start, drag.end))
         {
             self.record(undo, cx);
+            self.remember_color(self.active_color());
         }
         self.stroke_preview = None;
         let stroke = self.current_stroke.take();
@@ -1090,6 +1166,7 @@ impl PaintApp {
             && let Some(undo) = self.canvas.draw_stroke(&stroke)
         {
             self.record(undo, cx);
+            self.remember_color(stroke.color);
         }
         if self.resize_drag.take().is_some() {
             self.resize_canvas(self.canvas_size, cx);
@@ -1117,17 +1194,21 @@ impl PaintApp {
         let Some(color) = self.canvas.color_at(position).filter(|color| color.a > 0.0) else {
             return;
         };
-        self.color = color;
-        // set_value does not emit a change event, so self.color is updated above
-        self.color_picker
-            .update(cx, |state, cx| state.set_value(color, window, cx));
+        // The right button picks color 2
+        if self.use_secondary {
+            self.set_secondary(color, window, cx);
+        } else {
+            self.set_primary(color, window, cx);
+        }
         self.tool = Tool::Pen;
         cx.notify();
     }
 
     fn fill_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        if let Some(undo) = self.canvas.flood_fill(position, self.color) {
+        let color = self.active_color();
+        if let Some(undo) = self.canvas.flood_fill(position, color) {
             self.record(undo, cx);
+            self.remember_color(color);
         }
     }
 
@@ -1592,7 +1673,6 @@ impl Render for PaintApp {
                         .child(div().w(px(28.0)).child(format!("{}", self.font_size))),
                 )
             })
-            .child(ColorPicker::new(&self.color_picker))
             .child(
                 h_flex()
                     .gap_2()
@@ -1647,6 +1727,66 @@ impl Render for PaintApp {
                     .on_click(
                         cx.listener(|this, _, window, cx| this.save_png(&SavePng, window, cx)),
                     ),
+            );
+
+        let swatch = |id: (&'static str, usize), color: Hsla, cx: &Context<Self>| {
+            div()
+                .id(id)
+                .size(SWATCH_SIZE)
+                .flex_none()
+                .rounded_sm()
+                .border_1()
+                .border_color(theme.border)
+                .bg(color)
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| this.set_primary(color, window, cx)),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, _, window, cx| this.set_secondary(color, window, cx)),
+                )
+        };
+        let palette_bar = h_flex()
+            .flex_wrap()
+            .gap_1()
+            .px_3()
+            .py_1()
+            .bg(theme.background)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(ColorPicker::new(&self.color_picker))
+            .child(ColorPicker::new(&self.secondary_picker))
+            .child(
+                Button::new("swap-colors")
+                    .ghost()
+                    .compact()
+                    .label("⇄")
+                    .tooltip("Swap color 1 and color 2")
+                    .on_click(cx.listener(|this, _, window, cx| this.swap_colors(window, cx))),
+            )
+            .child(div().w(px(8.0)))
+            .children(
+                PALETTE
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, &color)| swatch(("palette", ix), rgb(color).into(), cx)),
+            )
+            .when(!self.recent_colors.is_empty(), |this| {
+                this.child(div().w(px(8.0))).child("Recent").children(
+                    self.recent_colors
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, &color)| swatch(("recent", ix), color, cx)),
+                )
+            })
+            .child(div().w(px(8.0)))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("Left click: color 1 · Right click: color 2"),
             );
 
         let canvas_bounds = self.canvas_bounds.clone();
@@ -1834,6 +1974,10 @@ impl Render for PaintApp {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            // The right button draws with color 2
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Right, cx.listener(Self::on_mouse_up))
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 if !hovered && this.cursor_position.take().is_some() {
                     cx.notify();
@@ -1952,9 +2096,18 @@ impl Render for PaintApp {
             .size_full()
             .text_color(theme.foreground)
             .child(toolbar)
+            .child(palette_bar)
             .child(viewport)
             .child(status_bar)
     }
+}
+
+/// Moves `color` to the front of `recent`, adding it if new and dropping the
+/// oldest past [`MAX_RECENT_COLORS`].
+fn remember_color(recent: &mut Vec<Hsla>, color: Hsla) {
+    recent.retain(|&c| c.to_rgb() != color.to_rgb());
+    recent.insert(0, color);
+    recent.truncate(MAX_RECENT_COLORS);
 }
 
 /// Paints `stroke` with the canvas top-left at `origin`, in window
@@ -2206,4 +2359,28 @@ fn main() {
         .detach();
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    // Not a glob: `gpui_kit::*` would bring in gpui's `test` macro in place of Rust's
+    use super::{MAX_RECENT_COLORS, remember_color};
+    use gpui_kit::{Hsla, rgb};
+
+    #[test]
+    fn recent_colors_put_the_latest_first_without_repeats() {
+        let mut recent = Vec::new();
+        let color = |c: u32| -> Hsla { rgb(c).into() };
+        remember_color(&mut recent, color(0xff0000));
+        remember_color(&mut recent, color(0x00ff00));
+        remember_color(&mut recent, color(0xff0000));
+        let rgbs: Vec<_> = recent.iter().map(|c| c.to_rgb()).collect();
+        assert_eq!(rgbs, vec![color(0xff0000).to_rgb(), color(0x00ff00).to_rgb()]);
+
+        for c in 0..20 {
+            remember_color(&mut recent, color(c));
+        }
+        assert_eq!(recent.len(), MAX_RECENT_COLORS);
+        assert_eq!(recent[0].to_rgb(), color(19).to_rgb());
+    }
 }
