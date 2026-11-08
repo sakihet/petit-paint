@@ -68,7 +68,8 @@ const POLYGON_CLOSE_DISTANCE: f32 = 8.0;
 /// Side length of the square handles for resizing the canvas.
 const HANDLE_SIZE: Pixels = px(8.0);
 const KEY_CONTEXT: &str = "PaintApp";
-const CANVAS_BACKGROUND: u32 = 0xffffff;
+/// Side of the checkerboard squares behind transparent pixels, in logical pixels.
+const CHECKER_SIZE: f32 = 8.0;
 const SELECTION_COLOR: u32 = 0x0078d7;
 
 // KeyBinding::new takes a &'static str and cannot resolve "secondary-", so
@@ -199,7 +200,7 @@ enum Tool {
     Select,
     /// Draws freehand with the brush chosen in the toolbar.
     Pen,
-    /// Paints with the canvas background color, so erasing is undoable like any stroke.
+    /// Erases to transparency.
     Eraser,
     /// Picks the brush color from the canvas, then switches back to the pen.
     Eyedropper,
@@ -288,6 +289,10 @@ struct PaintApp {
     brush: Brush,
     /// Strokes made so far, to give each airbrush stroke its own spray pattern.
     stroke_count: u64,
+    /// While erasing, the canvas as it was when the stroke began.
+    erase_base: Option<Pixmap>,
+    /// Restores what the eraser stroke so far has removed.
+    erase_undo: Option<Change>,
     shape_kind: ShapeKind,
     /// Whether rectangles, ellipses and polygons are filled with the brush color.
     shape_filled: bool,
@@ -384,7 +389,8 @@ impl PaintApp {
         let canvas = Canvas::new(
             DEFAULT_CANVAS_SIZE.width.as_f32() as u32,
             DEFAULT_CANVAS_SIZE.height.as_f32() as u32,
-            rgb(CANVAS_BACKGROUND).into(),
+            // Transparent, for drawing game sprites and other assets
+            transparent_black(),
         )
         .expect("default canvas size is valid");
 
@@ -399,6 +405,8 @@ impl PaintApp {
             stroke_cache: Rc::default(),
             brush: Brush::Pen,
             stroke_count: 0,
+            erase_base: None,
+            erase_undo: None,
             shape_kind: ShapeKind::Rectangle,
             shape_filled: false,
             shape_drag: None,
@@ -452,7 +460,11 @@ impl PaintApp {
         let (color, brush) = match self.tool {
             Tool::Select => return,
             Tool::Pen => (self.color, self.brush),
-            Tool::Eraser => (rgb(CANVAS_BACKGROUND).into(), Brush::Pen),
+            Tool::Eraser => {
+                // The eraser's shape is all that matters; it removes what is under it
+                self.erase_base = Some(self.canvas.pixels().clone());
+                (black(), Brush::Pen)
+            }
             Tool::Eyedropper => {
                 self.pick_color(position, window, cx);
                 return;
@@ -483,11 +495,16 @@ impl PaintApp {
     }
 
     fn update_stroke_preview(&mut self, cx: &mut Context<Self>) {
-        self.stroke_preview = self
-            .current_stroke
-            .as_ref()
-            .and_then(|stroke| self.canvas.render_stroke(stroke));
-        self.stroke_preview_id += 1;
+        if let (Some(stroke), Some(base)) = (&self.current_stroke, &self.erase_base) {
+            // Transparency cannot be layered on top, so the eraser applies directly
+            self.erase_undo = self.canvas.erase_stroke(base, stroke);
+        } else {
+            self.stroke_preview = self
+                .current_stroke
+                .as_ref()
+                .and_then(|stroke| self.canvas.render_stroke(stroke));
+            self.stroke_preview_id += 1;
+        }
         cx.notify();
     }
 
@@ -1036,7 +1053,12 @@ impl PaintApp {
             self.record(undo, cx);
         }
         self.stroke_preview = None;
-        if let Some(stroke) = self.current_stroke.take()
+        let stroke = self.current_stroke.take();
+        if self.erase_base.take().is_some() {
+            if let Some(undo) = self.erase_undo.take() {
+                self.record(undo, cx);
+            }
+        } else if let Some(stroke) = stroke
             && let Some(undo) = self.canvas.draw_stroke(&stroke)
         {
             self.record(undo, cx);
@@ -1063,7 +1085,8 @@ impl PaintApp {
     }
 
     fn pick_color(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(color) = self.canvas.color_at(position) else {
+        // Picking a fully transparent pixel would leave a brush that draws nothing
+        let Some(color) = self.canvas.color_at(position).filter(|color| color.a > 0.0) else {
             return;
         };
         self.color = color;
@@ -1461,7 +1484,6 @@ impl Render for PaintApp {
             .w(canvas_size.width)
             .h(canvas_size.height)
             .flex_none()
-            .bg(rgb(CANVAS_BACKGROUND))
             .shadow_md()
             .children(handles)
             .child(
@@ -1842,7 +1864,7 @@ fn paint_view(
     };
 
     if cache.key != Some(key) {
-        let bytes = canvas.render_view(key.origin, key.size, scale * zoom);
+        let bytes = canvas.render_view(key.origin, key.size, scale * zoom, CHECKER_SIZE * scale);
         let Some(frame) = RgbaImage::from_raw(key.size.width, key.size.height, bytes) else {
             return;
         };

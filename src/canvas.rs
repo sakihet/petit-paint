@@ -7,6 +7,10 @@ use tiny_skia::{
 
 use crate::Stroke;
 
+/// Checkerboard shades behind transparent pixels.
+const CHECKER_LIGHT: u8 = 0xff;
+const CHECKER_DARK: u8 = 0xdd;
+
 /// How far each RGBA channel may differ from the clicked pixel and still be
 /// filled. Lets the fill reach into the light half of anti-aliased edges.
 const FILL_TOLERANCE: u8 = 64;
@@ -445,26 +449,92 @@ impl Canvas {
     }
 
     /// Renders part of the canvas, scaled up or down with nearest-neighbor
-    /// sampling so pixels stay sharp, as BGRA bytes for gpui.
+    /// sampling so pixels stay sharp, as opaque BGRA bytes for gpui.
     ///
     /// The canvas is displayed at `pixels_per_canvas_pixel` device pixels per
     /// canvas pixel. `origin` and `region` select the device pixels to render,
     /// relative to the displayed canvas's top-left. Pixels beyond the canvas,
     /// for example while a resize drag is enlarging it, show the background.
+    ///
+    /// Transparency shows as a checkerboard of `checker_size` device pixel
+    /// squares, which stay the same size on screen at any zoom.
     pub fn render_view(
         &self,
         origin: Point<u32>,
         region: Size<u32>,
         pixels_per_canvas_pixel: f32,
+        checker_size: f32,
     ) -> Vec<u8> {
         let background = bgra(self.background.premultiply().to_color_u8());
-        render_scaled(
+        let mut bytes = render_scaled(
             &self.pixmap,
             background,
             origin,
             region,
             pixels_per_canvas_pixel,
-        )
+        );
+        let checker = |device: u32| (device as f32 / checker_size) as u32 % 2;
+        for (i, pixel) in bytes.chunks_exact_mut(4).enumerate() {
+            let alpha = pixel[3];
+            if alpha == 255 {
+                continue;
+            }
+            let x = origin.x + (i as u32 % region.width);
+            let y = origin.y + (i as u32 / region.width);
+            let square = if checker(x) == checker(y) {
+                CHECKER_LIGHT
+            } else {
+                CHECKER_DARK
+            };
+            // Premultiplied pixel over the opaque checker
+            let keep = 255 - alpha as u16;
+            for channel in &mut pixel[..3] {
+                *channel = (*channel as u16 + (square as u16 * keep + 127) / 255) as u8;
+            }
+            pixel[3] = 255;
+        }
+        bytes
+    }
+
+    /// The canvas image.
+    pub fn pixels(&self) -> &Pixmap {
+        &self.pixmap
+    }
+
+    /// Erases along `stroke` to transparency, starting from `base`, the canvas
+    /// as it was when the stroke began. Erasing is applied straight to the
+    /// canvas so it can be seen as it is drawn; repeating it from `base` as
+    /// the stroke grows keeps each pixel erased once.
+    ///
+    /// Returns the change that restores `base`, covering the stroke so far.
+    pub fn erase_stroke(&mut self, base: &Pixmap, stroke: &Stroke) -> Option<Change> {
+        let layer = self.render_stroke(stroke)?;
+        let rect = IntRect::from_xywh(
+            layer.at.x,
+            layer.at.y,
+            layer.pixels.width(),
+            layer.pixels.height(),
+        )?;
+        let before = base.clone_rect(rect)?;
+        let (x, y) = (rect.x() as u32, rect.y() as u32);
+        self.write(x, y, &before);
+        self.pixmap.draw_pixmap(
+            rect.x(),
+            rect.y(),
+            layer.pixels.as_ref(),
+            &PixmapPaint {
+                blend_mode: tiny_skia::BlendMode::DestinationOut,
+                ..Default::default()
+            },
+            Transform::identity(),
+            None,
+        );
+        self.version += 1;
+        Some(Change::Patch {
+            x,
+            y,
+            pixels: before,
+        })
     }
 
     /// Converts a canvas position to pixel indices, if it is inside.
@@ -1159,6 +1229,60 @@ mod tests {
         }
     }
 
+    fn transparent_canvas(width: u32, height: u32) -> Canvas {
+        Canvas::new(width, height, gpui_kit::transparent_black()).unwrap()
+    }
+
+    #[test]
+    fn transparent_canvas_exports_transparent_png() {
+        let mut canvas = transparent_canvas(20, 20);
+        canvas.draw_stroke(&stroke(&[(0.0, 10.0), (20.0, 10.0)], 0xff0000, 4.0));
+        let png = Pixmap::decode_png(&canvas.encode_png().unwrap()).unwrap();
+        assert_eq!(png.pixel(10, 2).unwrap().alpha(), 0);
+        assert_eq!(png.pixel(10, 10).unwrap().alpha(), 255);
+    }
+
+    #[test]
+    fn eraser_makes_pixels_transparent_and_can_be_undone() {
+        let mut canvas = transparent_canvas(40, 20);
+        canvas.draw_stroke(&stroke(&[(0.0, 10.0), (40.0, 10.0)], 0x000000, 10.0));
+        let base = canvas.pixels().clone();
+
+        let eraser = stroke(&[(20.0, 0.0), (20.0, 20.0)], 0x000000, 6.0);
+        let undo = canvas.erase_stroke(&base, &eraser).unwrap();
+        assert_eq!(canvas.pixmap.pixel(20, 10).unwrap().alpha(), 0);
+        // Outside the eraser the line stays
+        assert_eq!(canvas.pixmap.pixel(5, 10).unwrap().alpha(), 255);
+
+        canvas.apply(undo);
+        assert_eq!(canvas.pixmap.pixel(20, 10).unwrap().alpha(), 255);
+    }
+
+    #[test]
+    fn erasing_again_as_the_stroke_grows_does_not_restore_erased_pixels() {
+        let mut canvas = transparent_canvas(40, 20);
+        canvas.draw_stroke(&stroke(&[(0.0, 10.0), (40.0, 10.0)], 0x000000, 10.0));
+        let base = canvas.pixels().clone();
+        let mut eraser = stroke(&[(5.0, 10.0), (15.0, 10.0)], 0x000000, 6.0);
+        canvas.erase_stroke(&base, &eraser);
+        eraser.points.push(point(px(35.0), px(10.0)));
+        canvas.erase_stroke(&base, &eraser);
+        assert_eq!(canvas.pixmap.pixel(10, 10).unwrap().alpha(), 0);
+        assert_eq!(canvas.pixmap.pixel(30, 10).unwrap().alpha(), 0);
+    }
+
+    #[test]
+    fn transparency_shows_as_a_checkerboard() {
+        let canvas = transparent_canvas(4, 1);
+        // Squares of 2 device pixels
+        let view = canvas.render_view(point(0, 0), size(4, 1), 1.0, 2.0);
+        let shade = |x: usize| view[x * 4];
+        assert_eq!(shade(0), CHECKER_LIGHT);
+        assert_eq!(shade(1), CHECKER_LIGHT);
+        assert_eq!(shade(2), CHECKER_DARK);
+        assert!(view.chunks(4).all(|pixel| pixel[3] == 255));
+    }
+
     #[test]
     fn png_is_exactly_the_canvas_size() {
         let canvas = canvas(80, 60);
@@ -1172,7 +1296,7 @@ mod tests {
         canvas.pixmap.pixels_mut()[0] = PremultipliedColorU8::from_rgba(255, 0, 0, 255).unwrap();
 
         // At 2x each canvas pixel covers 2x2 device pixels; column 4+ is past the canvas
-        let view = canvas.render_view(point(0, 0), size(5, 2), 2.0);
+        let view = canvas.render_view(point(0, 0), size(5, 2), 2.0, 16.0);
         let pixel = |x: usize, y: usize| &view[(y * 5 + x) * 4..][..4];
         let red = [0, 0, 255, 255];
         let white = [255, 255, 255, 255];
