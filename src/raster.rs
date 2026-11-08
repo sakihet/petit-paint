@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result, anyhow};
-use gpui_kit::{Bounds, Hsla, Pixels};
+use gpui_kit::{Bounds, Hsla, Pixels, Point, Rgba};
 use tiny_skia::{
     Color, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke as SkiaStroke, Transform,
 };
@@ -7,16 +7,59 @@ use tiny_skia::{
 use crate::Stroke;
 
 /// Rasterizes the strokes inside `bounds` and encodes them as PNG.
-///
-/// `scale` is the window's scale factor, so the image matches the on-screen
-/// resolution. Strokes use round caps and joins to match the on-screen
-/// rendering.
 pub fn encode_png(
     strokes: &[Stroke],
     bounds: Bounds<Pixels>,
     background: Hsla,
     scale: f32,
 ) -> Result<Vec<u8>> {
+    rasterize(strokes, bounds, background, scale)?
+        .encode_png()
+        .context("failed to encode PNG")
+}
+
+/// Returns the color of the drawing at `position`, in window coordinates.
+///
+/// Returns `None` when `position` is outside `bounds`.
+pub fn color_at(
+    strokes: &[Stroke],
+    bounds: Bounds<Pixels>,
+    background: Hsla,
+    scale: f32,
+    position: Point<Pixels>,
+) -> Result<Option<Hsla>> {
+    let pixmap = rasterize(strokes, bounds, background, scale)?;
+    let x = ((position.x - bounds.origin.x).as_f32() * scale).floor();
+    let y = ((position.y - bounds.origin.y).as_f32() * scale).floor();
+    if x < 0.0 || y < 0.0 {
+        return Ok(None);
+    }
+    let Some(pixel) = pixmap.pixel(x as u32, y as u32) else {
+        return Ok(None);
+    };
+    let color = pixel.demultiply();
+    Ok(Some(
+        Rgba {
+            r: color.red() as f32 / 255.0,
+            g: color.green() as f32 / 255.0,
+            b: color.blue() as f32 / 255.0,
+            a: color.alpha() as f32 / 255.0,
+        }
+        .into(),
+    ))
+}
+
+/// Draws the strokes inside `bounds` onto a new pixmap filled with `background`.
+///
+/// `scale` is the window's scale factor, so the image matches the on-screen
+/// resolution. Strokes use round caps and joins to match the on-screen
+/// rendering.
+fn rasterize(
+    strokes: &[Stroke],
+    bounds: Bounds<Pixels>,
+    background: Hsla,
+    scale: f32,
+) -> Result<Pixmap> {
     let width = (bounds.size.width.as_f32() * scale).round() as u32;
     let height = (bounds.size.height.as_f32() * scale).round() as u32;
     let mut pixmap =
@@ -60,7 +103,7 @@ pub fn encode_png(
         pixmap.stroke_path(&path, &paint, &style, transform, None);
     }
 
-    pixmap.encode_png().context("failed to encode PNG")
+    Ok(pixmap)
 }
 
 fn to_skia_color(color: Hsla) -> Color {
@@ -116,5 +159,25 @@ mod tests {
         }
         // The corner of the bounding square stays white because the cap is round
         assert_eq!(pixmap.pixel(15, 15).unwrap().red(), 255);
+    }
+
+    #[test]
+    fn color_at_picks_stroke_and_background() {
+        let bounds = Bounds::new(point(px(0.0), px(44.0)), size(px(100.0), px(50.0)));
+        let blue: Hsla = rgb(0x0000ff).into();
+        let white: Hsla = rgb(0xffffff).into();
+        let strokes = [Stroke {
+            points: vec![point(px(10.0), px(69.0)), point(px(90.0), px(69.0))],
+            color: blue,
+            width: px(6.0),
+        }];
+
+        let on_line = color_at(&strokes, bounds, white, 2.0, point(px(50.0), px(69.0)));
+        assert_eq!(on_line.unwrap().unwrap().to_rgb(), blue.to_rgb());
+        let background = color_at(&strokes, bounds, white, 2.0, point(px(50.0), px(50.0)));
+        assert_eq!(background.unwrap().unwrap().to_rgb(), white.to_rgb());
+        // Above the canvas, on the toolbar
+        let outside = color_at(&strokes, bounds, white, 2.0, point(px(50.0), px(10.0)));
+        assert_eq!(outside.unwrap(), None);
     }
 }

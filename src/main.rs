@@ -11,7 +11,7 @@ use lyon::tessellation::{LineCap, LineJoin};
 use std::cell::Cell;
 use std::rc::Rc;
 
-mod export;
+mod raster;
 
 actions!(petit_paint, [Undo, Redo, SavePng]);
 
@@ -61,6 +61,21 @@ enum Tool {
     Pen,
     /// Paints with the canvas background color, so erasing is undoable like any stroke.
     Eraser,
+    /// Picks the brush color from the canvas, then switches back to the pen.
+    Eyedropper,
+}
+
+/// Tools in toolbar order.
+const TOOLS: [Tool; 3] = [Tool::Pen, Tool::Eraser, Tool::Eyedropper];
+
+impl Tool {
+    fn label(self) -> &'static str {
+        match self {
+            Tool::Pen => "Pen",
+            Tool::Eraser => "Eraser",
+            Tool::Eyedropper => "Eyedropper",
+        }
+    }
 }
 
 struct PaintApp {
@@ -134,13 +149,18 @@ impl PaintApp {
     ) {
         // Take focus back from toolbar inputs so shortcuts reach the canvas
         window.focus(&self.focus_handle, cx);
+        let color = match self.tool {
+            Tool::Pen => self.color,
+            Tool::Eraser => rgb(CANVAS_BACKGROUND).into(),
+            Tool::Eyedropper => {
+                self.pick_color(event.position, window, cx);
+                return;
+            }
+        };
         self.drawing = true;
         self.strokes.push(Stroke {
             points: vec![event.position],
-            color: match self.tool {
-                Tool::Pen => self.color,
-                Tool::Eraser => rgb(CANVAS_BACKGROUND).into(),
-            },
+            color,
             width: self.width,
         });
         self.history.push(HistoryEntry::Stroke);
@@ -160,6 +180,25 @@ impl PaintApp {
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.drawing = false;
+        cx.notify();
+    }
+
+    fn pick_color(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let color = raster::color_at(
+            &self.strokes,
+            self.canvas_bounds.get(),
+            rgb(CANVAS_BACKGROUND).into(),
+            window.scale_factor(),
+            position,
+        );
+        let Ok(Some(color)) = color else {
+            return;
+        };
+        self.color = color;
+        // set_value does not emit a change event, so self.color is updated above
+        self.color_picker
+            .update(cx, |state, cx| state.set_value(color, window, cx));
+        self.tool = Tool::Pen;
         cx.notify();
     }
 
@@ -211,7 +250,7 @@ impl PaintApp {
 
     fn save_png(&mut self, _: &SavePng, window: &mut Window, cx: &mut Context<Self>) {
         // Encode now so the image reflects the drawing at the time of the request
-        let png = export::encode_png(
+        let png = raster::encode_png(
             &self.strokes,
             self.canvas_bounds.get(),
             rgb(CANVAS_BACKGROUND).into(),
@@ -264,22 +303,16 @@ impl Render for PaintApp {
             .child(
                 ButtonGroup::new("tool")
                     .outline()
-                    .child(
-                        Button::new("pen")
-                            .label("Pen")
-                            .selected(self.tool == Tool::Pen),
-                    )
-                    .child(
-                        Button::new("eraser")
-                            .label("Eraser")
-                            .selected(self.tool == Tool::Eraser),
-                    )
+                    .children(TOOLS.map(|tool| {
+                        Button::new(tool.label())
+                            .label(tool.label())
+                            .selected(self.tool == tool)
+                    }))
                     .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
-                        this.tool = match clicks.first() {
-                            Some(1) => Tool::Eraser,
-                            _ => Tool::Pen,
-                        };
-                        cx.notify();
+                        if let Some(&tool) = clicks.first().and_then(|ix| TOOLS.get(*ix)) {
+                            this.tool = tool;
+                            cx.notify();
+                        }
                     })),
             )
             .child(ColorPicker::new(&self.color_picker))
