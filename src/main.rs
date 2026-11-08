@@ -16,6 +16,10 @@ mod raster;
 actions!(petit_paint, [Undo, Redo, SavePng]);
 
 const DEFAULT_WIDTH: f32 = 4.0;
+const DEFAULT_CANVAS_SIZE: Size<Pixels> = Size {
+    width: px(800.0),
+    height: px(600.0),
+};
 const KEY_CONTEXT: &str = "PaintApp";
 const CANVAS_BACKGROUND: u32 = 0xffffff;
 
@@ -114,6 +118,7 @@ struct PaintApp {
     items: Vec<Item>,
     history: Vec<HistoryEntry>,
     redo_stack: Vec<RedoEntry>,
+    canvas_size: Size<Pixels>,
     drawing: bool,
     focus_handle: FocusHandle,
     /// Canvas bounds in window coordinates from the last paint, used to map
@@ -161,6 +166,7 @@ impl PaintApp {
             items: Vec::new(),
             history: Vec::new(),
             redo_stack: Vec::new(),
+            canvas_size: DEFAULT_CANVAS_SIZE,
             drawing: false,
             tool: Tool::Pen,
             focus_handle: cx.focus_handle(),
@@ -181,6 +187,9 @@ impl PaintApp {
     ) {
         // Take focus back from toolbar inputs so shortcuts reach the canvas
         window.focus(&self.focus_handle, cx);
+        if !self.canvas_bounds.get().contains(&event.position) {
+            return;
+        }
         let position = self.to_canvas(event.position);
         let color = match self.tool {
             Tool::Pen => self.color,
@@ -424,19 +433,19 @@ impl Render for PaintApp {
         let canvas_bounds = self.canvas_bounds.clone();
 
         let canvas_area = div()
-            .flex_1()
-            .size_full()
+            .w(self.canvas_size.width)
+            .h(self.canvas_size.height)
+            .flex_none()
             .bg(rgb(CANVAS_BACKGROUND))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .shadow_md()
             .child(
                 canvas(
                     |_, _, _| {},
                     move |bounds, _, window, _| {
                         canvas_bounds.set(bounds);
-                        window.paint_layer(bounds, |window| {
+                        // Keep strokes that run past the edge from drawing outside the canvas
+                        let mask = ContentMask { bounds };
+                        window.with_content_mask(Some(mask), |window| {
                             for item in &items {
                                 match item {
                                     Item::Stroke(stroke) => {
@@ -451,6 +460,23 @@ impl Render for PaintApp {
                 .size_full(),
             );
 
+        // Mouse handlers sit on the viewport so a drag keeps drawing when it
+        // leaves the canvas
+        let viewport = div()
+            .id("viewport")
+            .flex()
+            .items_start()
+            .flex_1()
+            .min_h_0()
+            .p_3()
+            .overflow_scroll()
+            .bg(theme.muted)
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .child(canvas_area);
+
         v_flex()
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
@@ -460,7 +486,7 @@ impl Render for PaintApp {
             .size_full()
             .text_color(theme.foreground)
             .child(toolbar)
-            .child(canvas_area)
+            .child(viewport)
     }
 }
 
