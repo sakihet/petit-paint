@@ -192,7 +192,12 @@ fn set_family(db: &mut cosmic_text::fontdb::Database, font: FontChoice, name: &s
 /// Whether text in `font` is laid out with the font family `name`.
 fn renders_with(font_system: &mut FontSystem, font: FontChoice, name: &str) -> bool {
     let mut buffer = Buffer::new(font_system, Metrics::new(16.0, 20.0));
-    buffer.set_text("a", &Attrs::new().family(font.family()), Shaping::Advanced, None);
+    buffer.set_text(
+        "a",
+        &Attrs::new().family(font.family()),
+        Shaping::Advanced,
+        None,
+    );
     buffer.shape_until_scroll(font_system, false);
     let font_id = buffer
         .layout_runs()
@@ -291,7 +296,11 @@ mod tests {
     fn every_font_choice_renders_in_its_own_font() {
         let mut renderer = TextRenderer::new();
         for font in FONTS {
-            let name = renderer.font_system.db().family_name(&font.family()).to_string();
+            let name = renderer
+                .font_system
+                .db()
+                .family_name(&font.family())
+                .to_string();
             assert!(
                 renders_with(&mut renderer.font_system, font, &name),
                 "{} renders in a fallback font instead of {name}",

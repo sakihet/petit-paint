@@ -1,8 +1,10 @@
+use canvas::{BRUSHES, Brush, Canvas, Change, Floating, Grid, Orientation, PixelRect, StrokeLayer};
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, h_flex,
+    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _,
     button::*,
     checkbox::Checkbox,
     color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
+    h_flex,
     slider::{Slider, SliderEvent, SliderState, SliderValue},
     v_flex,
 };
@@ -14,9 +16,6 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use canvas::{
-    BRUSHES, Brush, Canvas, Change, Floating, Grid, Orientation, PixelRect, StrokeLayer,
-};
 use image::{Frame, RgbaImage};
 use lyon::tessellation::{LineCap, LineJoin};
 use std::cell::{Cell, RefCell};
@@ -619,16 +618,15 @@ impl PaintApp {
             return;
         }
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Type, then press Enter"));
-        let subscription = cx.subscribe_in(&input, window, |this, _, event, window, cx| {
-            match event {
+        let subscription =
+            cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
                 InputEvent::Change => this.update_text_preview(cx),
                 InputEvent::PressEnter { .. } => {
                     this.commit_text(cx);
                     window.focus(&this.focus_handle, cx);
                 }
                 _ => {}
-            }
-        });
+            });
         input.update(cx, |input, cx| input.focus(window, cx));
         self.text_edit = Some(TextEdit {
             anchor: point(
@@ -1012,7 +1010,10 @@ impl PaintApp {
     /// Copies the selection to the system clipboard as a PNG image, so it can
     /// also be pasted into other apps.
     fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(png) = self.selected_pixels().and_then(|pixels| pixels.encode_png().ok()) else {
+        let Some(png) = self
+            .selected_pixels()
+            .and_then(|pixels| pixels.encode_png().ok())
+        else {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(
@@ -1102,17 +1103,13 @@ impl PaintApp {
             cx.notify();
         }
 
-        let cursor_position = self
-            .canvas_bounds
-            .get()
-            .contains(&event.position)
-            .then(|| {
-                let position = self.to_canvas(event.position);
-                point(
-                    position.x.as_f32().floor() as i32,
-                    position.y.as_f32().floor() as i32,
-                )
-            });
+        let cursor_position = self.canvas_bounds.get().contains(&event.position).then(|| {
+            let position = self.to_canvas(event.position);
+            point(
+                position.x.as_f32().floor() as i32,
+                position.y.as_f32().floor() as i32,
+            )
+        });
         // Only re-render when the pixel changes, not on every sub-pixel move
         if cursor_position != self.cursor_position {
             self.cursor_position = cursor_position;
@@ -1153,7 +1150,9 @@ impl PaintApp {
         self.select_drag = None;
         if let Some(drag) = self.shape_drag.take()
             && drag.start != drag.end
-            && let Some(undo) = self.canvas.draw_stroke(&self.shape_stroke(drag.start, drag.end))
+            && let Some(undo) = self
+                .canvas
+                .draw_stroke(&self.shape_stroke(drag.start, drag.end))
         {
             self.record(undo, cx);
             self.remember_color(self.active_color());
@@ -1303,10 +1302,9 @@ impl PaintApp {
         self.deselect(cx);
         self.commit_text(cx);
         if size != self.canvas.size()
-            && let Ok(undo) = self.canvas.resize(
-                size.width.as_f32() as u32,
-                size.height.as_f32() as u32,
-            )
+            && let Ok(undo) = self
+                .canvas
+                .resize(size.width.as_f32() as u32, size.height.as_f32() as u32)
         {
             self.record(undo, cx);
         }
@@ -1353,7 +1351,8 @@ impl PaintApp {
                     return false;
                 };
                 let size = size(px(width as f32), px(height as f32));
-                this.update(cx, |this, cx| this.resize_canvas(size, cx)).ok();
+                this.update(cx, |this, cx| this.resize_canvas(size, cx))
+                    .ok();
                 true
             }
         });
@@ -1385,16 +1384,13 @@ impl PaintApp {
                                 .label("Cancel")
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
-                        .child(
-                            Button::new("ok")
-                                .primary()
-                                .label("OK")
-                                .on_click(move |_, window, cx| {
-                                    if ok(window, cx) {
-                                        window.close_dialog(cx);
-                                    }
-                                }),
-                        ),
+                        .child(Button::new("ok").primary().label("OK").on_click(
+                            move |_, window, cx| {
+                                if ok(window, cx) {
+                                    window.close_dialog(cx);
+                                }
+                            },
+                        )),
                 )
         });
     }
@@ -1417,7 +1413,9 @@ impl PaintApp {
         self.document_path
             .as_ref()
             .and_then(|path| path.file_name())
-            .map_or("Untitled".into(), |name| name.to_string_lossy().into_owned())
+            .map_or("Untitled".into(), |name| {
+                name.to_string_lossy().into_owned()
+            })
     }
 
     /// Runs `then` right away when there are no unsaved changes. Otherwise
@@ -1572,7 +1570,8 @@ impl PaintApp {
             .as_ref()
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned());
-        let path = cx.prompt_for_new_path(&directory, Some(name.as_deref().unwrap_or("untitled.png")));
+        let path =
+            cx.prompt_for_new_path(&directory, Some(name.as_deref().unwrap_or("untitled.png")));
 
         cx.spawn_in(window, async move |this, cx| {
             let result = async {
@@ -1702,7 +1701,11 @@ impl Render for PaintApp {
                     h_flex()
                         .gap_2()
                         .child("Size")
-                        .child(div().w(px(120.0)).child(Slider::new(&self.font_size_slider)))
+                        .child(
+                            div()
+                                .w(px(120.0))
+                                .child(Slider::new(&self.font_size_slider)),
+                        )
                         .child(div().w(px(28.0)).child(format!("{}", self.font_size))),
                 )
             })
@@ -1739,25 +1742,33 @@ impl Render for PaintApp {
                 Button::new("canvas-size")
                     .outline()
                     .label("Canvas Size")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_canvas_size_dialog(window, cx)
-                    })),
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_canvas_size_dialog(window, cx)),
+                    ),
             )
             .child(
                 ButtonGroup::new("orientation")
                     .outline()
-                    .child(Button::new("flip-horizontal").label("Flip ↔").tooltip(
-                        "Flip left to right: the selection, or the whole image",
-                    ))
-                    .child(Button::new("flip-vertical").label("Flip ↕").tooltip(
-                        "Flip top to bottom: the selection, or the whole image",
-                    ))
-                    .child(Button::new("rotate-left").label("↺ 90°").tooltip(
-                        "Turn counterclockwise: the selection, or the whole image",
-                    ))
-                    .child(Button::new("rotate-right").label("↻ 90°").tooltip(
-                        "Turn clockwise: the selection, or the whole image",
-                    ))
+                    .child(
+                        Button::new("flip-horizontal")
+                            .label("Flip ↔")
+                            .tooltip("Flip left to right: the selection, or the whole image"),
+                    )
+                    .child(
+                        Button::new("flip-vertical")
+                            .label("Flip ↕")
+                            .tooltip("Flip top to bottom: the selection, or the whole image"),
+                    )
+                    .child(
+                        Button::new("rotate-left")
+                            .label("↺ 90°")
+                            .tooltip("Turn counterclockwise: the selection, or the whole image"),
+                    )
+                    .child(
+                        Button::new("rotate-right")
+                            .label("↻ 90°")
+                            .tooltip("Turn clockwise: the selection, or the whole image"),
+                    )
                     .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
                         let orientation = match clicks.first() {
                             Some(0) => Orientation::FlipHorizontal,
@@ -1859,7 +1870,10 @@ impl Render for PaintApp {
 
         let zoom = self.zoom();
         // The canvas as displayed, at the current zoom
-        let canvas_size = size(self.canvas_size.width * zoom, self.canvas_size.height * zoom);
+        let canvas_size = size(
+            self.canvas_size.width * zoom,
+            self.canvas_size.height * zoom,
+        );
         let handle = |handle: ResizeHandle, cx: &Context<Self>| {
             let (on_right, on_bottom) = handle.axes();
             // Centered on the edge midpoint, or on the corner, just outside the canvas
@@ -2077,27 +2091,29 @@ impl Render for PaintApp {
                     })),
             )
             .child(
-                h_flex()
-                    .gap_1()
-                    .child("Tiles")
-                    .child(
-                        ButtonGroup::new("tile-grid")
-                            .outline()
-                            .xsmall()
-                            .child(Button::new("tiles-off").label("Off").selected(self.grid.tile.is_none()))
-                            .children(TILE_SIZES.map(|tile| {
-                                Button::new(("tiles", tile as usize))
-                                    .label(tile.to_string())
-                                    .selected(self.grid.tile == Some(tile))
-                            }))
-                            .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
-                                if let Some(&ix) = clicks.first() {
-                                    // The first button turns the tile grid off
-                                    this.grid.tile = ix.checked_sub(1).and_then(|ix| TILE_SIZES.get(ix).copied());
-                                    cx.notify();
-                                }
-                            })),
-                    ),
+                h_flex().gap_1().child("Tiles").child(
+                    ButtonGroup::new("tile-grid")
+                        .outline()
+                        .xsmall()
+                        .child(
+                            Button::new("tiles-off")
+                                .label("Off")
+                                .selected(self.grid.tile.is_none()),
+                        )
+                        .children(TILE_SIZES.map(|tile| {
+                            Button::new(("tiles", tile as usize))
+                                .label(tile.to_string())
+                                .selected(self.grid.tile == Some(tile))
+                        }))
+                        .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
+                            if let Some(&ix) = clicks.first() {
+                                // The first button turns the tile grid off
+                                this.grid.tile =
+                                    ix.checked_sub(1).and_then(|ix| TILE_SIZES.get(ix).copied());
+                                cx.notify();
+                            }
+                        })),
+                ),
             )
             .child(
                 h_flex()
@@ -2117,11 +2133,9 @@ impl Render for PaintApp {
                             .compact()
                             .label(format!("{}%", (zoom * 100.0).round()))
                             .tooltip_with_action("Reset zoom", &ResetZoom, Some(KEY_CONTEXT))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.reset_zoom(&ResetZoom, window, cx)
-                                }),
-                            ),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.reset_zoom(&ResetZoom, window, cx)
+                            })),
                     )
                     .child(
                         Button::new("zoom-in")
@@ -2434,7 +2448,10 @@ mod tests {
         remember_color(&mut recent, color(0x00ff00));
         remember_color(&mut recent, color(0xff0000));
         let rgbs: Vec<_> = recent.iter().map(|c| c.to_rgb()).collect();
-        assert_eq!(rgbs, vec![color(0xff0000).to_rgb(), color(0x00ff00).to_rgb()]);
+        assert_eq!(
+            rgbs,
+            vec![color(0xff0000).to_rgb(), color(0x00ff00).to_rgb()]
+        );
 
         for c in 0..20 {
             remember_color(&mut recent, color(c));

@@ -230,7 +230,12 @@ impl Canvas {
             Brush::Calligraphy => draw_nib(&mut pixels, stroke, opaque, transform),
         }
 
-        let opacity = color.alpha() * if stroke.brush == Brush::Marker { 0.5 } else { 1.0 };
+        let opacity = color.alpha()
+            * if stroke.brush == Brush::Marker {
+                0.5
+            } else {
+                1.0
+            };
         if opacity < 1.0 {
             for pixel in pixels.pixels_mut() {
                 let scale = |c: u8| (c as f32 * opacity).round() as u8;
@@ -388,11 +393,7 @@ impl Canvas {
                     .and_then(|rect| self.pixmap.clone_rect(rect))
                     .expect("patch lies inside the canvas it was taken from");
                 self.write(x, y, &pixels);
-                Change::Patch {
-                    x,
-                    y,
-                    pixels: rect,
-                }
+                Change::Patch { x, y, pixels: rect }
             }
             Change::Replace(pixmap) => Change::Replace(std::mem::replace(&mut self.pixmap, pixmap)),
         }
@@ -899,7 +900,10 @@ fn draw_nib(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Trans
             let (x, y) = xy(only);
             vec![((x - 0.5, y - 0.5), (x + 0.5, y + 0.5))]
         }
-        points => points.windows(2).map(|pair| (xy(&pair[0]), xy(&pair[1]))).collect(),
+        points => points
+            .windows(2)
+            .map(|pair| (xy(&pair[0]), xy(&pair[1])))
+            .collect(),
     };
 
     // One path for the whole stroke, so neighboring segments merge instead
@@ -945,8 +949,8 @@ impl Random {
 }
 
 fn blank(width: u32, height: u32, background: Color) -> Result<Pixmap> {
-    let mut pixmap =
-        Pixmap::new(width, height).ok_or_else(|| anyhow!("invalid canvas size {width}x{height}"))?;
+    let mut pixmap = Pixmap::new(width, height)
+        .ok_or_else(|| anyhow!("invalid canvas size {width}x{height}"))?;
     pixmap.fill(background);
     Ok(pixmap)
 }
@@ -1041,7 +1045,11 @@ mod tests {
         let square = Stroke {
             closed: true,
             sharp_corners: true,
-            ..stroke(&[(5.0, 5.0), (35.0, 5.0), (35.0, 35.0), (5.0, 35.0)], 0x000000, 2.0)
+            ..stroke(
+                &[(5.0, 5.0), (35.0, 5.0), (35.0, 35.0), (5.0, 35.0)],
+                0x000000,
+                2.0,
+            )
         };
         canvas.draw_stroke(&square);
         assert_eq!(rgb_at(&canvas, 20, 20), (255, 255, 255));
@@ -1263,7 +1271,11 @@ mod tests {
     #[test]
     fn pencil_draws_only_solid_pixels() {
         let mut pencil = canvas(40, 40);
-        pencil.draw_stroke(&brush_stroke(Brush::Pencil, &[(3.0, 5.0), (35.0, 31.0)], 1.0));
+        pencil.draw_stroke(&brush_stroke(
+            Brush::Pencil,
+            &[(3.0, 5.0), (35.0, 31.0)],
+            1.0,
+        ));
         // No anti-aliased in-between shades, unlike the pen
         assert_eq!(shades(&pencil), [(0, 0, 0)].into());
 
@@ -1276,7 +1288,12 @@ mod tests {
     fn pencil_click_colors_one_pixel() {
         let mut canvas = canvas(10, 10);
         canvas.draw_stroke(&brush_stroke(Brush::Pencil, &[(4.5, 4.5)], 1.0));
-        let colored = canvas.pixmap.pixels().iter().filter(|p| p.red() == 0).count();
+        let colored = canvas
+            .pixmap
+            .pixels()
+            .iter()
+            .filter(|p| p.red() == 0)
+            .count();
         assert_eq!(colored, 1);
         assert_eq!(rgb_at(&canvas, 4, 4), (0, 0, 0));
     }
@@ -1294,7 +1311,10 @@ mod tests {
         let crossing = rgb_at(&canvas, 20, 20);
         let single = rgb_at(&canvas, 10, 10);
         assert_eq!(crossing, single);
-        assert!(crossing.0 > 100 && crossing.0 < 160, "{crossing:?} is not half gray");
+        assert!(
+            crossing.0 > 100 && crossing.0 < 160,
+            "{crossing:?} is not half gray"
+        );
     }
 
     #[test]
@@ -1319,7 +1339,11 @@ mod tests {
     fn airbrush_keeps_earlier_dots_as_the_stroke_grows() {
         let canvas = canvas(100, 40);
         let short = brush_stroke(Brush::Airbrush, &[(10.0, 20.0), (40.0, 20.0)], 6.0);
-        let long = brush_stroke(Brush::Airbrush, &[(10.0, 20.0), (40.0, 20.0), (90.0, 20.0)], 6.0);
+        let long = brush_stroke(
+            Brush::Airbrush,
+            &[(10.0, 20.0), (40.0, 20.0), (90.0, 20.0)],
+            6.0,
+        );
         let short = canvas.render_stroke(&short).unwrap();
         let long = canvas.render_stroke(&long).unwrap();
         // Compare the columns both layers cover, left of where the stroke grew
@@ -1342,7 +1366,8 @@ mod tests {
                 .filter(|i| {
                     let x = probe.0 as i32 + step.0 * i;
                     let y = probe.1 as i32 + step.1 * i;
-                    (0..60).contains(&x) && (0..60).contains(&y)
+                    (0..60).contains(&x)
+                        && (0..60).contains(&y)
                         && rgb_at(&canvas, x as u32, y as u32).0 < 128
                 })
                 .count()
@@ -1359,7 +1384,9 @@ mod tests {
     fn calligraphy_has_no_seams_between_segments() {
         let mut canvas = canvas(60, 60);
         // Many short segments across the nib, as a slow mouse drag makes
-        let points: Vec<_> = (0..=40).map(|i| (10.0 + i as f32, 10.0 + i as f32)).collect();
+        let points: Vec<_> = (0..=40)
+            .map(|i| (10.0 + i as f32, 10.0 + i as f32))
+            .collect();
         canvas.draw_stroke(&brush_stroke(Brush::Calligraphy, &points, 12.0));
         // Down the middle of the stroke every pixel is fully covered
         for i in 5..35 {
@@ -1504,16 +1531,28 @@ mod tests {
         // 4 5 6
         let image = numbered();
         let result = |o| numbers(&reoriented(&image, o));
-        assert_eq!(result(Orientation::FlipHorizontal), (3, 2, vec![3, 2, 1, 6, 5, 4]));
-        assert_eq!(result(Orientation::FlipVertical), (3, 2, vec![4, 5, 6, 1, 2, 3]));
+        assert_eq!(
+            result(Orientation::FlipHorizontal),
+            (3, 2, vec![3, 2, 1, 6, 5, 4])
+        );
+        assert_eq!(
+            result(Orientation::FlipVertical),
+            (3, 2, vec![4, 5, 6, 1, 2, 3])
+        );
         // 4 1
         // 5 2
         // 6 3
-        assert_eq!(result(Orientation::RotateClockwise), (2, 3, vec![4, 1, 5, 2, 6, 3]));
+        assert_eq!(
+            result(Orientation::RotateClockwise),
+            (2, 3, vec![4, 1, 5, 2, 6, 3])
+        );
         // 3 6
         // 2 5
         // 1 4
-        assert_eq!(result(Orientation::RotateCounterClockwise), (2, 3, vec![3, 6, 2, 5, 1, 4]));
+        assert_eq!(
+            result(Orientation::RotateCounterClockwise),
+            (2, 3, vec![3, 6, 2, 5, 1, 4])
+        );
     }
 
     #[test]
