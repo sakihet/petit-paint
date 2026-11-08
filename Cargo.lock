@@ -4510,11 +4510,13 @@ name = "petit-paint"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cosmic-text",
  "gpui-kit",
  "gpui-pre-platform",
  "image",
  "lyon",
  "tiny-skia 0.12.0",
+ "ttf-parser",
 ]
 
 [[package]]

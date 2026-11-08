@@ -304,6 +304,28 @@ impl Canvas {
         Some(undo)
     }
 
+    /// Draws `pixels` over the canvas with their top-left at `at`, blending
+    /// by their alpha, and returns the change that undoes it.
+    pub fn stamp(&mut self, pixels: &Pixmap, at: Point<i32>) -> Option<Change> {
+        let rect = self.clip_rect(PixelRect {
+            x: at.x,
+            y: at.y,
+            width: pixels.width(),
+            height: pixels.height(),
+        })?;
+        let undo = self.snapshot(rect)?;
+        self.pixmap.draw_pixmap(
+            at.x,
+            at.y,
+            pixels.as_ref(),
+            &PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
+        self.version += 1;
+        Some(undo)
+    }
+
     /// Lifts the pixels in `rect` off the canvas, leaving background behind.
     pub fn lift(&mut self, rect: PixelRect) -> Option<Floating> {
         let source = self.clip_rect(rect)?;
@@ -782,6 +804,20 @@ mod tests {
         assert_eq!(rgb_at(&canvas, 5, 5), (0, 0, 0));
         canvas.apply(undo);
         assert_eq!(rgb_at(&canvas, 3, 3), (0, 0, 0));
+    }
+
+    #[test]
+    fn stamp_blends_transparent_pixels_and_can_be_undone() {
+        let mut canvas = canvas_with_block();
+        // A 2x1 image: opaque red, then fully transparent
+        let mut pixels = Pixmap::new(2, 1).unwrap();
+        pixels.pixels_mut()[0] = PremultipliedColorU8::from_rgba(255, 0, 0, 255).unwrap();
+        let undo = canvas.stamp(&pixels, point(2, 2)).unwrap();
+        assert_eq!(rgb_at(&canvas, 2, 2), (255, 0, 0));
+        // The transparent pixel leaves the block showing through
+        assert_eq!(rgb_at(&canvas, 3, 2), (0, 0, 0));
+        canvas.apply(undo);
+        assert_eq!(rgb_at(&canvas, 2, 2), (0, 0, 0));
     }
 
     #[test]

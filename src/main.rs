@@ -1,5 +1,5 @@
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Selectable as _, h_flex,
+    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, h_flex,
     button::*,
     checkbox::Checkbox,
     color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
@@ -9,7 +9,7 @@ use gpui_kit::component::{
 use gpui_kit::component::{
     WindowExt as _,
     dialog::DialogFooter,
-    input::{InputState, NumberInput},
+    input::{Input, InputEvent, InputState, NumberInput},
     notification::Notification,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -20,9 +20,11 @@ use lyon::tessellation::{LineCap, LineJoin};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use text::{FONTS, FontChoice, TextRenderer};
 use tiny_skia::Pixmap;
 
 mod canvas;
+mod text;
 
 actions!(
     petit_paint,
@@ -44,6 +46,7 @@ actions!(
 );
 
 const DEFAULT_WIDTH: f32 = 4.0;
+const DEFAULT_FONT_SIZE: f32 = 24.0;
 const DEFAULT_CANVAS_SIZE: Size<Pixels> = Size {
     width: px(800.0),
     height: px(600.0),
@@ -170,6 +173,16 @@ impl ShapeKind {
     }
 }
 
+/// Text being typed, previewed on the canvas until it is placed.
+struct TextEdit {
+    /// Canvas pixel where the text starts.
+    anchor: Point<i32>,
+    input: Entity<InputState>,
+    /// The rendered text and how far left of `anchor` it starts.
+    preview: Option<(Pixmap, u32)>,
+    _subscription: Subscription,
+}
+
 /// A line, rectangle or ellipse being dragged out, in canvas coordinates.
 #[derive(Clone, Copy)]
 struct ShapeDrag {
@@ -190,16 +203,19 @@ enum Tool {
     Fill,
     /// Draws the shape chosen in the toolbar.
     Shape,
+    /// Types text onto the canvas at the clicked point.
+    Text,
 }
 
 /// Tools in toolbar order.
-const TOOLS: [Tool; 6] = [
+const TOOLS: [Tool; 7] = [
     Tool::Select,
     Tool::Pen,
     Tool::Eraser,
     Tool::Eyedropper,
     Tool::Fill,
     Tool::Shape,
+    Tool::Text,
 ];
 
 impl Tool {
@@ -211,6 +227,7 @@ impl Tool {
             Tool::Eyedropper => "Eyedropper",
             Tool::Fill => "Fill",
             Tool::Shape => "Shape",
+            Tool::Text => "Text",
         }
     }
 }
@@ -267,6 +284,15 @@ struct PaintApp {
     polygon: Vec<Point<Pixels>>,
     /// Where the mouse is while building a polygon, for previewing the next edge.
     polygon_hover: Option<Point<Pixels>>,
+    text_edit: Option<TextEdit>,
+    /// Made on first use of the text tool, since it scans the installed fonts.
+    text_renderer: Option<TextRenderer>,
+    font: FontChoice,
+    font_size: f32,
+    font_size_slider: Entity<SliderState>,
+    /// Bumped whenever the text preview changes, to refresh its cached image.
+    text_preview_id: u64,
+    text_cache: Rc<RefCell<ViewCache>>,
     view_cache: Rc<RefCell<ViewCache>>,
     selection: Option<Selection>,
     select_drag: Option<SelectDrag>,
@@ -306,13 +332,31 @@ impl PaintApp {
                 .default_value(DEFAULT_WIDTH)
         });
 
+        let font_size_slider = cx.new(|_| {
+            SliderState::new()
+                .min(8.0)
+                .max(144.0)
+                .step(1.0)
+                .default_value(DEFAULT_FONT_SIZE)
+        });
+
         let _subscriptions = vec![
             cx.subscribe_in(&color_picker, window, |this, _, event, _, cx| {
                 let ColorPickerEvent::Change(Some(color)) = event else {
                     return;
                 };
                 this.color = *color;
+                this.update_text_preview(cx);
                 cx.notify();
+            }),
+            cx.subscribe_in(&font_size_slider, window, |this, _, event, _, cx| {
+                let (SliderEvent::Change(SliderValue::Single(size))
+                | SliderEvent::Release(SliderValue::Single(size))) = event
+                else {
+                    return;
+                };
+                this.font_size = *size;
+                this.update_text_preview(cx);
             }),
             cx.subscribe_in(&width_slider, window, |this, _, event, _, cx| {
                 let (SliderEvent::Change(SliderValue::Single(width))
@@ -343,6 +387,13 @@ impl PaintApp {
             shape_drag: None,
             polygon: Vec::new(),
             polygon_hover: None,
+            text_edit: None,
+            text_renderer: None,
+            font: FontChoice::SansSerif,
+            font_size: DEFAULT_FONT_SIZE,
+            font_size_slider,
+            text_preview_id: 0,
+            text_cache: Rc::default(),
             view_cache: Rc::default(),
             selection: None,
             select_drag: None,
@@ -397,6 +448,10 @@ impl PaintApp {
                 self.start_shape(position, event.click_count, cx);
                 return;
             }
+            Tool::Text => {
+                self.start_text(position, window, cx);
+                return;
+            }
         };
         self.current_stroke = Some(Stroke {
             points: vec![position],
@@ -404,6 +459,69 @@ impl PaintApp {
             width: self.width,
             ..Default::default()
         });
+        cx.notify();
+    }
+
+    /// Opens a text box at `position`, or places the text being typed if
+    /// there is one, as clicking outside a text box does in Windows Paint.
+    fn start_text(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_edit.is_some() {
+            self.commit_text(cx);
+            return;
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Type, then press Enter"));
+        let subscription = cx.subscribe_in(&input, window, |this, _, event, window, cx| {
+            match event {
+                InputEvent::Change => this.update_text_preview(cx),
+                InputEvent::PressEnter { .. } => {
+                    this.commit_text(cx);
+                    window.focus(&this.focus_handle, cx);
+                }
+                _ => {}
+            }
+        });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.text_edit = Some(TextEdit {
+            anchor: point(
+                position.x.as_f32().floor() as i32,
+                position.y.as_f32().floor() as i32,
+            ),
+            input,
+            preview: None,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// Re-renders the text being typed with the current font, size and color.
+    fn update_text_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self
+            .text_edit
+            .as_ref()
+            .map(|edit| edit.input.read(cx).value().to_string())
+        else {
+            return;
+        };
+        let renderer = self.text_renderer.get_or_insert_with(TextRenderer::new);
+        let preview = renderer.render(&text, self.font, self.font_size, self.color);
+        if let Some(edit) = &mut self.text_edit {
+            edit.preview = preview;
+        }
+        self.text_preview_id += 1;
+        cx.notify();
+    }
+
+    /// Burns the text being typed into the canvas as one undo step.
+    fn commit_text(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.text_edit.take() else {
+            return;
+        };
+        if let Some((pixels, margin)) = &edit.preview {
+            let at = point(edit.anchor.x - *margin as i32, edit.anchor.y);
+            if let Some(undo) = self.canvas.stamp(pixels, at) {
+                self.record(undo, cx);
+            }
+        }
         cx.notify();
     }
 
@@ -622,6 +740,7 @@ impl PaintApp {
             self.deselect(cx);
         }
         self.cancel_polygon(cx);
+        self.commit_text(cx);
         self.tool = tool;
         cx.notify();
     }
@@ -699,8 +818,14 @@ impl PaintApp {
         }
     }
 
-    /// Escape: cancels a polygon being built, or drops the selection.
-    fn on_deselect(&mut self, _: &Deselect, _: &mut Window, cx: &mut Context<Self>) {
+    /// Escape: discards text being typed, cancels a polygon being built, or
+    /// drops the selection.
+    fn on_deselect(&mut self, _: &Deselect, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_edit.take().is_some() {
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+            return;
+        }
         if !self.polygon.is_empty() {
             self.cancel_polygon(cx);
             return;
@@ -926,6 +1051,7 @@ impl PaintApp {
 
     fn clear(&mut self, cx: &mut Context<Self>) {
         self.deselect(cx);
+        self.text_edit = None;
         if let Ok(undo) = self.canvas.clear() {
             self.record(undo, cx);
         }
@@ -949,6 +1075,8 @@ impl PaintApp {
             self.cancel_polygon(cx);
             return;
         }
+        // Placing typed text records it, which this then undoes
+        self.commit_text(cx);
         // Dropping floating pixels records their move, which this then undoes
         self.deselect(cx);
         let Some(change) = self.undo_stack.pop() else {
@@ -963,6 +1091,7 @@ impl PaintApp {
         if self.dragging() {
             return;
         }
+        self.commit_text(cx);
         self.deselect(cx);
         let Some(change) = self.redo_stack.pop() else {
             return;
@@ -976,6 +1105,7 @@ impl PaintApp {
     /// Growing adds background; shrinking crops, which undo brings back.
     fn resize_canvas(&mut self, size: Size<Pixels>, cx: &mut Context<Self>) {
         self.deselect(cx);
+        self.commit_text(cx);
         if size != self.canvas.size()
             && let Ok(undo) = self.canvas.resize(
                 size.width.as_f32() as u32,
@@ -1077,6 +1207,7 @@ impl PaintApp {
         // Include floating pixels, and encode now so the image reflects the
         // drawing at the time of the request
         self.commit_selection(cx);
+        self.commit_text(cx);
         let png = self.canvas.encode_png();
         let directory = std::env::home_dir().unwrap_or_default();
         let path = cx.prompt_for_new_path(&directory, Some("untitled.png"));
@@ -1160,6 +1291,30 @@ impl Render for PaintApp {
                         })),
                 )
             })
+            .when(self.tool == Tool::Text, |this| {
+                this.child(
+                    ButtonGroup::new("font")
+                        .outline()
+                        .children(FONTS.map(|font| {
+                            Button::new(font.label())
+                                .label(font.label())
+                                .selected(self.font == font)
+                        }))
+                        .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
+                            if let Some(&font) = clicks.first().and_then(|ix| FONTS.get(*ix)) {
+                                this.font = font;
+                                this.update_text_preview(cx);
+                            }
+                        })),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child("Size")
+                        .child(div().w(px(120.0)).child(Slider::new(&self.font_size_slider)))
+                        .child(div().w(px(28.0)).child(format!("{}", self.font_size))),
+                )
+            })
             .child(ColorPicker::new(&self.color_picker))
             .child(
                 h_flex()
@@ -1212,6 +1367,7 @@ impl Render for PaintApp {
         let visible_bounds = self.visible_bounds.clone();
         let view_cache = self.view_cache.clone();
         let floating_cache = self.floating_cache.clone();
+        let text_cache = self.text_cache.clone();
         let preview = self.current_stroke.clone().or_else(|| self.shape_preview());
         let app = cx.entity();
 
@@ -1291,6 +1447,21 @@ impl Render for PaintApp {
                                     &mut floating_cache.borrow_mut(),
                                 );
                             }
+                            if let Some(edit) = &app.text_edit
+                                && let Some((pixels, margin)) = &edit.preview
+                            {
+                                let x = edit.anchor.x as f32 - *margin as f32;
+                                let at = bounds.origin
+                                    + point(px(x * zoom), px(edit.anchor.y as f32 * zoom));
+                                paint_floating(
+                                    window,
+                                    pixels,
+                                    app.text_preview_id,
+                                    at,
+                                    zoom,
+                                    &mut text_cache.borrow_mut(),
+                                );
+                            }
                             if let Some(stroke) = &preview {
                                 paint_stroke(window, stroke, bounds.origin, zoom);
                             }
@@ -1311,6 +1482,25 @@ impl Render for PaintApp {
                         .border_1()
                         .border_dashed()
                         .border_color(rgb(SELECTION_COLOR)),
+                )
+            })
+            .when_some(self.text_edit.as_ref(), |this, edit| {
+                // Below the line of text, so it does not cover the preview
+                let line_height = (self.font_size * 1.2).ceil();
+                let top = (edit.anchor.y as f32 + line_height) * zoom + 4.0;
+                this.child(
+                    div()
+                        .id("text-editor")
+                        .absolute()
+                        .left(px(edit.anchor.x as f32 * zoom))
+                        .top(px(top))
+                        .w(px(240.0))
+                        .bg(theme.background)
+                        .shadow_md()
+                        .rounded_md()
+                        // Clicks in the box edit the text rather than reach the canvas
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(Input::new(&edit.input).small()),
                 )
             });
 
