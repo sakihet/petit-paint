@@ -34,24 +34,56 @@ const REDO_KEYS: &[&str] = &["ctrl-shift-z", "ctrl-y"];
 const SAVE_KEY: &str = "ctrl-s";
 
 /// A single brush stroke. Points are stored in window coordinates.
+#[derive(Clone)]
 struct Stroke {
     points: Vec<Point<Pixels>>,
     color: Hsla,
     width: Pixels,
 }
 
+/// A flood-filled region, stored as rectangles of device pixels.
+#[derive(Clone)]
+struct Fill {
+    color: Hsla,
+    /// Canvas origin in window coordinates when the fill was made.
+    origin: Point<Pixels>,
+    /// Window scale factor when the fill was made; `rects` are in its device pixels.
+    scale: f32,
+    rects: Rc<Vec<raster::PixelRect>>,
+}
+
+impl Fill {
+    fn window_bounds(&self, rect: &raster::PixelRect) -> Bounds<Pixels> {
+        let to_pixels = |device: u32| px(device as f32 / self.scale);
+        Bounds::new(
+            point(
+                self.origin.x + to_pixels(rect.x),
+                self.origin.y + to_pixels(rect.y),
+            ),
+            size(to_pixels(rect.width), to_pixels(rect.height)),
+        )
+    }
+}
+
+/// Something drawn on the canvas, painted in order.
+#[derive(Clone)]
+enum Item {
+    Stroke(Stroke),
+    Fill(Fill),
+}
+
 /// An undoable change to the drawing.
 enum HistoryEntry {
-    /// A stroke was appended to the end of `strokes`.
-    Stroke,
-    /// The canvas was cleared; holds the strokes that were removed.
-    Clear(Vec<Stroke>),
+    /// An item was appended to the end of `items`.
+    Add,
+    /// The canvas was cleared; holds the items that were removed.
+    Clear(Vec<Item>),
 }
 
 /// A change that was undone and can be reapplied.
 enum RedoEntry {
-    /// Holds the stroke that was removed by undo.
-    Stroke(Stroke),
+    /// Holds the item that was removed by undo.
+    Add(Item),
     /// Clears the canvas again.
     Clear,
 }
@@ -63,10 +95,12 @@ enum Tool {
     Eraser,
     /// Picks the brush color from the canvas, then switches back to the pen.
     Eyedropper,
+    /// Fills the region of matching color under the cursor with the brush color.
+    Fill,
 }
 
 /// Tools in toolbar order.
-const TOOLS: [Tool; 3] = [Tool::Pen, Tool::Eraser, Tool::Eyedropper];
+const TOOLS: [Tool; 4] = [Tool::Pen, Tool::Eraser, Tool::Eyedropper, Tool::Fill];
 
 impl Tool {
     fn label(self) -> &'static str {
@@ -74,13 +108,14 @@ impl Tool {
             Tool::Pen => "Pen",
             Tool::Eraser => "Eraser",
             Tool::Eyedropper => "Eyedropper",
+            Tool::Fill => "Fill",
         }
     }
 }
 
 struct PaintApp {
     tool: Tool,
-    strokes: Vec<Stroke>,
+    items: Vec<Item>,
     history: Vec<HistoryEntry>,
     redo_stack: Vec<RedoEntry>,
     drawing: bool,
@@ -126,7 +161,7 @@ impl PaintApp {
         ];
 
         Self {
-            strokes: Vec::new(),
+            items: Vec::new(),
             history: Vec::new(),
             redo_stack: Vec::new(),
             drawing: false,
@@ -156,14 +191,25 @@ impl PaintApp {
                 self.pick_color(event.position, window, cx);
                 return;
             }
+            Tool::Fill => {
+                self.fill_at(event.position, window, cx);
+                return;
+            }
         };
         self.drawing = true;
-        self.strokes.push(Stroke {
-            points: vec![event.position],
-            color,
-            width: self.width,
-        });
-        self.history.push(HistoryEntry::Stroke);
+        self.push_item(
+            Item::Stroke(Stroke {
+                points: vec![event.position],
+                color,
+                width: self.width,
+            }),
+            cx,
+        );
+    }
+
+    fn push_item(&mut self, item: Item, cx: &mut Context<Self>) {
+        self.items.push(item);
+        self.history.push(HistoryEntry::Add);
         self.redo_stack.clear();
         cx.notify();
     }
@@ -172,7 +218,7 @@ impl PaintApp {
         if !self.drawing {
             return;
         }
-        if let Some(stroke) = self.strokes.last_mut() {
+        if let Some(Item::Stroke(stroke)) = self.items.last_mut() {
             stroke.points.push(event.position);
             cx.notify();
         }
@@ -185,7 +231,7 @@ impl PaintApp {
 
     fn pick_color(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let color = raster::color_at(
-            &self.strokes,
+            &self.items,
             self.canvas_bounds.get(),
             rgb(CANVAS_BACKGROUND).into(),
             window.scale_factor(),
@@ -202,11 +248,34 @@ impl PaintApp {
         cx.notify();
     }
 
+    fn fill_at(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let bounds = self.canvas_bounds.get();
+        let scale = window.scale_factor();
+        let rects = raster::flood_fill(
+            &self.items,
+            bounds,
+            rgb(CANVAS_BACKGROUND).into(),
+            scale,
+            position,
+            self.color,
+        );
+        let Ok(Some(rects)) = rects else {
+            return;
+        };
+        let fill = Fill {
+            color: self.color,
+            origin: bounds.origin,
+            scale,
+            rects: Rc::new(rects),
+        };
+        self.push_item(Item::Fill(fill), cx);
+    }
+
     fn clear(&mut self, cx: &mut Context<Self>) {
-        if self.strokes.is_empty() {
+        if self.items.is_empty() {
             return;
         }
-        let removed = std::mem::take(&mut self.strokes);
+        let removed = std::mem::take(&mut self.items);
         self.history.push(HistoryEntry::Clear(removed));
         self.redo_stack.clear();
         cx.notify();
@@ -218,12 +287,12 @@ impl PaintApp {
             return;
         }
         let redo = match self.history.pop() {
-            Some(HistoryEntry::Stroke) => match self.strokes.pop() {
-                Some(stroke) => RedoEntry::Stroke(stroke),
+            Some(HistoryEntry::Add) => match self.items.pop() {
+                Some(item) => RedoEntry::Add(item),
                 None => return,
             },
             Some(HistoryEntry::Clear(removed)) => {
-                self.strokes = removed;
+                self.items = removed;
                 RedoEntry::Clear
             }
             None => return,
@@ -237,11 +306,11 @@ impl PaintApp {
             return;
         }
         let entry = match self.redo_stack.pop() {
-            Some(RedoEntry::Stroke(stroke)) => {
-                self.strokes.push(stroke);
-                HistoryEntry::Stroke
+            Some(RedoEntry::Add(item)) => {
+                self.items.push(item);
+                HistoryEntry::Add
             }
-            Some(RedoEntry::Clear) => HistoryEntry::Clear(std::mem::take(&mut self.strokes)),
+            Some(RedoEntry::Clear) => HistoryEntry::Clear(std::mem::take(&mut self.items)),
             None => return,
         };
         self.history.push(entry);
@@ -251,7 +320,7 @@ impl PaintApp {
     fn save_png(&mut self, _: &SavePng, window: &mut Window, cx: &mut Context<Self>) {
         // Encode now so the image reflects the drawing at the time of the request
         let png = raster::encode_png(
-            &self.strokes,
+            &self.items,
             self.canvas_bounds.get(),
             rgb(CANVAS_BACKGROUND).into(),
             window.scale_factor(),
@@ -283,12 +352,8 @@ impl PaintApp {
 
 impl Render for PaintApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Copy the stroke data so it can be moved into the paint closure
-        let strokes: Vec<(Vec<Point<Pixels>>, Hsla, Pixels)> = self
-            .strokes
-            .iter()
-            .map(|s| (s.points.clone(), s.color, s.width))
-            .collect();
+        // Copy the items so they can be moved into the paint closure
+        let items = self.items.clone();
 
         let theme = cx.theme();
 
@@ -371,8 +436,11 @@ impl Render for PaintApp {
                     move |bounds, _, window, _| {
                         canvas_bounds.set(bounds);
                         window.paint_layer(bounds, |window| {
-                            for (points, color, width) in &strokes {
-                                paint_stroke(window, points, *color, *width);
+                            for item in &items {
+                                match item {
+                                    Item::Stroke(stroke) => paint_stroke(window, stroke),
+                                    Item::Fill(fill) => paint_fill(window, fill),
+                                }
                             }
                         });
                     },
@@ -393,7 +461,12 @@ impl Render for PaintApp {
     }
 }
 
-fn paint_stroke(window: &mut Window, points: &[Point<Pixels>], color: Hsla, width: Pixels) {
+fn paint_stroke(window: &mut Window, stroke: &Stroke) {
+    let Stroke {
+        points,
+        color,
+        width,
+    } = stroke;
     let Some(first) = points.first() else {
         return;
     };
@@ -413,7 +486,13 @@ fn paint_stroke(window: &mut Window, points: &[Point<Pixels>], color: Hsla, widt
         }
     }
     if let Ok(path) = builder.build() {
-        window.paint_path(path, color);
+        window.paint_path(path, *color);
+    }
+}
+
+fn paint_fill(window: &mut Window, fill: &Fill) {
+    for rect in fill.rects.iter() {
+        window.paint_quad(gpui_kit::fill(fill.window_bounds(rect), fill.color));
     }
 }
 
