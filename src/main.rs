@@ -18,6 +18,7 @@ use canvas::{BRUSHES, Brush, Canvas, Change, Floating, PixelRect, StrokeLayer};
 use image::{Frame, RgbaImage};
 use lyon::tessellation::{LineCap, LineJoin};
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use text::{FONTS, FontChoice, TextRenderer};
@@ -31,6 +32,7 @@ actions!(
     [
         Undo,
         Redo,
+        OpenImage,
         SavePng,
         SelectAll,
         CopySelection,
@@ -291,6 +293,8 @@ struct PaintApp {
     stroke_count: u64,
     /// While erasing, the canvas as it was when the stroke began.
     erase_base: Option<Pixmap>,
+    /// The PNG file last opened or saved, suggested when saving.
+    document_path: Option<PathBuf>,
     /// Restores what the eraser stroke so far has removed.
     erase_undo: Option<Change>,
     shape_kind: ShapeKind,
@@ -406,6 +410,7 @@ impl PaintApp {
             brush: Brush::Pen,
             stroke_count: 0,
             erase_base: None,
+            document_path: None,
             erase_undo: None,
             shape_kind: ShapeKind::Rectangle,
             shape_filled: false,
@@ -1257,16 +1262,83 @@ impl PaintApp {
         });
     }
 
+    /// Opens a PNG file as the canvas, at its size and with its transparency.
+    /// Replacing the canvas is one undo step, so an accidental open can be undone.
+    fn open_image(&mut self, _: &OpenImage, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = async {
+                let Some(path) = paths.await??.and_then(|paths| paths.into_iter().next()) else {
+                    return Ok(None);
+                };
+                let bytes = std::fs::read(&path)?;
+                let pixels = Pixmap::decode_png(&bytes)
+                    .map_err(|_| anyhow::anyhow!("{} is not a PNG image", path.display()))?;
+                if pixels.width() > MAX_CANVAS_SIDE || pixels.height() > MAX_CANVAS_SIDE {
+                    anyhow::bail!(
+                        "{}×{} is larger than the {MAX_CANVAS_SIDE}×{MAX_CANVAS_SIDE} limit",
+                        pixels.width(),
+                        pixels.height()
+                    );
+                }
+                anyhow::Ok(Some((path, pixels)))
+            }
+            .await;
+
+            match result {
+                Ok(Some((path, pixels))) => {
+                    this.update(cx, |this, cx| this.load_image(path, pixels, cx))
+                        .ok();
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let notification = Notification::error(format!("Failed to open: {err:#}"));
+                    cx.update(|window, cx| window.push_notification(notification, cx))
+                        .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn load_image(&mut self, path: PathBuf, pixels: Pixmap, cx: &mut Context<Self>) {
+        self.deselect(cx);
+        self.cancel_polygon(cx);
+        self.text_edit = None;
+        let undo = self.canvas.replace(pixels);
+        self.record(undo, cx);
+        self.canvas_size = self.canvas.size();
+        self.document_path = Some(path);
+        cx.notify();
+    }
+
     fn save_png(&mut self, _: &SavePng, window: &mut Window, cx: &mut Context<Self>) {
         // Include floating pixels, and encode now so the image reflects the
         // drawing at the time of the request
         self.commit_selection(cx);
         self.commit_text(cx);
         let png = self.canvas.encode_png();
-        let directory = std::env::home_dir().unwrap_or_default();
-        let path = cx.prompt_for_new_path(&directory, Some("untitled.png"));
+        // Suggest the file last opened or saved, so saving again overwrites it
+        let directory = self
+            .document_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|dir| dir.to_path_buf())
+            .or_else(std::env::home_dir)
+            .unwrap_or_default();
+        let name = self
+            .document_path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned());
+        let path = cx.prompt_for_new_path(&directory, Some(name.as_deref().unwrap_or("untitled.png")));
 
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = async {
                 let Some(path) = path.await?? else {
                     return Ok(None);
@@ -1277,7 +1349,12 @@ impl PaintApp {
             .await;
 
             let notification = match result {
-                Ok(Some(path)) => Notification::success(format!("Saved {}", path.display())),
+                Ok(Some(path)) => {
+                    let notification = Notification::success(format!("Saved {}", path.display()));
+                    this.update(cx, |this, _| this.document_path = Some(path))
+                        .ok();
+                    notification
+                }
                 Ok(None) => return,
                 Err(err) => Notification::error(format!("Failed to save PNG: {err:#}")),
             };
@@ -1423,6 +1500,15 @@ impl Render for PaintApp {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_canvas_size_dialog(window, cx)
                     })),
+            )
+            .child(
+                Button::new("open")
+                    .outline()
+                    .label("Open")
+                    .tooltip_with_action("Open a PNG image", &OpenImage, Some(KEY_CONTEXT))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_image(&OpenImage, window, cx)),
+                    ),
             )
             .child(
                 Button::new("save")
@@ -1688,6 +1774,7 @@ impl Render for PaintApp {
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::save_png))
+            .on_action(cx.listener(Self::open_image))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::cut_selection))
@@ -1903,6 +1990,7 @@ fn main() {
             KeyBinding::new(with_modifier!("z"), Undo, context),
             KeyBinding::new(with_modifier!("shift-z"), Redo, context),
             KeyBinding::new(with_modifier!("s"), SavePng, context),
+            KeyBinding::new(with_modifier!("o"), OpenImage, context),
             KeyBinding::new(with_modifier!("a"), SelectAll, context),
             KeyBinding::new(with_modifier!("c"), CopySelection, context),
             KeyBinding::new(with_modifier!("x"), CutSelection, context),

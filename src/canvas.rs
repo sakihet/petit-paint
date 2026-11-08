@@ -307,6 +307,12 @@ impl Canvas {
         Ok(self.apply(Change::Replace(resized)))
     }
 
+    /// Replaces the whole canvas with `pixels`, taking on their size, and
+    /// returns the change that undoes it.
+    pub fn replace(&mut self, pixels: Pixmap) -> Change {
+        self.apply(Change::Replace(pixels))
+    }
+
     /// Applies `change` and returns its inverse.
     pub fn apply(&mut self, change: Change) -> Change {
         self.version += 1;
@@ -1281,6 +1287,23 @@ mod tests {
         assert_eq!(shade(1), CHECKER_LIGHT);
         assert_eq!(shade(2), CHECKER_DARK);
         assert!(view.chunks(4).all(|pixel| pixel[3] == 255));
+    }
+
+    #[test]
+    fn opening_a_png_replaces_the_canvas_and_can_be_undone() {
+        let mut source = transparent_canvas(30, 10);
+        source.draw_stroke(&stroke(&[(0.0, 5.0), (30.0, 5.0)], 0x00ff00, 4.0));
+        let opened = Pixmap::decode_png(&source.encode_png().unwrap()).unwrap();
+
+        let mut canvas = canvas(80, 60);
+        let undo = canvas.replace(opened);
+        assert_eq!(canvas.size(), size(px(30.0), px(10.0)));
+        assert_eq!(rgb_at(&canvas, 15, 5), (0, 255, 0));
+        // Transparency survives the round trip through PNG
+        assert_eq!(canvas.pixmap.pixel(15, 0).unwrap().alpha(), 0);
+
+        canvas.apply(undo);
+        assert_eq!(canvas.size(), size(px(80.0), px(60.0)));
     }
 
     #[test]
