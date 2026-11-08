@@ -19,6 +19,35 @@ pub struct Canvas {
     version: u64,
 }
 
+/// A rectangle of canvas pixels. It may extend past the canvas, for example
+/// while a selection is moved over the edge.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PixelRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl PixelRect {
+    pub fn contains(&self, point: Point<i32>) -> bool {
+        point.x >= self.x
+            && point.y >= self.y
+            && point.x < self.x + self.width as i32
+            && point.y < self.y + self.height as i32
+    }
+}
+
+/// Pixels lifted off the canvas or pasted, which float above it until dropped.
+pub struct Floating {
+    pub pixels: Pixmap,
+    /// The canvas before the pixels were lifted or pasted, so the whole move
+    /// is recorded as one undo step when they are dropped.
+    before: Pixmap,
+    /// Where the pixels were lifted from, which the undo step must restore too.
+    source: Option<IntRect>,
+}
+
 /// A reversible change to the canvas. Applying one returns its inverse.
 pub enum Change {
     /// Pixels to write back with their top-left at (`x`, `y`).
@@ -233,6 +262,102 @@ impl Canvas {
         self.pixmap.encode_png().context("failed to encode PNG")
     }
 
+    /// Returns a copy of the pixels in `rect`, clipped to the canvas.
+    pub fn copy(&self, rect: PixelRect) -> Option<Pixmap> {
+        self.pixmap.clone_rect(self.clip_rect(rect)?)
+    }
+
+    /// Paints `rect` with the background color and returns the change that undoes it.
+    pub fn erase(&mut self, rect: PixelRect) -> Option<Change> {
+        let rect = self.clip_rect(rect)?;
+        let undo = self.snapshot(rect)?;
+        self.pixmap.fill_rect(
+            rect.to_rect(),
+            &Paint {
+                shader: tiny_skia::Shader::SolidColor(self.background),
+                blend_mode: tiny_skia::BlendMode::Source,
+                ..Default::default()
+            },
+            Transform::identity(),
+            None,
+        );
+        self.version += 1;
+        Some(undo)
+    }
+
+    /// Lifts the pixels in `rect` off the canvas, leaving background behind.
+    pub fn lift(&mut self, rect: PixelRect) -> Option<Floating> {
+        let source = self.clip_rect(rect)?;
+        let pixels = self.pixmap.clone_rect(source)?;
+        let before = self.pixmap.clone();
+        self.erase(rect);
+        Some(Floating {
+            pixels,
+            before,
+            source: Some(source),
+        })
+    }
+
+    /// Floats `pixels` above the canvas, as when pasting.
+    pub fn float(&self, pixels: Pixmap) -> Floating {
+        Floating {
+            pixels,
+            before: self.pixmap.clone(),
+            source: None,
+        }
+    }
+
+    /// Drops `floating` onto the canvas with its top-left at `at`, or discards
+    /// it when `keep` is false, and returns the change that undoes the whole
+    /// lift-and-move or paste.
+    ///
+    /// Returns `None` when the canvas ends up as it was, such as when lifted
+    /// pixels are dropped back where they came from.
+    pub fn drop_floating(
+        &mut self,
+        floating: Floating,
+        at: Point<i32>,
+        keep: bool,
+    ) -> Option<Change> {
+        let target = PixelRect {
+            x: at.x,
+            y: at.y,
+            width: floating.pixels.width(),
+            height: floating.pixels.height(),
+        };
+        let target = keep.then(|| self.clip_rect(target)).flatten();
+        if keep {
+            self.pixmap.draw_pixmap(
+                at.x,
+                at.y,
+                floating.pixels.as_ref(),
+                &PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
+            self.version += 1;
+        }
+        if keep && target == floating.source {
+            return None;
+        }
+        // Restore both where the pixels came from and where they landed
+        let changed = match (floating.source, target) {
+            (Some(a), Some(b)) => IntRect::from_ltrb(
+                a.left().min(b.left()),
+                a.top().min(b.top()),
+                a.right().max(b.right()),
+                a.bottom().max(b.bottom()),
+            )?,
+            (Some(rect), None) | (None, Some(rect)) => rect,
+            (None, None) => return None,
+        };
+        Some(Change::Patch {
+            x: changed.x() as u32,
+            y: changed.y() as u32,
+            pixels: floating.before.clone_rect(changed)?,
+        })
+    }
+
     /// Renders part of the canvas, scaled up or down with nearest-neighbor
     /// sampling so pixels stay sharp, as BGRA bytes for gpui.
     ///
@@ -246,29 +371,14 @@ impl Canvas {
         region: Size<u32>,
         pixels_per_canvas_pixel: f32,
     ) -> Vec<u8> {
-        let canvas_index = |device: u32, len: u32| {
-            let index = ((device as f32 + 0.5) / pixels_per_canvas_pixel) as u32;
-            (index < len).then_some(index as usize)
-        };
-        let columns: Vec<Option<usize>> = (origin.x..origin.x + region.width)
-            .map(|x| canvas_index(x, self.pixmap.width()))
-            .collect();
         let background = bgra(self.background.premultiply().to_color_u8());
-        let width = self.pixmap.width() as usize;
-        let pixels = self.pixmap.pixels();
-
-        let mut out = Vec::with_capacity(region.width as usize * region.height as usize * 4);
-        for y in origin.y..origin.y + region.height {
-            let row = canvas_index(y, self.pixmap.height()).map(|row| &pixels[row * width..][..width]);
-            for column in &columns {
-                let pixel = match (row, column) {
-                    (Some(row), Some(x)) => bgra(row[*x]),
-                    _ => background,
-                };
-                out.extend_from_slice(&pixel);
-            }
-        }
-        out
+        render_scaled(
+            &self.pixmap,
+            background,
+            origin,
+            region,
+            pixels_per_canvas_pixel,
+        )
     }
 
     /// Converts a canvas position to pixel indices, if it is inside.
@@ -280,6 +390,12 @@ impl Canvas {
             && x < self.pixmap.width() as f32
             && y < self.pixmap.height() as f32;
         inside.then_some((x as usize, y as usize))
+    }
+
+    fn clip_rect(&self, rect: PixelRect) -> Option<IntRect> {
+        let right = rect.x as f32 + rect.width as f32;
+        let bottom = rect.y as f32 + rect.height as f32;
+        self.clip(rect.x as f32, rect.y as f32, right, bottom)
     }
 
     /// Rounds the rectangle outward to whole pixels and clips it to the canvas.
@@ -313,6 +429,57 @@ impl Canvas {
                 .copy_from_slice(&source[row * patch_width..][..patch_width]);
         }
     }
+}
+
+/// Renders all of `pixmap` like [`Canvas::render_view`], returning the BGRA
+/// bytes and their size in device pixels.
+pub fn render_pixmap(pixmap: &Pixmap, pixels_per_canvas_pixel: f32) -> (Vec<u8>, Size<u32>) {
+    let region = size(
+        (pixmap.width() as f32 * pixels_per_canvas_pixel).ceil() as u32,
+        (pixmap.height() as f32 * pixels_per_canvas_pixel).ceil() as u32,
+    );
+    let transparent = [0; 4];
+    let bytes = render_scaled(
+        pixmap,
+        transparent,
+        Point::default(),
+        region,
+        pixels_per_canvas_pixel,
+    );
+    (bytes, region)
+}
+
+/// Samples `pixmap` with nearest-neighbor scaling into BGRA bytes, using
+/// `padding` for device pixels past its edge.
+fn render_scaled(
+    pixmap: &Pixmap,
+    padding: [u8; 4],
+    origin: Point<u32>,
+    region: Size<u32>,
+    pixels_per_canvas_pixel: f32,
+) -> Vec<u8> {
+    let canvas_index = |device: u32, len: u32| {
+        let index = ((device as f32 + 0.5) / pixels_per_canvas_pixel) as u32;
+        (index < len).then_some(index as usize)
+    };
+    let columns: Vec<Option<usize>> = (origin.x..origin.x + region.width)
+        .map(|x| canvas_index(x, pixmap.width()))
+        .collect();
+    let width = pixmap.width() as usize;
+    let pixels = pixmap.pixels();
+
+    let mut out = Vec::with_capacity(region.width as usize * region.height as usize * 4);
+    for y in origin.y..origin.y + region.height {
+        let row = canvas_index(y, pixmap.height()).map(|row| &pixels[row * width..][..width]);
+        for column in &columns {
+            let pixel = match (row, column) {
+                (Some(row), Some(x)) => bgra(row[*x]),
+                _ => padding,
+            };
+            out.extend_from_slice(&pixel);
+        }
+    }
+    out
 }
 
 fn blank(width: u32, height: u32, background: Color) -> Result<Pixmap> {
@@ -485,6 +652,85 @@ mod tests {
         assert_eq!(rgb_at(&canvas, 10, 10), (255, 255, 255));
         canvas.apply(undo);
         assert_eq!(rgb_at(&canvas, 10, 10), (0, 0, 0));
+    }
+
+    fn rect(x: i32, y: i32, width: u32, height: u32) -> PixelRect {
+        PixelRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// A 20x20 canvas with a black 4x4 block at (2, 2).
+    fn canvas_with_block() -> Canvas {
+        let mut canvas = canvas(20, 20);
+        let black = PremultipliedColorU8::from_rgba(0, 0, 0, 255).unwrap();
+        for y in 2..6 {
+            for x in 2..6 {
+                canvas.pixmap.pixels_mut()[y * 20 + x] = black;
+            }
+        }
+        canvas
+    }
+
+    #[test]
+    fn moving_a_selection_is_one_undo_step() {
+        let mut canvas = canvas_with_block();
+        let floating = canvas.lift(rect(2, 2, 4, 4)).unwrap();
+        // Lifting leaves background behind
+        assert_eq!(rgb_at(&canvas, 3, 3), (255, 255, 255));
+
+        let undo = canvas.drop_floating(floating, point(10, 10), true).unwrap();
+        assert_eq!(rgb_at(&canvas, 3, 3), (255, 255, 255));
+        assert_eq!(rgb_at(&canvas, 11, 11), (0, 0, 0));
+
+        canvas.apply(undo);
+        assert_eq!(rgb_at(&canvas, 3, 3), (0, 0, 0));
+        assert_eq!(rgb_at(&canvas, 11, 11), (255, 255, 255));
+    }
+
+    #[test]
+    fn dropping_lifted_pixels_in_place_records_nothing() {
+        let mut canvas = canvas_with_block();
+        let floating = canvas.lift(rect(2, 2, 4, 4)).unwrap();
+        assert!(canvas.drop_floating(floating, point(2, 2), true).is_none());
+        assert_eq!(rgb_at(&canvas, 3, 3), (0, 0, 0));
+    }
+
+    #[test]
+    fn discarding_lifted_pixels_deletes_them() {
+        let mut canvas = canvas_with_block();
+        let floating = canvas.lift(rect(2, 2, 4, 4)).unwrap();
+        let undo = canvas.drop_floating(floating, point(2, 2), false).unwrap();
+        assert_eq!(rgb_at(&canvas, 3, 3), (255, 255, 255));
+        canvas.apply(undo);
+        assert_eq!(rgb_at(&canvas, 3, 3), (0, 0, 0));
+    }
+
+    #[test]
+    fn pasting_clips_to_the_canvas_and_can_be_undone() {
+        let mut canvas = canvas_with_block();
+        let pixels = canvas.copy(rect(2, 2, 4, 4)).unwrap();
+        let floating = canvas.float(pixels);
+        // Partly past the bottom-right corner
+        let undo = canvas.drop_floating(floating, point(18, 18), true).unwrap();
+        assert_eq!(rgb_at(&canvas, 19, 19), (0, 0, 0));
+        canvas.apply(undo);
+        assert_eq!(rgb_at(&canvas, 19, 19), (255, 255, 255));
+        assert_eq!(rgb_at(&canvas, 3, 3), (0, 0, 0));
+    }
+
+    #[test]
+    fn erase_paints_background_and_can_be_undone() {
+        let mut canvas = canvas_with_block();
+        let undo = canvas.erase(rect(0, 0, 4, 4)).unwrap();
+        assert_eq!(rgb_at(&canvas, 3, 3), (255, 255, 255));
+        // Outside the erased rect stays
+        assert_eq!(rgb_at(&canvas, 5, 5), (0, 0, 0));
+        canvas.apply(undo);
+        assert_eq!(rgb_at(&canvas, 3, 3), (0, 0, 0));
     }
 
     #[test]

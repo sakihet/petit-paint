@@ -13,16 +13,30 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use canvas::{Canvas, Change};
+use canvas::{Canvas, Change, Floating, PixelRect};
 use image::{Frame, RgbaImage};
 use lyon::tessellation::{LineCap, LineJoin};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use tiny_skia::Pixmap;
 
 mod canvas;
 
-actions!(petit_paint, [Undo, Redo, SavePng]);
+actions!(
+    petit_paint,
+    [
+        Undo,
+        Redo,
+        SavePng,
+        SelectAll,
+        CopySelection,
+        CutSelection,
+        Paste,
+        DeleteSelection,
+        Deselect,
+    ]
+);
 
 const DEFAULT_WIDTH: f32 = 4.0;
 const DEFAULT_CANVAS_SIZE: Size<Pixels> = Size {
@@ -38,20 +52,22 @@ const MAX_HISTORY: usize = 100;
 const HANDLE_SIZE: Pixels = px(8.0);
 const KEY_CONTEXT: &str = "PaintApp";
 const CANVAS_BACKGROUND: u32 = 0xffffff;
+const SELECTION_COLOR: u32 = 0x0078d7;
 
-// KeyBinding::new cannot resolve "secondary-", so pick the modifier per OS
+// KeyBinding::new takes a &'static str and cannot resolve "secondary-", so
+// pick the modifier per OS at compile time
 #[cfg(target_os = "macos")]
-const UNDO_KEYS: &[&str] = &["cmd-z"];
-#[cfg(target_os = "macos")]
-const REDO_KEYS: &[&str] = &["cmd-shift-z"];
-#[cfg(target_os = "macos")]
-const SAVE_KEY: &str = "cmd-s";
+macro_rules! with_modifier {
+    ($key:literal) => {
+        concat!("cmd-", $key)
+    };
+}
 #[cfg(not(target_os = "macos"))]
-const UNDO_KEYS: &[&str] = &["ctrl-z"];
-#[cfg(not(target_os = "macos"))]
-const REDO_KEYS: &[&str] = &["ctrl-shift-z", "ctrl-y"];
-#[cfg(not(target_os = "macos"))]
-const SAVE_KEY: &str = "ctrl-s";
+macro_rules! with_modifier {
+    ($key:literal) => {
+        concat!("ctrl-", $key)
+    };
+}
 
 /// A single brush stroke. Points are in canvas coordinates, with the origin at its top-left.
 ///
@@ -62,6 +78,23 @@ struct Stroke {
     points: Vec<Point<Pixels>>,
     color: Hsla,
     width: Pixels,
+}
+
+/// The selected rectangle, in canvas pixels.
+struct Selection {
+    rect: PixelRect,
+    /// Pixels lifted from the selection or pasted into it, drawn above the
+    /// canvas until dropped.
+    floating: Option<Floating>,
+}
+
+/// An in-progress drag with the select tool.
+#[derive(Clone, Copy)]
+enum SelectDrag {
+    /// Dragging out a new selection from `anchor`.
+    Marquee { anchor: Point<i32> },
+    /// Moving the selection; `grab` is the mouse offset from its top-left.
+    Move { grab: Point<i32> },
 }
 
 /// What the cached view image was rendered from.
@@ -83,6 +116,8 @@ struct ViewCache {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tool {
+    /// Selects a rectangle to move, copy, cut or delete.
+    Select,
     Pen,
     /// Paints with the canvas background color, so erasing is undoable like any stroke.
     Eraser,
@@ -93,11 +128,18 @@ enum Tool {
 }
 
 /// Tools in toolbar order.
-const TOOLS: [Tool; 4] = [Tool::Pen, Tool::Eraser, Tool::Eyedropper, Tool::Fill];
+const TOOLS: [Tool; 5] = [
+    Tool::Select,
+    Tool::Pen,
+    Tool::Eraser,
+    Tool::Eyedropper,
+    Tool::Fill,
+];
 
 impl Tool {
     fn label(self) -> &'static str {
         match self {
+            Tool::Select => "Select",
             Tool::Pen => "Pen",
             Tool::Eraser => "Eraser",
             Tool::Eyedropper => "Eyedropper",
@@ -151,6 +193,14 @@ struct PaintApp {
     /// The stroke being drawn, not yet burned into `canvas`.
     current_stroke: Option<Stroke>,
     view_cache: Rc<RefCell<ViewCache>>,
+    selection: Option<Selection>,
+    select_drag: Option<SelectDrag>,
+    /// Bumped whenever new floating pixels are created, to refresh their cached image.
+    floating_id: u64,
+    floating_cache: Rc<RefCell<ViewCache>>,
+    /// The part of the canvas inside the viewport, in window coordinates from
+    /// the last paint. Pasted pixels land at its top-left.
+    visible_bounds: Rc<Cell<Bounds<Pixels>>>,
     resize_drag: Option<ResizeDrag>,
     /// Canvas pixel under the mouse, shown in the status bar.
     cursor_position: Option<Point<i32>>,
@@ -210,6 +260,11 @@ impl PaintApp {
             canvas_size: DEFAULT_CANVAS_SIZE,
             current_stroke: None,
             view_cache: Rc::default(),
+            selection: None,
+            select_drag: None,
+            floating_id: 0,
+            floating_cache: Rc::default(),
+            visible_bounds: Rc::default(),
             resize_drag: None,
             cursor_position: None,
             tool: Tool::Pen,
@@ -231,11 +286,16 @@ impl PaintApp {
     ) {
         // Take focus back from toolbar inputs so shortcuts reach the canvas
         window.focus(&self.focus_handle, cx);
+        if self.tool == Tool::Select {
+            self.start_select(event.position, cx);
+            return;
+        }
         if !self.canvas_bounds.get().contains(&event.position) {
             return;
         }
         let position = self.to_canvas(event.position);
         let color = match self.tool {
+            Tool::Select => return,
             Tool::Pen => self.color,
             Tool::Eraser => rgb(CANVAS_BACKGROUND).into(),
             Tool::Eyedropper => {
@@ -257,6 +317,190 @@ impl PaintApp {
 
     fn to_canvas(&self, position: Point<Pixels>) -> Point<Pixels> {
         position - self.canvas_bounds.get().origin
+    }
+
+    /// The canvas pixel at `position` in window coordinates, which may lie
+    /// outside the canvas.
+    fn canvas_pixel(&self, position: Point<Pixels>) -> Point<i32> {
+        let position = self.to_canvas(position);
+        point(
+            position.x.as_f32().floor() as i32,
+            position.y.as_f32().floor() as i32,
+        )
+    }
+
+    fn set_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
+        if tool != Tool::Select {
+            self.deselect(cx);
+        }
+        self.tool = tool;
+        cx.notify();
+    }
+
+    fn start_select(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let pixel = self.canvas_pixel(position);
+        if let Some(selection) = &mut self.selection
+            && selection.rect.contains(pixel)
+        {
+            if selection.floating.is_none() {
+                selection.floating = self.canvas.lift(selection.rect);
+                self.floating_id += 1;
+            }
+            let grab = point(pixel.x - selection.rect.x, pixel.y - selection.rect.y);
+            self.select_drag = Some(SelectDrag::Move { grab });
+            cx.notify();
+            return;
+        }
+        self.deselect(cx);
+        if self.canvas_bounds.get().contains(&position) {
+            self.select_drag = Some(SelectDrag::Marquee { anchor: pixel });
+        }
+    }
+
+    fn drag_select(&mut self, drag: SelectDrag, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let pixel = self.canvas_pixel(position);
+        match drag {
+            SelectDrag::Marquee { anchor } => {
+                let size = self.canvas.size();
+                // Pixel edges, so the rectangle can reach the canvas's far edge
+                let end = point(
+                    pixel.x.clamp(0, size.width.as_f32() as i32),
+                    pixel.y.clamp(0, size.height.as_f32() as i32),
+                );
+                let rect = PixelRect {
+                    x: anchor.x.min(end.x),
+                    y: anchor.y.min(end.y),
+                    width: anchor.x.abs_diff(end.x),
+                    height: anchor.y.abs_diff(end.y),
+                };
+                self.selection = (rect.width > 0 && rect.height > 0).then_some(Selection {
+                    rect,
+                    floating: None,
+                });
+            }
+            SelectDrag::Move { grab } => {
+                if let Some(selection) = &mut self.selection {
+                    selection.rect.x = pixel.x - grab.x;
+                    selection.rect.y = pixel.y - grab.y;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Drops floating pixels onto the canvas, recording the move or paste as
+    /// one undo step. The selection stays.
+    fn commit_selection(&mut self, cx: &mut Context<Self>) {
+        let Some((floating, at)) = self.selection.as_mut().and_then(|selection| {
+            let at = point(selection.rect.x, selection.rect.y);
+            Some((selection.floating.take()?, at))
+        }) else {
+            return;
+        };
+        if let Some(undo) = self.canvas.drop_floating(floating, at, true) {
+            self.record(undo, cx);
+        }
+        cx.notify();
+    }
+
+    fn deselect(&mut self, cx: &mut Context<Self>) {
+        self.commit_selection(cx);
+        if self.selection.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn on_deselect(&mut self, _: &Deselect, _: &mut Window, cx: &mut Context<Self>) {
+        self.deselect(cx);
+    }
+
+    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.deselect(cx);
+        let size = self.canvas.size();
+        self.selection = Some(Selection {
+            rect: PixelRect {
+                x: 0,
+                y: 0,
+                width: size.width.as_f32() as u32,
+                height: size.height.as_f32() as u32,
+            },
+            floating: None,
+        });
+        self.tool = Tool::Select;
+        cx.notify();
+    }
+
+    fn selected_pixels(&self) -> Option<Pixmap> {
+        let selection = self.selection.as_ref()?;
+        match &selection.floating {
+            Some(floating) => Some(floating.pixels.clone()),
+            None => self.canvas.copy(selection.rect),
+        }
+    }
+
+    /// Copies the selection to the system clipboard as a PNG image, so it can
+    /// also be pasted into other apps.
+    fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(png) = self.selected_pixels().and_then(|pixels| pixels.encode_png().ok()) else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(
+            ImageFormat::Png,
+            png,
+        )));
+    }
+
+    fn cut_selection(&mut self, _: &CutSelection, window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_selection(&CopySelection, window, cx);
+        self.delete_selection(&DeleteSelection, window, cx);
+    }
+
+    fn delete_selection(&mut self, _: &DeleteSelection, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(selection) = self.selection.take() else {
+            return;
+        };
+        let undo = match selection.floating {
+            // Lifted pixels already left background behind; discarding them deletes them
+            Some(floating) => {
+                let at = point(selection.rect.x, selection.rect.y);
+                self.canvas.drop_floating(floating, at, false)
+            }
+            None => self.canvas.erase(selection.rect),
+        };
+        if let Some(undo) = undo {
+            self.record(undo, cx);
+        }
+        cx.notify();
+    }
+
+    /// Pastes a PNG image from the system clipboard as floating pixels at the
+    /// top-left of the visible part of the canvas.
+    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        let Some(pixels) = item.entries().iter().find_map(|entry| match entry {
+            ClipboardEntry::Image(image) if image.format == ImageFormat::Png => {
+                Pixmap::decode_png(&image.bytes).ok()
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+        self.deselect(cx);
+        let visible = self.canvas_pixel(self.visible_bounds.get().origin);
+        self.selection = Some(Selection {
+            rect: PixelRect {
+                x: visible.x.max(0),
+                y: visible.y.max(0),
+                width: pixels.width(),
+                height: pixels.height(),
+            },
+            floating: Some(self.canvas.float(pixels)),
+        });
+        self.floating_id += 1;
+        self.tool = Tool::Select;
+        cx.notify();
     }
 
     /// Records `undo`, the change that reverts an edit just made to the canvas.
@@ -287,6 +531,10 @@ impl PaintApp {
             cx.notify();
         }
 
+        if let Some(drag) = self.select_drag {
+            self.drag_select(drag, event.position, cx);
+            return;
+        }
         if let Some(drag) = &self.resize_drag {
             let delta = event.position - drag.start_position;
             let (resize_width, resize_height) = drag.handle.axes();
@@ -313,6 +561,7 @@ impl PaintApp {
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_drag = None;
         if let Some(stroke) = self.current_stroke.take()
             && let Some(undo) = self.canvas.draw_stroke(&stroke)
         {
@@ -358,6 +607,7 @@ impl PaintApp {
     }
 
     fn clear(&mut self, cx: &mut Context<Self>) {
+        self.deselect(cx);
         if let Ok(undo) = self.canvas.clear() {
             self.record(undo, cx);
         }
@@ -366,13 +616,15 @@ impl PaintApp {
     /// Whether a mouse drag is in progress, during which undo and redo would
     /// conflict with the stroke or resize being made.
     fn dragging(&self) -> bool {
-        self.current_stroke.is_some() || self.resize_drag.is_some()
+        self.current_stroke.is_some() || self.resize_drag.is_some() || self.select_drag.is_some()
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
         if self.dragging() {
             return;
         }
+        // Dropping floating pixels records their move, which this then undoes
+        self.deselect(cx);
         let Some(change) = self.undo_stack.pop() else {
             return;
         };
@@ -385,6 +637,7 @@ impl PaintApp {
         if self.dragging() {
             return;
         }
+        self.deselect(cx);
         let Some(change) = self.redo_stack.pop() else {
             return;
         };
@@ -396,6 +649,7 @@ impl PaintApp {
     /// Resizes the canvas, keeping the drawing anchored at the top-left.
     /// Growing adds background; shrinking crops, which undo brings back.
     fn resize_canvas(&mut self, size: Size<Pixels>, cx: &mut Context<Self>) {
+        self.deselect(cx);
         if size != self.canvas.size()
             && let Ok(undo) = self.canvas.resize(
                 size.width.as_f32() as u32,
@@ -494,7 +748,9 @@ impl PaintApp {
     }
 
     fn save_png(&mut self, _: &SavePng, window: &mut Window, cx: &mut Context<Self>) {
-        // Encode now so the image reflects the drawing at the time of the request
+        // Include floating pixels, and encode now so the image reflects the
+        // drawing at the time of the request
+        self.commit_selection(cx);
         let png = self.canvas.encode_png();
         let directory = std::env::home_dir().unwrap_or_default();
         let path = cx.prompt_for_new_path(&directory, Some("untitled.png"));
@@ -526,9 +782,12 @@ impl Render for PaintApp {
         let theme = cx.theme();
 
         let toolbar = h_flex()
+            // Wrap instead of clipping buttons when the window is narrow
+            .flex_wrap()
             .gap_3()
             .px_3()
-            .h(px(44.0))
+            .py_1p5()
+            .min_h(px(44.0))
             .bg(theme.background)
             .border_b_1()
             .border_color(theme.border)
@@ -543,8 +802,7 @@ impl Render for PaintApp {
                     }))
                     .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
                         if let Some(&tool) = clicks.first().and_then(|ix| TOOLS.get(*ix)) {
-                            this.tool = tool;
-                            cx.notify();
+                            this.set_tool(tool, cx);
                         }
                     })),
             )
@@ -597,7 +855,9 @@ impl Render for PaintApp {
             );
 
         let canvas_bounds = self.canvas_bounds.clone();
+        let visible_bounds = self.visible_bounds.clone();
         let view_cache = self.view_cache.clone();
+        let floating_cache = self.floating_cache.clone();
         let preview = self.current_stroke.clone();
         let app = cx.entity();
 
@@ -648,11 +908,26 @@ impl Render for PaintApp {
                     |_, _, _| {},
                     move |bounds, _, window, cx| {
                         canvas_bounds.set(bounds);
+                        visible_bounds.set(bounds.intersect(&window.content_mask().bounds));
                         // Keep strokes that run past the edge from drawing outside the canvas
                         let mask = ContentMask { bounds };
                         window.with_content_mask(Some(mask), |window| {
-                            let canvas = &app.read(cx).canvas;
-                            paint_view(window, canvas, bounds, &mut view_cache.borrow_mut());
+                            let app = app.read(cx);
+                            paint_view(window, &app.canvas, bounds, &mut view_cache.borrow_mut());
+                            if let Some(selection) = &app.selection
+                                && let Some(floating) = &selection.floating
+                            {
+                                let rect = selection.rect;
+                                let at = bounds.origin
+                                    + point(px(rect.x as f32), px(rect.y as f32));
+                                paint_floating(
+                                    window,
+                                    &floating.pixels,
+                                    app.floating_id,
+                                    at,
+                                    &mut floating_cache.borrow_mut(),
+                                );
+                            }
                             if let Some(stroke) = &preview {
                                 paint_stroke(window, stroke, bounds.origin);
                             }
@@ -660,7 +935,21 @@ impl Render for PaintApp {
                     },
                 )
                 .size_full(),
-            );
+            )
+            .when_some(self.selection.as_ref(), |this, selection| {
+                let rect = selection.rect;
+                this.child(
+                    div()
+                        .absolute()
+                        .left(px(rect.x as f32))
+                        .top(px(rect.y as f32))
+                        .w(px(rect.width as f32))
+                        .h(px(rect.height as f32))
+                        .border_1()
+                        .border_dashed()
+                        .border_color(rgb(SELECTION_COLOR)),
+                )
+            });
 
         // Mouse handlers sit on the viewport so a drag keeps drawing when it
         // leaves the canvas
@@ -700,6 +989,10 @@ impl Render for PaintApp {
             ))
             .when_some(self.cursor_position, |this, position| {
                 this.child(format!("{}, {}px", position.x, position.y))
+            })
+            .when_some(self.selection.as_ref(), |this, selection| {
+                let rect = selection.rect;
+                this.child(format!("Selection {} × {}px", rect.width, rect.height))
             });
 
         v_flex()
@@ -708,6 +1001,12 @@ impl Render for PaintApp {
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::save_png))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::cut_selection))
+            .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::delete_selection))
+            .on_action(cx.listener(Self::on_deselect))
             .size_full()
             .text_color(theme.foreground)
             .child(toolbar)
@@ -744,6 +1043,58 @@ fn paint_stroke(window: &mut Window, stroke: &Stroke, origin: Point<Pixels>) {
     if let Ok(path) = builder.build() {
         window.paint_path(path, *color);
     }
+}
+
+/// Paints floating selection pixels with their top-left at `at`, in window
+/// coordinates, sampled like the canvas view so they stay sharp.
+fn paint_floating(
+    window: &mut Window,
+    pixels: &Pixmap,
+    id: u64,
+    at: Point<Pixels>,
+    cache: &mut ViewCache,
+) {
+    let scale = window.scale_factor();
+    let key = ViewKey {
+        version: id,
+        scale: scale.to_bits(),
+        origin: point(0, 0),
+        size: size(pixels.width(), pixels.height()),
+    };
+    if cache.key != Some(key) {
+        let (bytes, region) = canvas::render_pixmap(pixels, scale);
+        let Some(frame) = RgbaImage::from_raw(region.width, region.height, bytes) else {
+            return;
+        };
+        let image = Arc::new(RenderImage::new(vec![Frame::new(frame)]));
+        if let Some(previous) = cache.image.replace(image) {
+            window.drop_image(previous).ok();
+        }
+        cache.key = Some(key);
+    }
+    let Some(image) = cache.image.clone() else {
+        return;
+    };
+    // Snap to device pixels so sampling stays 1:1
+    let snap = |pixels: Pixels| px((pixels.as_f32() * scale).round() / scale);
+    let image_size = image.size(0);
+    let image_bounds = Bounds::new(
+        point(snap(at.x), snap(at.y)),
+        size(
+            px(image_size.width.0 as f32 / scale),
+            px(image_size.height.0 as f32 / scale),
+        ),
+    );
+    window
+        .paint_image(
+            image_bounds,
+            image_bounds,
+            Corners::default(),
+            image,
+            0,
+            false,
+        )
+        .ok();
 }
 
 /// Paints the visible part of `canvas`, displayed at `bounds` in window coordinates.
@@ -810,17 +1161,24 @@ fn paint_view(window: &mut Window, canvas: &Canvas, bounds: Bounds<Pixels>, cach
 fn main() {
     gpui_kit::application().run(|cx| {
         gpui_kit::init(cx);
-        cx.bind_keys(
-            UNDO_KEYS
-                .iter()
-                .map(|key| KeyBinding::new(key, Undo, Some(KEY_CONTEXT)))
-                .chain(
-                    REDO_KEYS
-                        .iter()
-                        .map(|key| KeyBinding::new(key, Redo, Some(KEY_CONTEXT))),
-                )
-                .chain([KeyBinding::new(SAVE_KEY, SavePng, Some(KEY_CONTEXT))]),
-        );
+        let context = Some(KEY_CONTEXT);
+        let mut bindings = vec![
+            KeyBinding::new(with_modifier!("z"), Undo, context),
+            KeyBinding::new(with_modifier!("shift-z"), Redo, context),
+            KeyBinding::new(with_modifier!("s"), SavePng, context),
+            KeyBinding::new(with_modifier!("a"), SelectAll, context),
+            KeyBinding::new(with_modifier!("c"), CopySelection, context),
+            KeyBinding::new(with_modifier!("x"), CutSelection, context),
+            KeyBinding::new(with_modifier!("v"), Paste, context),
+            KeyBinding::new("backspace", DeleteSelection, context),
+            KeyBinding::new("delete", DeleteSelection, context),
+            KeyBinding::new("escape", Deselect, context),
+        ];
+        // Windows and Linux apps also redo with Ctrl+Y
+        if cfg!(not(target_os = "macos")) {
+            bindings.push(KeyBinding::new("ctrl-y", Redo, context));
+        }
+        cx.bind_keys(bindings);
         let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
         gpui_kit::open_window(
             WindowOptions {
