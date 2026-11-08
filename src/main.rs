@@ -7,16 +7,20 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 
-actions!(petit_paint, [Undo]);
+actions!(petit_paint, [Undo, Redo]);
 
 const DEFAULT_WIDTH: f32 = 4.0;
 const KEY_CONTEXT: &str = "PaintApp";
 
 // KeyBinding::new cannot resolve "secondary-", so pick the modifier per OS
 #[cfg(target_os = "macos")]
-const UNDO_KEY: &str = "cmd-z";
+const UNDO_KEYS: &[&str] = &["cmd-z"];
+#[cfg(target_os = "macos")]
+const REDO_KEYS: &[&str] = &["cmd-shift-z"];
 #[cfg(not(target_os = "macos"))]
-const UNDO_KEY: &str = "ctrl-z";
+const UNDO_KEYS: &[&str] = &["ctrl-z"];
+#[cfg(not(target_os = "macos"))]
+const REDO_KEYS: &[&str] = &["ctrl-shift-z", "ctrl-y"];
 
 /// A single brush stroke. Points are stored in window coordinates.
 struct Stroke {
@@ -33,9 +37,18 @@ enum HistoryEntry {
     Clear(Vec<Stroke>),
 }
 
+/// A change that was undone and can be reapplied.
+enum RedoEntry {
+    /// Holds the stroke that was removed by undo.
+    Stroke(Stroke),
+    /// Clears the canvas again.
+    Clear,
+}
+
 struct PaintApp {
     strokes: Vec<Stroke>,
     history: Vec<HistoryEntry>,
+    redo_stack: Vec<RedoEntry>,
     drawing: bool,
     focus_handle: FocusHandle,
     color: Hsla,
@@ -79,6 +92,7 @@ impl PaintApp {
         Self {
             strokes: Vec::new(),
             history: Vec::new(),
+            redo_stack: Vec::new(),
             drawing: false,
             focus_handle: cx.focus_handle(),
             color,
@@ -104,6 +118,7 @@ impl PaintApp {
             width: self.width,
         });
         self.history.push(HistoryEntry::Stroke);
+        self.redo_stack.clear();
         cx.notify();
     }
 
@@ -128,6 +143,7 @@ impl PaintApp {
         }
         let removed = std::mem::take(&mut self.strokes);
         self.history.push(HistoryEntry::Clear(removed));
+        self.redo_stack.clear();
         cx.notify();
     }
 
@@ -136,13 +152,34 @@ impl PaintApp {
         if self.drawing {
             return;
         }
-        match self.history.pop() {
-            Some(HistoryEntry::Stroke) => {
-                self.strokes.pop();
+        let redo = match self.history.pop() {
+            Some(HistoryEntry::Stroke) => match self.strokes.pop() {
+                Some(stroke) => RedoEntry::Stroke(stroke),
+                None => return,
+            },
+            Some(HistoryEntry::Clear(removed)) => {
+                self.strokes = removed;
+                RedoEntry::Clear
             }
-            Some(HistoryEntry::Clear(removed)) => self.strokes = removed,
             None => return,
+        };
+        self.redo_stack.push(redo);
+        cx.notify();
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.drawing {
+            return;
         }
+        let entry = match self.redo_stack.pop() {
+            Some(RedoEntry::Stroke(stroke)) => {
+                self.strokes.push(stroke);
+                HistoryEntry::Stroke
+            }
+            Some(RedoEntry::Clear) => HistoryEntry::Clear(std::mem::take(&mut self.strokes)),
+            None => return,
+        };
+        self.history.push(entry);
         cx.notify();
     }
 }
@@ -183,6 +220,14 @@ impl Render for PaintApp {
                     .on_click(cx.listener(|this, _, window, cx| this.undo(&Undo, window, cx))),
             )
             .child(
+                Button::new("redo")
+                    .outline()
+                    .label("Redo")
+                    .tooltip_with_action("Redo", &Redo, Some(KEY_CONTEXT))
+                    .disabled(self.redo_stack.is_empty())
+                    .on_click(cx.listener(|this, _, window, cx| this.redo(&Redo, window, cx))),
+            )
+            .child(
                 Button::new("clear")
                     .outline()
                     .label("Clear")
@@ -215,6 +260,7 @@ impl Render for PaintApp {
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .size_full()
             .text_color(theme.foreground)
             .child(toolbar)
@@ -244,7 +290,16 @@ fn paint_stroke(window: &mut Window, points: &[Point<Pixels>], color: Hsla, widt
 fn main() {
     gpui_kit::application().run(|cx| {
         gpui_kit::init(cx);
-        cx.bind_keys([KeyBinding::new(UNDO_KEY, Undo, Some(KEY_CONTEXT))]);
+        cx.bind_keys(
+            UNDO_KEYS
+                .iter()
+                .map(|key| KeyBinding::new(key, Undo, Some(KEY_CONTEXT)))
+                .chain(
+                    REDO_KEYS
+                        .iter()
+                        .map(|key| KeyBinding::new(key, Redo, Some(KEY_CONTEXT))),
+                ),
+        );
         let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
         gpui_kit::open_window(
             WindowOptions {
