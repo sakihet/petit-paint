@@ -35,6 +35,9 @@ actions!(
         Paste,
         DeleteSelection,
         Deselect,
+        ZoomIn,
+        ZoomOut,
+        ResetZoom,
     ]
 );
 
@@ -48,6 +51,12 @@ const DEFAULT_CANVAS_SIZE: Size<Pixels> = Size {
 const MAX_CANVAS_SIDE: u32 = 4096;
 /// Number of undo steps kept; older ones are dropped.
 const MAX_HISTORY: usize = 100;
+/// Zoom levels, as displayed pixels per canvas pixel.
+const ZOOM_LEVELS: [f32; 8] = [0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0];
+const DEFAULT_ZOOM_INDEX: usize = 2;
+/// Scroll distance with Cmd/Ctrl held, or pinch amount, per zoom step.
+const SCROLL_PER_ZOOM_STEP: f32 = 50.0;
+const PINCH_PER_ZOOM_STEP: f32 = 0.15;
 /// Side length of the square handles for resizing the canvas.
 const HANDLE_SIZE: Pixels = px(8.0);
 const KEY_CONTEXT: &str = "PaintApp";
@@ -101,7 +110,8 @@ enum SelectDrag {
 #[derive(Clone, Copy, PartialEq)]
 struct ViewKey {
     version: u64,
-    scale: u32,
+    /// Device pixels per canvas pixel, as bits so the key can be compared exactly.
+    pixels_per_canvas_pixel: u32,
     origin: Point<u32>,
     size: Size<u32>,
 }
@@ -201,6 +211,10 @@ struct PaintApp {
     /// The part of the canvas inside the viewport, in window coordinates from
     /// the last paint. Pasted pixels land at its top-left.
     visible_bounds: Rc<Cell<Bounds<Pixels>>>,
+    zoom_index: usize,
+    /// Scroll or pinch input not yet turned into a zoom step.
+    zoom_input: f32,
+    scroll_handle: ScrollHandle,
     resize_drag: Option<ResizeDrag>,
     /// Canvas pixel under the mouse, shown in the status bar.
     cursor_position: Option<Point<i32>>,
@@ -265,6 +279,9 @@ impl PaintApp {
             floating_id: 0,
             floating_cache: Rc::default(),
             visible_bounds: Rc::default(),
+            zoom_index: DEFAULT_ZOOM_INDEX,
+            zoom_input: 0.0,
+            scroll_handle: ScrollHandle::new(),
             resize_drag: None,
             cursor_position: None,
             tool: Tool::Pen,
@@ -315,8 +332,93 @@ impl PaintApp {
         cx.notify();
     }
 
+    fn zoom(&self) -> f32 {
+        ZOOM_LEVELS[self.zoom_index]
+    }
+
     fn to_canvas(&self, position: Point<Pixels>) -> Point<Pixels> {
-        position - self.canvas_bounds.get().origin
+        let position = position - self.canvas_bounds.get().origin;
+        point(position.x / self.zoom(), position.y / self.zoom())
+    }
+
+    /// Zooms to `ZOOM_LEVELS[index]`, keeping the canvas point under `anchor`
+    /// (in window coordinates) in place by scrolling the viewport.
+    fn zoom_to(&mut self, index: usize, anchor: Point<Pixels>, cx: &mut Context<Self>) {
+        let index = index.min(ZOOM_LEVELS.len() - 1);
+        if index == self.zoom_index {
+            return;
+        }
+        let canvas_point = self.to_canvas(anchor);
+        let zoom = ZOOM_LEVELS[index];
+        let canvas_origin = self.canvas_bounds.get().origin;
+        let new_origin = anchor - point(canvas_point.x * zoom, canvas_point.y * zoom);
+        let offset = self.scroll_handle.offset() + (new_origin - canvas_origin);
+        // Offsets are negative when scrolled; past zero would leave a gap at the start
+        self.scroll_handle
+            .set_offset(point(offset.x.min(px(0.0)), offset.y.min(px(0.0))));
+        self.zoom_index = index;
+        cx.notify();
+    }
+
+    /// Zooms one step in or out around the middle of the visible canvas.
+    fn zoom_step(&mut self, zoom_in: bool, cx: &mut Context<Self>) {
+        let visible = self.visible_bounds.get();
+        let anchor = visible.origin + point(visible.size.width / 2.0, visible.size.height / 2.0);
+        let index = if zoom_in {
+            self.zoom_index + 1
+        } else {
+            self.zoom_index.saturating_sub(1)
+        };
+        self.zoom_to(index, anchor, cx);
+    }
+
+    fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_step(true, cx);
+    }
+
+    fn zoom_out(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_step(false, cx);
+    }
+
+    fn reset_zoom(&mut self, _: &ResetZoom, _: &mut Window, cx: &mut Context<Self>) {
+        let visible = self.visible_bounds.get();
+        self.zoom_to(DEFAULT_ZOOM_INDEX, visible.origin, cx);
+    }
+
+    /// Accumulates scroll or pinch input and zooms a step around `anchor`
+    /// each time it passes `per_step`.
+    fn zoom_by_input(
+        &mut self,
+        amount: f32,
+        per_step: f32,
+        anchor: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.zoom_input += amount;
+        while self.zoom_input.abs() >= per_step {
+            let zoom_in = self.zoom_input > 0.0;
+            self.zoom_input -= per_step.copysign(self.zoom_input);
+            let index = if zoom_in {
+                self.zoom_index + 1
+            } else {
+                self.zoom_index.saturating_sub(1)
+            };
+            self.zoom_to(index, anchor, cx);
+        }
+    }
+
+    fn on_scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !event.modifiers.secondary(cx) {
+            return;
+        }
+        // Zoom instead of scrolling the viewport
+        cx.stop_propagation();
+        let delta = event.delta.pixel_delta(px(16.0)).y.as_f32();
+        self.zoom_by_input(delta, SCROLL_PER_ZOOM_STEP, event.position, cx);
+    }
+
+    fn on_pinch(&mut self, event: &PinchEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_by_input(event.delta, PINCH_PER_ZOOM_STEP, event.position, cx);
     }
 
     /// The canvas pixel at `position` in window coordinates, which may lie
@@ -537,6 +639,7 @@ impl PaintApp {
         }
         if let Some(drag) = &self.resize_drag {
             let delta = event.position - drag.start_position;
+            let delta = point(delta.x / self.zoom(), delta.y / self.zoom());
             let (resize_width, resize_height) = drag.handle.axes();
             let resize = |side: Pixels, delta: Pixels, enabled: bool| {
                 if !enabled {
@@ -861,7 +964,9 @@ impl Render for PaintApp {
         let preview = self.current_stroke.clone();
         let app = cx.entity();
 
-        let canvas_size = self.canvas_size;
+        let zoom = self.zoom();
+        // The canvas as displayed, at the current zoom
+        let canvas_size = size(self.canvas_size.width * zoom, self.canvas_size.height * zoom);
         let handle = |handle: ResizeHandle, cx: &Context<Self>| {
             let (on_right, on_bottom) = handle.axes();
             // Centered on the edge midpoint, or on the corner, just outside the canvas
@@ -897,8 +1002,8 @@ impl Render for PaintApp {
 
         let canvas_area = div()
             .relative()
-            .w(self.canvas_size.width)
-            .h(self.canvas_size.height)
+            .w(canvas_size.width)
+            .h(canvas_size.height)
             .flex_none()
             .bg(rgb(CANVAS_BACKGROUND))
             .shadow_md()
@@ -913,23 +1018,30 @@ impl Render for PaintApp {
                         let mask = ContentMask { bounds };
                         window.with_content_mask(Some(mask), |window| {
                             let app = app.read(cx);
-                            paint_view(window, &app.canvas, bounds, &mut view_cache.borrow_mut());
+                            paint_view(
+                                window,
+                                &app.canvas,
+                                bounds,
+                                zoom,
+                                &mut view_cache.borrow_mut(),
+                            );
                             if let Some(selection) = &app.selection
                                 && let Some(floating) = &selection.floating
                             {
                                 let rect = selection.rect;
                                 let at = bounds.origin
-                                    + point(px(rect.x as f32), px(rect.y as f32));
+                                    + point(px(rect.x as f32 * zoom), px(rect.y as f32 * zoom));
                                 paint_floating(
                                     window,
                                     &floating.pixels,
                                     app.floating_id,
                                     at,
+                                    zoom,
                                     &mut floating_cache.borrow_mut(),
                                 );
                             }
                             if let Some(stroke) = &preview {
-                                paint_stroke(window, stroke, bounds.origin);
+                                paint_stroke(window, stroke, bounds.origin, zoom);
                             }
                         });
                     },
@@ -941,15 +1053,28 @@ impl Render for PaintApp {
                 this.child(
                     div()
                         .absolute()
-                        .left(px(rect.x as f32))
-                        .top(px(rect.y as f32))
-                        .w(px(rect.width as f32))
-                        .h(px(rect.height as f32))
+                        .left(px(rect.x as f32 * zoom))
+                        .top(px(rect.y as f32 * zoom))
+                        .w(px(rect.width as f32 * zoom))
+                        .h(px(rect.height as f32 * zoom))
                         .border_1()
                         .border_dashed()
                         .border_color(rgb(SELECTION_COLOR)),
                 )
             });
+
+        // Fills the viewport and holds the canvas. Zoom gestures are handled
+        // here because a child's listeners run before the viewport scrolls.
+        let stage = div()
+            .flex()
+            .items_start()
+            .flex_none()
+            .min_w_full()
+            .min_h_full()
+            .p_3()
+            .on_scroll(cx.listener(Self::on_scroll))
+            .on_pinch(cx.listener(Self::on_pinch))
+            .child(canvas_area);
 
         // Mouse handlers sit on the viewport so a drag keeps drawing when it
         // leaves the canvas
@@ -959,8 +1084,8 @@ impl Render for PaintApp {
             .items_start()
             .flex_1()
             .min_h_0()
-            .p_3()
             .overflow_scroll()
+            .track_scroll(&self.scroll_handle)
             .bg(theme.muted)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -971,7 +1096,7 @@ impl Render for PaintApp {
                     cx.notify();
                 }
             }))
-            .child(canvas_area);
+            .child(stage);
 
         let status_bar = h_flex()
             .gap_4()
@@ -993,7 +1118,42 @@ impl Render for PaintApp {
             .when_some(self.selection.as_ref(), |this, selection| {
                 let rect = selection.rect;
                 this.child(format!("Selection {} × {}px", rect.width, rect.height))
-            });
+            })
+            .child(div().flex_1())
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("zoom-out")
+                            .ghost()
+                            .compact()
+                            .label("−")
+                            .tooltip_with_action("Zoom out", &ZoomOut, Some(KEY_CONTEXT))
+                            .disabled(self.zoom_index == 0)
+                            .on_click(cx.listener(|this, _, _, cx| this.zoom_step(false, cx))),
+                    )
+                    .child(
+                        Button::new("reset-zoom")
+                            .ghost()
+                            .compact()
+                            .label(format!("{}%", (zoom * 100.0).round()))
+                            .tooltip_with_action("Reset zoom", &ResetZoom, Some(KEY_CONTEXT))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.reset_zoom(&ResetZoom, window, cx)
+                                }),
+                            ),
+                    )
+                    .child(
+                        Button::new("zoom-in")
+                            .ghost()
+                            .compact()
+                            .label("+")
+                            .tooltip_with_action("Zoom in", &ZoomIn, Some(KEY_CONTEXT))
+                            .disabled(self.zoom_index == ZOOM_LEVELS.len() - 1)
+                            .on_click(cx.listener(|this, _, _, cx| this.zoom_step(true, cx))),
+                    ),
+            );
 
         v_flex()
             .key_context(KEY_CONTEXT)
@@ -1007,6 +1167,9 @@ impl Render for PaintApp {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::delete_selection))
             .on_action(cx.listener(Self::on_deselect))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::reset_zoom))
             .size_full()
             .text_color(theme.foreground)
             .child(toolbar)
@@ -1015,8 +1178,9 @@ impl Render for PaintApp {
     }
 }
 
-/// Paints `stroke` with the canvas top-left at `origin`, in window coordinates.
-fn paint_stroke(window: &mut Window, stroke: &Stroke, origin: Point<Pixels>) {
+/// Paints `stroke` with the canvas top-left at `origin`, in window
+/// coordinates, scaled by `zoom`.
+fn paint_stroke(window: &mut Window, stroke: &Stroke, origin: Point<Pixels>, zoom: f32) {
     let Stroke {
         points,
         color,
@@ -1026,18 +1190,19 @@ fn paint_stroke(window: &mut Window, stroke: &Stroke, origin: Point<Pixels>) {
         return;
     };
     // Round caps turn a single click into a dot; round joins avoid miter spikes on sharp turns
+    let to_window = |p: Point<Pixels>| origin + point(p.x * zoom, p.y * zoom);
     let options = StrokeOptions::default()
-        .with_line_width(width.as_f32())
+        .with_line_width(width.as_f32() * zoom)
         .with_line_cap(LineCap::Round)
         .with_line_join(LineJoin::Round);
     let mut builder = PathBuilder::default().with_style(PathStyle::Stroke(options));
-    builder.move_to(origin + *first);
+    builder.move_to(to_window(*first));
     if points.len() == 1 {
         // Draw a tiny segment so a single click still leaves a visible dot
-        builder.line_to(origin + *first + Point::new(px(0.1), px(0.1)));
+        builder.line_to(to_window(*first + Point::new(px(0.1), px(0.1))));
     } else {
         for p in &points[1..] {
-            builder.line_to(origin + *p);
+            builder.line_to(to_window(*p));
         }
     }
     if let Ok(path) = builder.build() {
@@ -1052,17 +1217,19 @@ fn paint_floating(
     pixels: &Pixmap,
     id: u64,
     at: Point<Pixels>,
+    zoom: f32,
     cache: &mut ViewCache,
 ) {
     let scale = window.scale_factor();
+    let pixels_per_canvas_pixel = scale * zoom;
     let key = ViewKey {
         version: id,
-        scale: scale.to_bits(),
+        pixels_per_canvas_pixel: pixels_per_canvas_pixel.to_bits(),
         origin: point(0, 0),
         size: size(pixels.width(), pixels.height()),
     };
     if cache.key != Some(key) {
-        let (bytes, region) = canvas::render_pixmap(pixels, scale);
+        let (bytes, region) = canvas::render_pixmap(pixels, pixels_per_canvas_pixel);
         let Some(frame) = RgbaImage::from_raw(region.width, region.height, bytes) else {
             return;
         };
@@ -1097,12 +1264,19 @@ fn paint_floating(
         .ok();
 }
 
-/// Paints the visible part of `canvas`, displayed at `bounds` in window coordinates.
+/// Paints the visible part of `canvas`, displayed at `bounds` in window
+/// coordinates and scaled by `zoom`.
 ///
 /// gpui samples images with linear filtering, which would blur pixels when
 /// the canvas is scaled up. So the view is rendered on the CPU at exactly the
 /// device resolution and drawn 1:1.
-fn paint_view(window: &mut Window, canvas: &Canvas, bounds: Bounds<Pixels>, cache: &mut ViewCache) {
+fn paint_view(
+    window: &mut Window,
+    canvas: &Canvas,
+    bounds: Bounds<Pixels>,
+    zoom: f32,
+    cache: &mut ViewCache,
+) {
     let scale = window.scale_factor();
     let visible = bounds.intersect(&window.content_mask().bounds);
     if visible.size.width <= px(0.0) || visible.size.height <= px(0.0) {
@@ -1121,13 +1295,13 @@ fn paint_view(window: &mut Window, canvas: &Canvas, bounds: Bounds<Pixels>, cach
     }
     let key = ViewKey {
         version: canvas.version(),
-        scale: scale.to_bits(),
+        pixels_per_canvas_pixel: (scale * zoom).to_bits(),
         origin: point(left as u32, top as u32),
         size: size((right - left) as u32, (bottom - top) as u32),
     };
 
     if cache.key != Some(key) {
-        let bytes = canvas.render_view(key.origin, key.size, scale);
+        let bytes = canvas.render_view(key.origin, key.size, scale * zoom);
         let Some(frame) = RgbaImage::from_raw(key.size.width, key.size.height, bytes) else {
             return;
         };
@@ -1170,6 +1344,9 @@ fn main() {
             KeyBinding::new(with_modifier!("c"), CopySelection, context),
             KeyBinding::new(with_modifier!("x"), CutSelection, context),
             KeyBinding::new(with_modifier!("v"), Paste, context),
+            KeyBinding::new(with_modifier!("="), ZoomIn, context),
+            KeyBinding::new(with_modifier!("-"), ZoomOut, context),
+            KeyBinding::new(with_modifier!("0"), ResetZoom, context),
             KeyBinding::new("backspace", DeleteSelection, context),
             KeyBinding::new("delete", DeleteSelection, context),
             KeyBinding::new("escape", Deselect, context),
