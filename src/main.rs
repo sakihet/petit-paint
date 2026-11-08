@@ -28,6 +28,8 @@ const DEFAULT_CANVAS_SIZE: Size<Pixels> = Size {
 /// Largest canvas side in pixels. Fill and eyedropper rasterize the canvas at
 /// the screen's scale factor, so a 2x screen needs about 4 * 8192^2 bytes.
 const MAX_CANVAS_SIDE: u32 = 4096;
+/// Side length of the square handles for resizing the canvas.
+const HANDLE_SIZE: Pixels = px(8.0);
 const KEY_CONTEXT: &str = "PaintApp";
 const CANVAS_BACKGROUND: u32 = 0xffffff;
 
@@ -125,6 +127,41 @@ impl Tool {
     }
 }
 
+/// A handle on the canvas edge that resizes it when dragged.
+#[derive(Clone, Copy, PartialEq)]
+enum ResizeHandle {
+    Right,
+    Bottom,
+    Corner,
+}
+
+impl ResizeHandle {
+    /// Whether dragging this handle changes the width and the height.
+    fn axes(self) -> (bool, bool) {
+        match self {
+            ResizeHandle::Right => (true, false),
+            ResizeHandle::Bottom => (false, true),
+            ResizeHandle::Corner => (true, true),
+        }
+    }
+
+    fn cursor(self) -> CursorStyle {
+        match self {
+            ResizeHandle::Right => CursorStyle::ResizeLeftRight,
+            ResizeHandle::Bottom => CursorStyle::ResizeUpDown,
+            ResizeHandle::Corner => CursorStyle::ResizeUpLeftDownRight,
+        }
+    }
+}
+
+/// An in-progress drag of a resize handle.
+struct ResizeDrag {
+    handle: ResizeHandle,
+    /// Mouse position in window coordinates when the drag started.
+    start_position: Point<Pixels>,
+    start_size: Size<Pixels>,
+}
+
 struct PaintApp {
     tool: Tool,
     items: Vec<Item>,
@@ -132,6 +169,7 @@ struct PaintApp {
     redo_stack: Vec<RedoEntry>,
     canvas_size: Size<Pixels>,
     drawing: bool,
+    resize_drag: Option<ResizeDrag>,
     focus_handle: FocusHandle,
     /// Canvas bounds in window coordinates from the last paint, used to map
     /// mouse positions to canvas coordinates.
@@ -180,6 +218,7 @@ impl PaintApp {
             redo_stack: Vec::new(),
             canvas_size: DEFAULT_CANVAS_SIZE,
             drawing: false,
+            resize_drag: None,
             tool: Tool::Pen,
             focus_handle: cx.focus_handle(),
             canvas_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -238,6 +277,24 @@ impl PaintApp {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(drag) = &self.resize_drag {
+            let delta = event.position - drag.start_position;
+            let (resize_width, resize_height) = drag.handle.axes();
+            let resize = |side: Pixels, delta: Pixels, enabled: bool| {
+                if !enabled {
+                    return side;
+                }
+                let side = (side + delta).as_f32().round();
+                px(side.clamp(1.0, MAX_CANVAS_SIDE as f32))
+            };
+            // The canvas follows the drag; history is recorded once on release
+            self.canvas_size = size(
+                resize(drag.start_size.width, delta.x, resize_width),
+                resize(drag.start_size.height, delta.y, resize_height),
+            );
+            cx.notify();
+            return;
+        }
         if !self.drawing {
             return;
         }
@@ -250,7 +307,27 @@ impl PaintApp {
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.drawing = false;
+        if let Some(drag) = self.resize_drag.take() {
+            // Put the start size back so resize_canvas records it for undo
+            let size = std::mem::replace(&mut self.canvas_size, drag.start_size);
+            self.resize_canvas(size, cx);
+        }
         cx.notify();
+    }
+
+    fn start_resize(
+        &mut self,
+        handle: ResizeHandle,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        // Keep the viewport from treating this press as the start of a stroke
+        cx.stop_propagation();
+        self.resize_drag = Some(ResizeDrag {
+            handle,
+            start_position: event.position,
+            start_size: self.canvas_size,
+        });
     }
 
     fn pick_color(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
@@ -304,8 +381,8 @@ impl PaintApp {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        // Undoing mid-drag would pop the stroke being drawn
-        if self.drawing {
+        // Undoing mid-drag would pop the stroke being drawn or fight the resize
+        if self.drawing || self.resize_drag.is_some() {
             return;
         }
         let redo = match self.history.pop() {
@@ -327,7 +404,7 @@ impl PaintApp {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        if self.drawing {
+        if self.drawing || self.resize_drag.is_some() {
             return;
         }
         let entry = match self.redo_stack.pop() {
@@ -563,12 +640,48 @@ impl Render for PaintApp {
 
         let canvas_bounds = self.canvas_bounds.clone();
 
+        let canvas_size = self.canvas_size;
+        let handle = |handle: ResizeHandle, cx: &Context<Self>| {
+            let (on_right, on_bottom) = handle.axes();
+            // Centered on the edge midpoint, or on the corner, just outside the canvas
+            let left = if on_right {
+                canvas_size.width + px(2.0)
+            } else {
+                canvas_size.width / 2.0 - HANDLE_SIZE / 2.0
+            };
+            let top = if on_bottom {
+                canvas_size.height + px(2.0)
+            } else {
+                canvas_size.height / 2.0 - HANDLE_SIZE / 2.0
+            };
+            div()
+                .absolute()
+                .left(left)
+                .top(top)
+                .size(HANDLE_SIZE)
+                .bg(theme.background)
+                .border_1()
+                .border_color(theme.foreground)
+                .cursor(handle.cursor())
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event, _, cx| this.start_resize(handle, event, cx)),
+                )
+        };
+        let handles = [
+            handle(ResizeHandle::Right, cx),
+            handle(ResizeHandle::Bottom, cx),
+            handle(ResizeHandle::Corner, cx),
+        ];
+
         let canvas_area = div()
+            .relative()
             .w(self.canvas_size.width)
             .h(self.canvas_size.height)
             .flex_none()
             .bg(rgb(CANVAS_BACKGROUND))
             .shadow_md()
+            .children(handles)
             .child(
                 canvas(
                     |_, _, _| {},
