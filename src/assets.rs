@@ -30,6 +30,7 @@ icon_assets!(
         FlipVertical2,
         RotateCcw,
         RotateCw,
+        Crop,
         Scaling,
         Trash,
         FilePlus,

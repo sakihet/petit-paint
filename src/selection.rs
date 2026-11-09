@@ -3,7 +3,10 @@ use tiny_skia::Pixmap;
 
 use crate::canvas::{Floating, PixelRect};
 use crate::tool::Tool;
-use crate::{CopySelection, CutSelection, DeleteSelection, Deselect, PaintApp, Paste, SelectAll};
+use crate::{
+    CopySelection, CropToSelection, CutSelection, DeleteSelection, Deselect, PaintApp, Paste,
+    SelectAll,
+};
 
 /// The selected rectangle, in canvas pixels.
 pub struct Selection {
@@ -158,6 +161,33 @@ impl PaintApp {
     pub fn cut_selection(&mut self, _: &CutSelection, window: &mut Window, cx: &mut Context<Self>) {
         self.copy_selection(&CopySelection, window, cx);
         self.delete_selection(&DeleteSelection, window, cx);
+    }
+
+    /// Shrinks the canvas to the selection, including any floating pixels,
+    /// as one undo step.
+    pub fn crop_to_selection(
+        &mut self,
+        _: &CropToSelection,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dragging() {
+            return;
+        }
+        self.commit_selection(cx);
+        // A selection moved past the edge crops to the part still on the canvas
+        let Some(pixels) = self
+            .selection
+            .as_ref()
+            .and_then(|selection| self.canvas.copy(selection.rect))
+        else {
+            return;
+        };
+        self.selection = None;
+        let undo = self.canvas.replace(pixels);
+        self.record(undo, cx);
+        self.canvas_size = self.canvas.size();
+        cx.notify();
     }
 
     pub fn delete_selection(

@@ -26,6 +26,7 @@ impl Render for PaintApp {
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::cut_selection))
+            .on_action(cx.listener(Self::crop_to_selection))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::delete_selection))
             .on_action(cx.listener(Self::on_deselect))

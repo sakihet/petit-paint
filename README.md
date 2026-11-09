@@ -10,7 +10,7 @@ It has only been tested on macOS.
 
 - Tools: select, brush, eraser, eyedropper, fill, shape, text
 - Undo and redo
-- Copy, cut and paste selections
+- Copy, cut, paste and crop to selections
 - Zoom
 - Open PNG, JPEG, BMP, WebP and GIF images, also by dropping them on the window
 - Save as PNG, JPEG, BMP, WebP or GIF, chosen by the file extension
@@ -34,6 +34,7 @@ On Windows and Linux, use `Ctrl` in place of `Cmd`.
 | Select all | `Cmd+A` |
 | Copy / Cut / Paste | `Cmd+C` / `Cmd+X` / `Cmd+V` |
 | Delete selection | `Delete` / `Backspace` |
+| Crop to selection | `Cmd+Shift+X` |
 | Deselect | `Esc` |
 | Finish polygon | `Enter` |
 | Zoom in / out | `Cmd+=` / `Cmd+-` |

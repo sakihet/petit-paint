@@ -9,7 +9,10 @@ use gpui_kit::*;
 use crate::canvas::{BRUSHES, Orientation};
 use crate::text::FONTS;
 use crate::tool::{SHAPES, Tool, brush_icon};
-use crate::{KEY_CONTEXT, NewImage, OpenImage, PaintApp, Redo, Save, Undo, tolerance_percent};
+use crate::{
+    CropToSelection, KEY_CONTEXT, NewImage, OpenImage, PaintApp, Redo, Save, Undo,
+    tolerance_percent,
+};
 
 impl PaintApp {
     /// The current tool's options, which give way to the actions when the
@@ -199,6 +202,18 @@ impl PaintApp {
                         }),
                     )
                     .child(separator())
+                    .child(
+                        icon_button("crop", IconName::Crop)
+                            .tooltip_with_action(
+                                "Crop to the selection",
+                                &CropToSelection,
+                                Some(KEY_CONTEXT),
+                            )
+                            .disabled(self.selection.is_none())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.crop_to_selection(&CropToSelection, window, cx)
+                            })),
+                    )
                     .child(
                         icon_button("canvas-size", IconName::Scaling)
                             .tooltip("Canvas size")
