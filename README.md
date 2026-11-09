@@ -24,6 +24,7 @@ On Windows and Linux, use `Ctrl` in place of `Cmd`.
 | Redo | `Cmd+Shift+Z` (also `Ctrl+Y` on Windows and Linux) |
 | Open | `Cmd+O` |
 | Save | `Cmd+S` |
+| Save as | `Cmd+Shift+S` |
 | Close window | `Cmd+W` |
 | Select all | `Cmd+A` |
 | Copy / Cut / Paste | `Cmd+C` / `Cmd+X` / `Cmd+V` |

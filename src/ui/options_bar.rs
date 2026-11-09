@@ -9,7 +9,7 @@ use gpui_kit::*;
 use crate::canvas::{BRUSHES, Orientation};
 use crate::text::FONTS;
 use crate::tool::{SHAPES, Tool, brush_icon};
-use crate::{KEY_CONTEXT, OpenImage, PaintApp, Redo, SavePng, Undo, tolerance_percent};
+use crate::{KEY_CONTEXT, OpenImage, PaintApp, Redo, Save, Undo, tolerance_percent};
 
 impl PaintApp {
     /// The current tool's options, which give way to the actions when the
@@ -221,10 +221,10 @@ impl PaintApp {
                     )
                     .child(
                         icon_button("save", IconName::Save)
-                            .tooltip_with_action("Save as PNG", &SavePng, Some(KEY_CONTEXT))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.save_png(&SavePng, window, cx)
-                            })),
+                            .tooltip_with_action("Save", &Save, Some(KEY_CONTEXT))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.on_save(&Save, window, cx)),
+                            ),
                     ),
             )
     }

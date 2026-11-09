@@ -3,7 +3,7 @@ use gpui_kit::*;
 use std::path::PathBuf;
 use tiny_skia::Pixmap;
 
-use crate::{CloseWindow, MAX_CANVAS_SIDE, OpenImage, PaintApp, SavePng};
+use crate::{CloseWindow, MAX_CANVAS_SIDE, OpenImage, PaintApp, Save, SaveAs};
 
 impl PaintApp {
     /// Whether the drawing has changes that were not saved. Undoing back to
@@ -155,13 +155,36 @@ impl PaintApp {
         cx.notify();
     }
 
-    pub fn save_png(&mut self, _: &SavePng, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn on_save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
         self.save(window, cx).detach();
     }
 
-    /// Asks where to save and writes the PNG there. The task resolves to
-    /// whether the drawing was saved.
+    pub fn on_save_as(&mut self, _: &SaveAs, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_as(window, cx).detach();
+    }
+
+    /// Writes the PNG to the file last opened or saved, or asks where when
+    /// there is none. The task resolves to whether the drawing was saved.
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
+        match self.document_path.clone() {
+            Some(path) => self.write(Some(path), window, cx),
+            None => self.save_as(window, cx),
+        }
+    }
+
+    /// Asks where to save and writes the PNG there.
+    fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
+        self.write(None, window, cx)
+    }
+
+    /// Writes the PNG to `path`, or to where the user chooses when it is
+    /// `None`. The task resolves to whether the drawing was saved.
+    fn write(
+        &mut self,
+        path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<bool> {
         // Include floating pixels, and encode now so the image reflects the
         // drawing at the time of the request
         self.commit_selection(cx);
@@ -181,38 +204,47 @@ impl PaintApp {
             .as_ref()
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned());
-        let path =
-            cx.prompt_for_new_path(&directory, Some(name.as_deref().unwrap_or("untitled.png")));
+        let prompt = path.is_none().then(|| {
+            cx.prompt_for_new_path(&directory, Some(name.as_deref().unwrap_or("untitled.png")))
+        });
 
         cx.spawn_in(window, async move |this, cx| {
             let result = async {
-                let Some(path) = path.await?? else {
+                let path = match prompt {
+                    Some(prompt) => {
+                        let Some(chosen) = prompt.await?? else {
+                            return Ok(None);
+                        };
+                        let path = with_png_extension(chosen.clone());
+                        // The save dialog only confirmed overwriting the name as typed
+                        if path != chosen && path.exists() {
+                            let message = format!(
+                                "{} already exists. Do you want to replace it?",
+                                path.file_name().unwrap_or_default().to_string_lossy()
+                            );
+                            let answer = this.update_in(cx, |this, window, cx| {
+                                this.confirming = true;
+                                window.prompt(
+                                    PromptLevel::Warning,
+                                    &message,
+                                    None,
+                                    &["Replace", "Cancel"],
+                                    cx,
+                                )
+                            })?;
+                            let answer = answer.await;
+                            this.update(cx, |this, _| this.confirming = false)?;
+                            if answer? != 0 {
+                                return Ok(None);
+                            }
+                        }
+                        Some(path)
+                    }
+                    None => path,
+                };
+                let Some(path) = path else {
                     return Ok(None);
                 };
-                let chosen = path.clone();
-                let path = with_png_extension(path);
-                // The save dialog only confirmed overwriting the name as typed
-                if path != chosen && path.exists() {
-                    let message = format!(
-                        "{} already exists. Do you want to replace it?",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    );
-                    let answer = this.update_in(cx, |this, window, cx| {
-                        this.confirming = true;
-                        window.prompt(
-                            PromptLevel::Warning,
-                            &message,
-                            None,
-                            &["Replace", "Cancel"],
-                            cx,
-                        )
-                    })?;
-                    let answer = answer.await;
-                    this.update(cx, |this, _| this.confirming = false)?;
-                    if answer? != 0 {
-                        return Ok(None);
-                    }
-                }
                 std::fs::write(&path, png?)?;
                 anyhow::Ok(Some(path))
             }

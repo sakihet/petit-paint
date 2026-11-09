@@ -31,7 +31,8 @@ actions!(
         Undo,
         Redo,
         OpenImage,
-        SavePng,
+        Save,
+        SaveAs,
         CloseWindow,
         SelectAll,
         CopySelection,
@@ -171,7 +172,7 @@ struct PaintApp {
     stroke_count: u64,
     /// While erasing, the canvas as it was when the stroke began.
     erase_base: Option<Pixmap>,
-    /// The PNG file last opened or saved, suggested when saving.
+    /// The PNG file last opened or saved, which saving writes to.
     document_path: Option<PathBuf>,
     /// `canvas.version()` when the drawing was last opened or saved.
     saved_version: u64,
@@ -964,7 +965,8 @@ fn main() {
             let mut bindings = vec![
                 KeyBinding::new(with_modifier!("z"), Undo, context),
                 KeyBinding::new(with_modifier!("shift-z"), Redo, context),
-                KeyBinding::new(with_modifier!("s"), SavePng, context),
+                KeyBinding::new(with_modifier!("s"), Save, context),
+                KeyBinding::new(with_modifier!("shift-s"), SaveAs, context),
                 KeyBinding::new(with_modifier!("o"), OpenImage, context),
                 KeyBinding::new(with_modifier!("w"), CloseWindow, context),
                 KeyBinding::new(with_modifier!("a"), SelectAll, context),
