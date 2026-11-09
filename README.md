@@ -12,7 +12,8 @@ It has only been tested on macOS.
 - Undo and redo
 - Copy, cut and paste selections
 - Zoom
-- Open and save PNG images
+- Open PNG, JPEG, BMP, WebP and GIF images, also by dropping them on the window
+- Save PNG images
 
 ## Keyboard shortcuts
 

@@ -1,7 +1,7 @@
 use gpui_kit::component::{WindowExt as _, notification::Notification};
 use gpui_kit::*;
 use std::path::{Path, PathBuf};
-use tiny_skia::Pixmap;
+use tiny_skia::{ColorU8, Pixmap};
 
 use crate::{
     CloseWindow, DEFAULT_CANVAS_SIZE, MAX_CANVAS_SIDE, NewImage, OpenImage, PaintApp, Save, SaveAs,
@@ -114,7 +114,7 @@ impl PaintApp {
         self.confirm_discard(window, cx, |this, window, cx| this.choose_image(window, cx));
     }
 
-    /// Asks for a PNG file and opens it.
+    /// Asks for an image file and opens it.
     fn choose_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -158,7 +158,7 @@ impl PaintApp {
         });
     }
 
-    /// Opens a PNG file as the canvas, at its size and with its transparency.
+    /// Opens an image file as the canvas, at its size and with its transparency.
     /// Replacing the canvas is one undo step, so an accidental open can be undone.
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         match read_image(&path) {
@@ -303,17 +303,32 @@ impl PaintApp {
     }
 }
 
-/// Reads the PNG file at `path`, if it fits on the canvas.
+/// Reads the image file at `path`, if it fits on the canvas.
 fn read_image(path: &Path) -> anyhow::Result<Pixmap> {
     let bytes = std::fs::read(path)?;
-    let pixels = Pixmap::decode_png(&bytes)
-        .map_err(|_| anyhow::anyhow!("{} is not a PNG image", path.display()))?;
+    let pixels = decode_image(&bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "{} is not a PNG, JPEG, BMP, WebP or GIF image",
+            path.display()
+        )
+    })?;
     if pixels.width() > MAX_CANVAS_SIDE || pixels.height() > MAX_CANVAS_SIDE {
         anyhow::bail!(
             "{}×{} is larger than the {MAX_CANVAS_SIDE}×{MAX_CANVAS_SIDE} limit",
             pixels.width(),
             pixels.height()
         );
+    }
+    Ok(pixels)
+}
+
+/// Decodes a PNG, JPEG, BMP, WebP or GIF image, taking a GIF's first frame.
+fn decode_image(bytes: &[u8]) -> anyhow::Result<Pixmap> {
+    let rgba = image::load_from_memory(bytes)?.into_rgba8();
+    let mut pixels = Pixmap::new(rgba.width(), rgba.height())
+        .ok_or_else(|| anyhow::anyhow!("the image is empty"))?;
+    for (pixel, &image::Rgba([r, g, b, a])) in pixels.pixels_mut().iter_mut().zip(rgba.pixels()) {
+        *pixel = ColorU8::from_rgba(r, g, b, a).premultiply();
     }
     Ok(pixels)
 }
@@ -333,8 +348,31 @@ fn with_png_extension(path: PathBuf) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::with_png_extension;
+    use super::{decode_image, with_png_extension};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn decodes_formats_other_than_png() {
+        let mut source = image::RgbaImage::new(2, 1);
+        source.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        source.put_pixel(1, 0, image::Rgba([0, 0, 255, 255]));
+        let mut bmp = std::io::Cursor::new(Vec::new());
+        source.write_to(&mut bmp, image::ImageFormat::Bmp).unwrap();
+
+        let pixels = decode_image(bmp.get_ref()).unwrap();
+        assert_eq!((pixels.width(), pixels.height()), (2, 1));
+        let rgb = |x| {
+            let p = pixels.pixel(x, 0).unwrap();
+            (p.red(), p.green(), p.blue(), p.alpha())
+        };
+        assert_eq!(rgb(0), (255, 0, 0, 255));
+        assert_eq!(rgb(1), (0, 0, 255, 255));
+    }
+
+    #[test]
+    fn rejects_data_that_is_not_an_image() {
+        assert!(decode_image(b"not an image").is_err());
+    }
 
     fn png_path(path: &str) -> PathBuf {
         with_png_extension(Path::new(path).to_path_buf())

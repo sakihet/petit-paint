@@ -221,7 +221,7 @@ impl PaintApp {
                     )
                     .child(
                         icon_button("open", IconName::FolderOpen)
-                            .tooltip_with_action("Open a PNG image", &OpenImage, Some(KEY_CONTEXT))
+                            .tooltip_with_action("Open an image", &OpenImage, Some(KEY_CONTEXT))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_image(&OpenImage, window, cx)
                             })),
