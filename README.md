@@ -37,6 +37,7 @@ On Windows and Linux, use `Ctrl` in place of `Cmd`.
 | Finish polygon | `Enter` |
 | Zoom in / out | `Cmd+=` / `Cmd+-` |
 | Reset zoom | `Cmd+0` |
+| Pan | Drag with `Space` held |
 
 ## Run
 

@@ -197,6 +197,7 @@ impl PaintApp {
             .overflow_scroll()
             .track_scroll(&self.scroll_handle)
             .bg(theme.muted)
+            .when_some(self.pan_cursor(), |this, cursor| this.cursor(cursor))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))

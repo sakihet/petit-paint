@@ -38,6 +38,8 @@ impl Render for PaintApp {
             .on_action(cx.listener(Self::thinner_brush))
             .on_action(cx.listener(Self::thicker_brush))
             .on_drop(cx.listener(Self::open_dropped))
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_up(cx.listener(Self::on_key_up))
             .size_full()
             .text_color(theme.foreground)
             .child(self.options_bar(cx))

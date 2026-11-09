@@ -5,6 +5,7 @@ use gpui_kit::component::{
     slider::{SliderEvent, SliderState, SliderValue},
 };
 use gpui_kit::*;
+use pan::PanDrag;
 use selection::{SelectDrag, Selection};
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -18,6 +19,7 @@ use zoom::DEFAULT_ZOOM_INDEX;
 mod assets;
 mod canvas;
 mod file;
+mod pan;
 mod selection;
 mod text;
 mod tool;
@@ -224,6 +226,9 @@ struct PaintApp {
     zoom_input: f32,
     scroll_handle: ScrollHandle,
     resize_drag: Option<ResizeDrag>,
+    /// Whether Space is held, so dragging pans instead of using the tool.
+    space_held: bool,
+    pan_drag: Option<PanDrag>,
     /// Canvas pixel under the mouse, shown in the status bar.
     cursor_position: Option<Point<i32>>,
     focus_handle: FocusHandle,
@@ -381,6 +386,8 @@ impl PaintApp {
             zoom_input: 0.0,
             scroll_handle: ScrollHandle::new(),
             resize_drag: None,
+            space_held: false,
+            pan_drag: None,
             cursor_position: None,
             tool: Tool::Pen,
             focus_handle: cx.focus_handle(),
@@ -407,6 +414,12 @@ impl PaintApp {
     ) {
         // Take focus back from toolbar inputs so shortcuts reach the canvas
         window.focus(&self.focus_handle, cx);
+        if self.space_held {
+            if event.button == MouseButton::Left {
+                self.start_pan(event.position);
+            }
+            return;
+        }
         self.use_secondary = event.button == MouseButton::Right;
         // The right button only paints; it neither selects nor types
         if self.use_secondary && matches!(self.tool, Tool::Select | Tool::Text) {
@@ -758,6 +771,10 @@ impl PaintApp {
             cx.notify();
         }
 
+        if let Some(drag) = self.pan_drag {
+            self.drag_pan(drag, event.position, cx);
+            return;
+        }
         if let Some(drag) = self.select_drag {
             self.drag_select(drag, event.position, cx);
             return;
@@ -790,6 +807,7 @@ impl PaintApp {
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.select_drag = None;
+        self.pan_drag = None;
         if let Some(drag) = self.shape_drag.take()
             && drag.start != drag.end
             && let Some(undo) = self
@@ -870,6 +888,7 @@ impl PaintApp {
             || self.resize_drag.is_some()
             || self.select_drag.is_some()
             || self.shape_drag.is_some()
+            || self.pan_drag.is_some()
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
