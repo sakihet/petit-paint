@@ -551,7 +551,7 @@ impl Canvas {
             pixels_per_canvas_pixel,
         );
         let checker = |device: u32| (device as f32 / checker_size) as u32 % 2;
-        for (i, pixel) in bytes.chunks_exact_mut(4).enumerate() {
+        for (i, pixel) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let alpha = pixel[3];
             if alpha == 255 {
                 continue;
@@ -608,9 +608,7 @@ impl Canvas {
             }
         };
         let (width, height) = (self.pixmap.width(), self.pixmap.height());
-        let columns: Vec<_> = (origin.x..origin.x + region.width)
-            .map(|x| line(x))
-            .collect();
+        let columns: Vec<_> = (origin.x..origin.x + region.width).map(&line).collect();
         for (row, y) in (origin.y..origin.y + region.height).enumerate() {
             let row_line = line(y);
             // No lines past the canvas, as while a resize drag enlarges it

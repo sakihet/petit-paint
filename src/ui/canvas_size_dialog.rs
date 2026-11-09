@@ -12,6 +12,8 @@ use std::rc::Rc;
 
 use crate::{MAX_CANVAS_SIDE, PaintApp};
 
+type ApplyFn = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
+
 impl PaintApp {
     pub fn open_canvas_size_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let side_input = |side: Pixels, window: &mut Window, cx: &mut Context<Self>| {
@@ -29,7 +31,7 @@ impl PaintApp {
 
         let this = cx.entity().downgrade();
         // Returns whether the dialog should close
-        let apply: Rc<dyn Fn(&mut Window, &mut App) -> bool> = Rc::new({
+        let apply: ApplyFn = Rc::new({
             let width_input = width_input.clone();
             let height_input = height_input.clone();
             move |window, cx| {
