@@ -920,13 +920,13 @@ impl PaintApp {
     }
 }
 
-/// Moves `color` to the front of `recent`, adding it if new and dropping the
-/// oldest past [`MAX_RECENT_COLORS`].
 /// A fill tolerance as a percentage of the full channel range.
 fn tolerance_percent(tolerance: u8) -> f32 {
     (tolerance as f32 / 255.0 * 100.0).round()
 }
 
+/// Moves `color` to the front of `recent`, adding it if new and dropping the
+/// oldest past [`MAX_RECENT_COLORS`].
 fn remember_color(recent: &mut Vec<Hsla>, color: Hsla) {
     recent.retain(|&c| c.to_rgb() != color.to_rgb());
     recent.insert(0, color);
