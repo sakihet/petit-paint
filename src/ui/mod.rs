@@ -34,6 +34,7 @@ impl Render for PaintApp {
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::reset_zoom))
             .on_action(cx.listener(Self::on_select_tool))
+            .on_action(cx.listener(Self::swap_colors))
             .size_full()
             .text_color(theme.foreground)
             .child(self.options_bar(cx))

@@ -45,6 +45,7 @@ actions!(
         ZoomIn,
         ZoomOut,
         ResetZoom,
+        SwapColors,
     ]
 );
 
@@ -481,7 +482,7 @@ impl PaintApp {
         cx.notify();
     }
 
-    fn swap_colors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn swap_colors(&mut self, _: &SwapColors, window: &mut Window, cx: &mut Context<Self>) {
         let (primary, secondary) = (self.color, self.secondary_color);
         self.set_primary(secondary, window, cx);
         self.set_secondary(primary, window, cx);
@@ -993,6 +994,7 @@ fn main() {
                 KeyBinding::new("escape", Deselect, context),
                 KeyBinding::new("enter", FinishPolygon, context),
             ];
+            bindings.push(KeyBinding::new("x", SwapColors, single_key));
             bindings.extend(
                 TOOLS.map(|tool| KeyBinding::new(tool.key(), SelectTool(tool), single_key)),
             );

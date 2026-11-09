@@ -21,6 +21,7 @@ On Windows and Linux, use `Ctrl` in place of `Cmd`.
 | Action | Shortcut |
 | --- | --- |
 | Select / Brush / Eraser / Eyedropper / Fill / Shape / Text | `V` / `B` / `E` / `I` / `G` / `U` / `T` |
+| Swap color 1 and color 2 | `X` |
 | Undo | `Cmd+Z` |
 | Redo | `Cmd+Shift+Z` (also `Ctrl+Y` on Windows and Linux) |
 | New | `Cmd+N` |

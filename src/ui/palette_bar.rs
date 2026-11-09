@@ -2,7 +2,7 @@ use gpui_kit::component::{ActiveTheme as _, button::*, color_picker::ColorPicker
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::PaintApp;
+use crate::{KEY_CONTEXT, PaintApp, SwapColors};
 
 /// Colors in the palette bar, after Windows Paint's default palette.
 const PALETTE: [u32; 20] = [
@@ -49,8 +49,12 @@ impl PaintApp {
                     .ghost()
                     .compact()
                     .label("⇄")
-                    .tooltip("Swap color 1 and color 2")
-                    .on_click(cx.listener(|this, _, window, cx| this.swap_colors(window, cx))),
+                    .tooltip_with_action("Swap color 1 and color 2", &SwapColors, Some(KEY_CONTEXT))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.swap_colors(&SwapColors, window, cx)
+                        }),
+                    ),
             )
             .child(div().w(px(8.0)))
             .children(
