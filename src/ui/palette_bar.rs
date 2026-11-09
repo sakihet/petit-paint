@@ -1,8 +1,7 @@
 use gpui_kit::component::{ActiveTheme as _, button::*, color_picker::ColorPicker, h_flex};
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::{KEY_CONTEXT, PaintApp, SwapColors};
+use crate::{KEY_CONTEXT, MAX_RECENT_COLORS, PaintApp, SwapColors};
 
 /// Colors in the palette bar, after Windows Paint's default palette.
 const PALETTE: [u32; 20] = [
@@ -34,8 +33,11 @@ impl PaintApp {
                     cx.listener(move |this, _, window, cx| this.set_secondary(color, window, cx)),
                 )
         };
+        // One row that keeps its size as colors are used, so the canvas below
+        // stays put; the hint gives way when the window is narrow
         h_flex()
-            .flex_wrap()
+            .flex_none()
+            .overflow_hidden()
             .gap_1()
             .px_3()
             .py_1()
@@ -63,17 +65,27 @@ impl PaintApp {
                     .enumerate()
                     .map(|(ix, &color)| swatch(("palette", ix), rgb(color).into(), cx)),
             )
-            .when(!self.recent_colors.is_empty(), |this| {
-                this.child(div().w(px(8.0))).child("Recent").children(
-                    self.recent_colors
-                        .iter()
-                        .enumerate()
-                        .map(|(ix, &color)| swatch(("recent", ix), color, cx)),
-                )
-            })
+            .child(div().w(px(8.0)))
+            .child(div().flex_none().child("Recent"))
+            .children((0..MAX_RECENT_COLORS).map(|ix| {
+                match self.recent_colors.get(ix) {
+                    Some(&color) => swatch(("recent", ix), color, cx).into_any_element(),
+                    // Empty slots hold the place of colors yet to be used
+                    None => div()
+                        .size(SWATCH_SIZE)
+                        .flex_none()
+                        .rounded_sm()
+                        .border_1()
+                        .border_dashed()
+                        .border_color(theme.border)
+                        .into_any_element(),
+                }
+            }))
             .child(div().w(px(8.0)))
             .child(
                 div()
+                    .min_w_0()
+                    .truncate()
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child("Left click: color 1 · Right click: color 2"),
