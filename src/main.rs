@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use text::{FontChoice, TextRenderer};
 use tiny_skia::Pixmap;
-use tool::{ShapeKind, Tool};
+use tool::{SelectTool, ShapeKind, TOOLS, Tool};
 use view::ViewCache;
 use zoom::DEFAULT_ZOOM_INDEX;
 
@@ -63,6 +63,9 @@ const MAX_HISTORY: usize = 100;
 /// point to close it.
 const POLYGON_CLOSE_DISTANCE: f32 = 8.0;
 const KEY_CONTEXT: &str = "PaintApp";
+/// Where single-key shortcuts apply: anywhere but in a text field, where the
+/// keys type instead.
+const SINGLE_KEY_CONTEXT: &str = "PaintApp && !Input";
 /// How many recently used colors the palette bar keeps.
 const MAX_RECENT_COLORS: usize = 10;
 
@@ -684,6 +687,12 @@ impl PaintApp {
         cx.notify();
     }
 
+    fn on_select_tool(&mut self, action: &SelectTool, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.dragging() {
+            self.set_tool(action.0, cx);
+        }
+    }
+
     /// Records `undo`, the change that reverts an edit just made to the canvas.
     fn record(&mut self, undo: Change, cx: &mut Context<Self>) {
         self.undo_stack.push(undo);
@@ -963,6 +972,7 @@ fn main() {
         .run(|cx| {
             gpui_kit::init(cx);
             let context = Some(KEY_CONTEXT);
+            let single_key = Some(SINGLE_KEY_CONTEXT);
             let mut bindings = vec![
                 KeyBinding::new(with_modifier!("z"), Undo, context),
                 KeyBinding::new(with_modifier!("shift-z"), Redo, context),
@@ -983,6 +993,9 @@ fn main() {
                 KeyBinding::new("escape", Deselect, context),
                 KeyBinding::new("enter", FinishPolygon, context),
             ];
+            bindings.extend(
+                TOOLS.map(|tool| KeyBinding::new(tool.key(), SelectTool(tool), single_key)),
+            );
             // Windows and Linux apps also redo with Ctrl+Y
             if cfg!(not(target_os = "macos")) {
                 bindings.push(KeyBinding::new("ctrl-y", Redo, context));
@@ -1017,8 +1030,25 @@ fn main() {
 #[cfg(test)]
 mod tests {
     // Not a glob: `gpui_kit::*` would bring in gpui's `test` macro in place of Rust's
-    use super::{MAX_RECENT_COLORS, remember_color};
-    use gpui_kit::{Hsla, rgb};
+    use super::{MAX_RECENT_COLORS, SINGLE_KEY_CONTEXT, remember_color};
+    use gpui_kit::{Hsla, KeyBindingContextPredicate, KeyContext, rgb};
+
+    #[test]
+    fn single_key_shortcuts_are_off_while_typing() {
+        let predicate = KeyBindingContextPredicate::parse(SINGLE_KEY_CONTEXT).unwrap();
+        let stack = |names: &[&str]| -> Vec<KeyContext> {
+            names
+                .iter()
+                .map(|n| KeyContext::parse(n).unwrap())
+                .collect()
+        };
+        assert!(predicate.depth_of(&stack(&["Root", "PaintApp"])).is_some());
+        assert!(
+            predicate
+                .depth_of(&stack(&["Root", "PaintApp", "Input"]))
+                .is_none()
+        );
+    }
 
     #[test]
     fn recent_colors_put_the_latest_first_without_repeats() {

@@ -1,8 +1,8 @@
 use gpui_kit::component::{ActiveTheme as _, Selectable as _, button::*, v_flex};
 use gpui_kit::*;
 
-use crate::PaintApp;
-use crate::tool::TOOLS;
+use crate::tool::{SelectTool, TOOLS};
+use crate::{KEY_CONTEXT, PaintApp};
 
 impl PaintApp {
     /// Tools, as a column of icons left of the canvas.
@@ -18,7 +18,7 @@ impl PaintApp {
                 Button::new(tool.label())
                     .ghost()
                     .icon(tool.icon())
-                    .tooltip(tool.label())
+                    .tooltip_with_action(tool.label(), &SelectTool(tool), Some(KEY_CONTEXT))
                     .selected(self.tool == tool)
                     .on_click(cx.listener(move |this, _, _, cx| this.set_tool(tool, cx)))
             }))

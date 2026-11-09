@@ -1,8 +1,9 @@
+use gpui_kit::Action;
 use gpui_kit::assets::IconName;
 
 use crate::canvas::Brush;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Tool {
     /// Selects a rectangle to move, copy, cut or delete.
     Select,
@@ -19,6 +20,11 @@ pub enum Tool {
     /// Types text onto the canvas at the clicked point.
     Text,
 }
+
+/// Switches to a tool, from its single-key shortcut.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = petit_paint, no_json)]
+pub struct SelectTool(pub Tool);
 
 /// Tools in toolbar order.
 pub const TOOLS: [Tool; 7] = [
@@ -41,6 +47,19 @@ impl Tool {
             Tool::Fill => IconName::PaintBucket,
             Tool::Shape => IconName::Shapes,
             Tool::Text => IconName::Type,
+        }
+    }
+
+    /// The key that switches to this tool, as in Photoshop.
+    pub fn key(self) -> &'static str {
+        match self {
+            Tool::Select => "v",
+            Tool::Pen => "b",
+            Tool::Eraser => "e",
+            Tool::Eyedropper => "i",
+            Tool::Fill => "g",
+            Tool::Shape => "u",
+            Tool::Text => "t",
         }
     }
 
