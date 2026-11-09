@@ -46,10 +46,15 @@ actions!(
         ZoomOut,
         ResetZoom,
         SwapColors,
+        ThinnerBrush,
+        ThickerBrush,
     ]
 );
 
 const DEFAULT_WIDTH: f32 = 4.0;
+/// Range of the brush width slider, in pixels.
+const MIN_WIDTH: f32 = 1.0;
+const MAX_WIDTH: f32 = 32.0;
 const DEFAULT_FONT_SIZE: f32 = 24.0;
 const DEFAULT_CANVAS_SIZE: Size<Pixels> = Size {
     width: px(800.0),
@@ -254,8 +259,8 @@ impl PaintApp {
             cx.new(|cx| ColorPickerState::new(window, cx).default_value(secondary_color));
         let width_slider = cx.new(|_| {
             SliderState::new()
-                .min(1.0)
-                .max(32.0)
+                .min(MIN_WIDTH)
+                .max(MAX_WIDTH)
                 .step(1.0)
                 .default_value(DEFAULT_WIDTH)
         });
@@ -486,6 +491,24 @@ impl PaintApp {
         let (primary, secondary) = (self.color, self.secondary_color);
         self.set_primary(secondary, window, cx);
         self.set_secondary(primary, window, cx);
+    }
+
+    fn thinner_brush(&mut self, _: &ThinnerBrush, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_width(-1.0, window, cx);
+    }
+
+    fn thicker_brush(&mut self, _: &ThickerBrush, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_width(1.0, window, cx);
+    }
+
+    /// Changes the brush width by `delta`, within the width slider's range.
+    fn step_width(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let width = (self.width.as_f32() + delta).clamp(MIN_WIDTH, MAX_WIDTH);
+        self.width = px(width);
+        // set_value does not emit a change event, so the width is set above
+        self.width_slider
+            .update(cx, |state, cx| state.set_value(width, window, cx));
+        cx.notify();
     }
 
     fn update_stroke_preview(&mut self, cx: &mut Context<Self>) {
@@ -994,7 +1017,11 @@ fn main() {
                 KeyBinding::new("escape", Deselect, context),
                 KeyBinding::new("enter", FinishPolygon, context),
             ];
-            bindings.push(KeyBinding::new("x", SwapColors, single_key));
+            bindings.extend([
+                KeyBinding::new("x", SwapColors, single_key),
+                KeyBinding::new("[", ThinnerBrush, single_key),
+                KeyBinding::new("]", ThickerBrush, single_key),
+            ]);
             bindings.extend(
                 TOOLS.map(|tool| KeyBinding::new(tool.key(), SelectTool(tool), single_key)),
             );
