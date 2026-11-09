@@ -3,8 +3,23 @@ use gpui_kit::*;
 use crate::{PaintApp, ResetZoom, ZoomIn, ZoomOut};
 
 /// Zoom levels, as displayed pixels per canvas pixel.
-pub const ZOOM_LEVELS: [f32; 8] = [0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0];
-pub const DEFAULT_ZOOM_INDEX: usize = 2;
+pub const ZOOM_LEVELS: [f32; 14] = [
+    0.25,
+    1.0 / 3.0,
+    0.5,
+    2.0 / 3.0,
+    0.75,
+    1.0,
+    1.25,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    5.0,
+    6.0,
+    8.0,
+];
+pub const DEFAULT_ZOOM_INDEX: usize = 5;
 /// Scroll distance with Cmd/Ctrl held, or pinch amount, per zoom step.
 const SCROLL_PER_ZOOM_STEP: f32 = 50.0;
 const PINCH_PER_ZOOM_STEP: f32 = 0.15;
