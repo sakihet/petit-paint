@@ -1,4 +1,4 @@
-use canvas::{Brush, Canvas, Change, Grid, Orientation, StrokeLayer};
+use canvas::{Brush, Canvas, Change, DEFAULT_FILL_TOLERANCE, Grid, Orientation, StrokeLayer};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::{
     color_picker::{ColorPickerEvent, ColorPickerState},
@@ -231,6 +231,11 @@ struct PaintApp {
     color_picker: Entity<ColorPickerState>,
     secondary_picker: Entity<ColorPickerState>,
     width_slider: Entity<SliderState>,
+    /// How far each RGBA channel may differ from the clicked pixel for the
+    /// fill tool to reach it.
+    fill_tolerance: u8,
+    /// Sets the fill tolerance in percent.
+    fill_tolerance_slider: Entity<SliderState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -255,6 +260,14 @@ impl PaintApp {
                 .max(144.0)
                 .step(1.0)
                 .default_value(DEFAULT_FONT_SIZE)
+        });
+
+        let fill_tolerance_slider = cx.new(|_| {
+            SliderState::new()
+                .min(0.0)
+                .max(100.0)
+                .step(1.0)
+                .default_value(tolerance_percent(DEFAULT_FILL_TOLERANCE))
         });
 
         // Ask before closing the window over unsaved changes
@@ -296,6 +309,15 @@ impl PaintApp {
                     return;
                 };
                 this.width = px(*width);
+                cx.notify();
+            }),
+            cx.subscribe_in(&fill_tolerance_slider, window, |this, _, event, _, cx| {
+                let (SliderEvent::Change(SliderValue::Single(percent))
+                | SliderEvent::Release(SliderValue::Single(percent))) = event
+                else {
+                    return;
+                };
+                this.fill_tolerance = (percent / 100.0 * 255.0).round() as u8;
                 cx.notify();
             }),
         ];
@@ -360,6 +382,8 @@ impl PaintApp {
             use_secondary: false,
             recent_colors: Vec::new(),
             width_slider,
+            fill_tolerance: DEFAULT_FILL_TOLERANCE,
+            fill_tolerance_slider,
             _subscriptions,
         }
     }
@@ -790,7 +814,7 @@ impl PaintApp {
 
     fn fill_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let color = self.active_color();
-        if let Some(undo) = self.canvas.flood_fill(position, color) {
+        if let Some(undo) = self.canvas.flood_fill(position, color, self.fill_tolerance) {
             self.record(undo, cx);
             self.remember_color(color);
         }
@@ -898,6 +922,11 @@ impl PaintApp {
 
 /// Moves `color` to the front of `recent`, adding it if new and dropping the
 /// oldest past [`MAX_RECENT_COLORS`].
+/// A fill tolerance as a percentage of the full channel range.
+fn tolerance_percent(tolerance: u8) -> f32 {
+    (tolerance as f32 / 255.0 * 100.0).round()
+}
+
 fn remember_color(recent: &mut Vec<Hsla>, color: Hsla) {
     recent.retain(|&c| c.to_rgb() != color.to_rgb());
     recent.insert(0, color);

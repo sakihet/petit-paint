@@ -28,8 +28,9 @@ const CHECKER_LIGHT: u8 = 0xff;
 const CHECKER_DARK: u8 = 0xdd;
 
 /// How far each RGBA channel may differ from the clicked pixel and still be
-/// filled. Lets the fill reach into the light half of anti-aliased edges.
-const FILL_TOLERANCE: u8 = 64;
+/// filled, by default. Lets the fill reach into the light half of
+/// anti-aliased edges.
+pub const DEFAULT_FILL_TOLERANCE: u8 = 64;
 
 /// The drawing as a single image, one pixel per canvas pixel.
 pub struct Canvas {
@@ -259,7 +260,12 @@ impl Canvas {
     ///
     /// Returns `None` when `position` is outside the canvas or the region
     /// already has `color`, since filling it would change nothing.
-    pub fn flood_fill(&mut self, position: Point<Pixels>, color: Hsla) -> Option<Change> {
+    pub fn flood_fill(
+        &mut self,
+        position: Point<Pixels>,
+        color: Hsla,
+        tolerance: u8,
+    ) -> Option<Change> {
         let (seed_x, seed_y) = self.pixel_at(position)?;
         let (width, height) = (self.pixmap.width() as usize, self.pixmap.height() as usize);
         let target = self.pixmap.pixels()[seed_y * width + seed_x].demultiply();
@@ -268,10 +274,10 @@ impl Canvas {
             return None;
         }
         let matches = |c: ColorU8| {
-            c.red().abs_diff(target.red()) <= FILL_TOLERANCE
-                && c.green().abs_diff(target.green()) <= FILL_TOLERANCE
-                && c.blue().abs_diff(target.blue()) <= FILL_TOLERANCE
-                && c.alpha().abs_diff(target.alpha()) <= FILL_TOLERANCE
+            c.red().abs_diff(target.red()) <= tolerance
+                && c.green().abs_diff(target.green()) <= tolerance
+                && c.blue().abs_diff(target.blue()) <= tolerance
+                && c.alpha().abs_diff(target.alpha()) <= tolerance
         };
 
         // Scanline fill: each popped seed grows into a horizontal run, then seeds
@@ -1109,7 +1115,11 @@ mod tests {
         let mut canvas = canvas(100, 100);
         canvas.draw_stroke(&square_outline());
         let undo = canvas
-            .flood_fill(point(px(50.0), px(50.0)), rgb(0xff0000).into())
+            .flood_fill(
+                point(px(50.0), px(50.0)),
+                rgb(0xff0000).into(),
+                DEFAULT_FILL_TOLERANCE,
+            )
             .unwrap();
 
         assert_eq!(rgb_at(&canvas, 50, 50), (255, 0, 0));
@@ -1124,8 +1134,41 @@ mod tests {
     #[test]
     fn flood_fill_with_the_same_color_does_nothing() {
         let mut canvas = canvas(10, 10);
-        let result = canvas.flood_fill(point(px(5.0), px(5.0)), rgb(WHITE).into());
+        let result = canvas.flood_fill(
+            point(px(5.0), px(5.0)),
+            rgb(WHITE).into(),
+            DEFAULT_FILL_TOLERANCE,
+        );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn flood_fill_tolerance_decides_whether_similar_colors_are_filled() {
+        // White on the left, light gray on the right, 0x20 apart per channel
+        let two_tone = || {
+            let mut canvas = canvas(10, 10);
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(0xdf, 0xdf, 0xdf, 0xff);
+            canvas.pixmap.fill_rect(
+                tiny_skia::Rect::from_xywh(5.0, 0.0, 5.0, 10.0).unwrap(),
+                &paint,
+                Transform::identity(),
+                None,
+            );
+            canvas
+        };
+        let fill = |canvas: &mut Canvas, tolerance| {
+            canvas.flood_fill(point(px(1.0), px(1.0)), rgb(0xff0000).into(), tolerance)
+        };
+
+        let mut exact = two_tone();
+        fill(&mut exact, 0).unwrap();
+        assert_eq!(rgb_at(&exact, 1, 1), (255, 0, 0));
+        assert_eq!(rgb_at(&exact, 8, 1), (0xdf, 0xdf, 0xdf));
+
+        let mut loose = two_tone();
+        fill(&mut loose, 0x20).unwrap();
+        assert_eq!(rgb_at(&loose, 8, 1), (255, 0, 0));
     }
 
     #[test]

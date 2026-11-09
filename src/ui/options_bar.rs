@@ -9,7 +9,7 @@ use gpui_kit::*;
 use crate::canvas::{BRUSHES, Orientation};
 use crate::text::FONTS;
 use crate::tool::{SHAPES, Tool, brush_icon};
-use crate::{KEY_CONTEXT, OpenImage, PaintApp, Redo, SavePng, Undo};
+use crate::{KEY_CONTEXT, OpenImage, PaintApp, Redo, SavePng, Undo, tolerance_percent};
 
 impl PaintApp {
     /// The current tool's options, which give way to the actions when the
@@ -95,6 +95,23 @@ impl PaintApp {
                                 .child(Slider::new(&self.font_size_slider)),
                         )
                         .child(div().w(px(28.0)).child(format!("{}", self.font_size))),
+                )
+            })
+            .when(self.tool == Tool::Fill, |this| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .child("Tolerance")
+                        .child(
+                            div()
+                                .w(px(120.0))
+                                .child(Slider::new(&self.fill_tolerance_slider)),
+                        )
+                        .child(
+                            div()
+                                .w(px(36.0))
+                                .child(format!("{}%", tolerance_percent(self.fill_tolerance))),
+                        ),
                 )
             })
             .when(uses_width, |this| {
