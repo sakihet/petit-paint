@@ -1,4 +1,4 @@
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Result, anyhow};
 use gpui_kit::{Hsla, Pixels, Point, Rgba, Size, px, size};
 use tiny_skia::{
     Color, ColorU8, FillRule, IntRect, LineCap, LineJoin, Paint, PathBuilder, Pixmap, PixmapPaint,
@@ -403,10 +403,6 @@ impl Canvas {
             }
             Change::Replace(pixmap) => Change::Replace(std::mem::replace(&mut self.pixmap, pixmap)),
         }
-    }
-
-    pub fn encode_png(&self) -> Result<Vec<u8>> {
-        self.pixmap.encode_png().context("failed to encode PNG")
     }
 
     /// Returns a copy of the pixels in `rect`, clipped to the canvas.
@@ -1444,7 +1440,7 @@ mod tests {
     fn transparent_canvas_exports_transparent_png() {
         let mut canvas = transparent_canvas(20, 20);
         canvas.draw_stroke(&stroke(&[(0.0, 10.0), (20.0, 10.0)], 0xff0000, 4.0));
-        let png = Pixmap::decode_png(&canvas.encode_png().unwrap()).unwrap();
+        let png = Pixmap::decode_png(&canvas.pixels().encode_png().unwrap()).unwrap();
         assert_eq!(png.pixel(10, 2).unwrap().alpha(), 0);
         assert_eq!(png.pixel(10, 10).unwrap().alpha(), 255);
     }
@@ -1494,7 +1490,7 @@ mod tests {
     fn opening_a_png_replaces_the_canvas_and_can_be_undone() {
         let mut source = transparent_canvas(30, 10);
         source.draw_stroke(&stroke(&[(0.0, 5.0), (30.0, 5.0)], 0x00ff00, 4.0));
-        let opened = Pixmap::decode_png(&source.encode_png().unwrap()).unwrap();
+        let opened = Pixmap::decode_png(&source.pixels().encode_png().unwrap()).unwrap();
 
         let mut canvas = canvas(80, 60);
         let undo = canvas.replace(opened);
@@ -1632,7 +1628,7 @@ mod tests {
     #[test]
     fn png_is_exactly_the_canvas_size() {
         let canvas = canvas(80, 60);
-        let pixmap = Pixmap::decode_png(&canvas.encode_png().unwrap()).unwrap();
+        let pixmap = Pixmap::decode_png(&canvas.pixels().encode_png().unwrap()).unwrap();
         assert_eq!((pixmap.width(), pixmap.height()), (80, 60));
     }
 

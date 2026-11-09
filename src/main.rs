@@ -184,7 +184,7 @@ struct PaintApp {
     stroke_count: u64,
     /// While erasing, the canvas as it was when the stroke began.
     erase_base: Option<Pixmap>,
-    /// The PNG file last opened or saved, which saving writes to.
+    /// The image file last opened or saved, which saving writes to.
     document_path: Option<PathBuf>,
     /// `canvas.version()` when the drawing was last opened or saved.
     saved_version: u64,

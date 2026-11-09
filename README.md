@@ -13,7 +13,7 @@ It has only been tested on macOS.
 - Copy, cut and paste selections
 - Zoom
 - Open PNG, JPEG, BMP, WebP and GIF images, also by dropping them on the window
-- Save PNG images
+- Save as PNG, JPEG, BMP, WebP or GIF, chosen by the file extension
 
 ## Keyboard shortcuts
 

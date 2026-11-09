@@ -1,5 +1,6 @@
 use gpui_kit::component::{WindowExt as _, notification::Notification};
 use gpui_kit::*;
+use image::ImageFormat;
 use std::path::{Path, PathBuf};
 use tiny_skia::{ColorU8, Pixmap};
 
@@ -192,33 +193,35 @@ impl PaintApp {
         self.save_as(window, cx).detach();
     }
 
-    /// Writes the PNG to the file last opened or saved, or asks where when
-    /// there is none. The task resolves to whether the drawing was saved.
+    /// Writes to the file last opened or saved, or asks where when there is
+    /// none or its format cannot be saved. The task resolves to whether the
+    /// drawing was saved.
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
         match self.document_path.clone() {
-            Some(path) => self.write(Some(path), window, cx),
-            None => self.save_as(window, cx),
+            Some(path) if save_format(&path).is_some() => self.write(Some(path), window, cx),
+            _ => self.save_as(window, cx),
         }
     }
 
-    /// Asks where to save and writes the PNG there.
+    /// Asks where to save and writes the image there.
     fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
         self.write(None, window, cx)
     }
 
-    /// Writes the PNG to `path`, or to where the user chooses when it is
-    /// `None`. The task resolves to whether the drawing was saved.
+    /// Writes the image to `path`, or to where the user chooses when it is
+    /// `None`, in the format its extension names. The task resolves to
+    /// whether the drawing was saved.
     fn write(
         &mut self,
         path: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<bool> {
-        // Include floating pixels, and encode now so the image reflects the
-        // drawing at the time of the request
+        // Include floating pixels, and copy them now so the image reflects
+        // the drawing at the time of the request
         self.commit_selection(cx);
         self.commit_text(cx);
-        let png = self.canvas.encode_png();
+        let pixels = self.canvas.pixels().clone();
         let version = self.canvas.version();
         // Suggest the file last opened or saved, so saving again overwrites it
         let directory = self
@@ -244,7 +247,7 @@ impl PaintApp {
                         let Some(chosen) = prompt.await?? else {
                             return Ok(None);
                         };
-                        let path = with_png_extension(chosen.clone());
+                        let path = with_image_extension(chosen.clone());
                         // The save dialog only confirmed overwriting the name as typed
                         if path != chosen && path.exists() {
                             let message = format!(
@@ -274,7 +277,8 @@ impl PaintApp {
                 let Some(path) = path else {
                     return Ok(None);
                 };
-                std::fs::write(&path, png?)?;
+                let format = save_format(&path).unwrap_or(ImageFormat::Png);
+                std::fs::write(&path, encode_image(&pixels, format)?)?;
                 anyhow::Ok(Some(path))
             }
             .await;
@@ -292,7 +296,7 @@ impl PaintApp {
                 }
                 Ok(None) => return false,
                 Err(err) => (
-                    Notification::error(format!("Failed to save PNG: {err:#}")),
+                    Notification::error(format!("Failed to save: {err:#}")),
                     false,
                 ),
             };
@@ -333,12 +337,56 @@ fn decode_image(bytes: &[u8]) -> anyhow::Result<Pixmap> {
     Ok(pixels)
 }
 
-/// Appends `.png` unless the path already ends with it, ignoring case.
-fn with_png_extension(path: PathBuf) -> PathBuf {
-    let is_png = path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
-    if is_png {
+/// File extensions that saving writes, with the format of each.
+const SAVE_FORMATS: [(&str, ImageFormat); 6] = [
+    ("png", ImageFormat::Png),
+    ("jpg", ImageFormat::Jpeg),
+    ("jpeg", ImageFormat::Jpeg),
+    ("bmp", ImageFormat::Bmp),
+    ("webp", ImageFormat::WebP),
+    ("gif", ImageFormat::Gif),
+];
+
+/// The format to save `path` in, from its extension, ignoring case.
+fn save_format(path: &Path) -> Option<ImageFormat> {
+    let extension = path.extension()?.to_str()?;
+    SAVE_FORMATS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(extension))
+        .map(|&(_, format)| format)
+}
+
+/// Encodes `pixels` as `format`. JPEG, BMP and GIF are saved without
+/// transparency, with transparent areas turned white.
+fn encode_image(pixels: &Pixmap, format: ImageFormat) -> anyhow::Result<Vec<u8>> {
+    if format == ImageFormat::Png {
+        return Ok(pixels.encode_png()?);
+    }
+    let (width, height) = (pixels.width(), pixels.height());
+    let pixel = |x: u32, y: u32| pixels.pixels()[(y * width + x) as usize];
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    if format == ImageFormat::WebP {
+        let rgba = image::RgbaImage::from_fn(width, height, |x, y| {
+            let c = pixel(x, y).demultiply();
+            image::Rgba([c.red(), c.green(), c.blue(), c.alpha()])
+        });
+        rgba.write_to(&mut bytes, format)?;
+    } else {
+        // Premultiplied, so adding the uncovered part of white blends over it
+        let rgb = image::RgbImage::from_fn(width, height, |x, y| {
+            let c = pixel(x, y);
+            let white = 255 - c.alpha();
+            image::Rgb([c.red() + white, c.green() + white, c.blue() + white])
+        });
+        rgb.write_to(&mut bytes, format)?;
+    }
+    Ok(bytes.into_inner())
+}
+
+/// Appends `.png` unless the path already ends with an extension that
+/// saving writes, ignoring case.
+fn with_image_extension(path: PathBuf) -> PathBuf {
+    if save_format(&path).is_some() {
         return path;
     }
     let mut name = path.file_name().unwrap_or_default().to_os_string();
@@ -348,8 +396,10 @@ fn with_png_extension(path: PathBuf) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_image, with_png_extension};
+    use super::{decode_image, encode_image, with_image_extension};
+    use image::ImageFormat;
     use std::path::{Path, PathBuf};
+    use tiny_skia::{ColorU8, Pixmap};
 
     #[test]
     fn decodes_formats_other_than_png() {
@@ -374,8 +424,51 @@ mod tests {
         assert!(decode_image(b"not an image").is_err());
     }
 
+    #[test]
+    fn saves_each_format_and_turns_transparency_white_without_alpha() {
+        // Blue on the left, transparent on the right, wide enough that JPEG's
+        // blurring of color does not reach the far right
+        let mut pixels = Pixmap::new(32, 8).unwrap();
+        for (i, pixel) in pixels.pixels_mut().iter_mut().enumerate() {
+            if i % 32 < 8 {
+                *pixel = ColorU8::from_rgba(0, 0, 255, 255).premultiply();
+            }
+        }
+        for format in [
+            ImageFormat::Png,
+            ImageFormat::Jpeg,
+            ImageFormat::Bmp,
+            ImageFormat::WebP,
+            ImageFormat::Gif,
+        ] {
+            let bytes = encode_image(&pixels, format).unwrap();
+            assert_eq!(image::guess_format(&bytes).unwrap(), format);
+            let saved = decode_image(&bytes).unwrap();
+            let transparent = saved.pixel(31, 4).unwrap().demultiply();
+            let expected = match format {
+                ImageFormat::Png | ImageFormat::WebP => (0, 0, 0, 0),
+                _ => (255, 255, 255, 255),
+            };
+            // JPEG is lossy, so allow a little difference
+            let close = |a: u8, b: u8| a.abs_diff(b) <= 8;
+            let actual = (
+                transparent.red(),
+                transparent.green(),
+                transparent.blue(),
+                transparent.alpha(),
+            );
+            assert!(
+                close(actual.0, expected.0)
+                    && close(actual.1, expected.1)
+                    && close(actual.2, expected.2)
+                    && close(actual.3, expected.3),
+                "{format:?}: {actual:?}"
+            );
+        }
+    }
+
     fn png_path(path: &str) -> PathBuf {
-        with_png_extension(Path::new(path).to_path_buf())
+        with_image_extension(Path::new(path).to_path_buf())
     }
 
     #[test]
@@ -391,5 +484,12 @@ mod tests {
     fn keeps_existing_png_extension() {
         assert_eq!(png_path("/tmp/drawing.png"), Path::new("/tmp/drawing.png"));
         assert_eq!(png_path("/tmp/drawing.PNG"), Path::new("/tmp/drawing.PNG"));
+    }
+
+    #[test]
+    fn keeps_other_saved_extensions() {
+        assert_eq!(png_path("/tmp/photo.jpg"), Path::new("/tmp/photo.jpg"));
+        assert_eq!(png_path("/tmp/photo.JPEG"), Path::new("/tmp/photo.JPEG"));
+        assert_eq!(png_path("/tmp/icon.webp"), Path::new("/tmp/icon.webp"));
     }
 }
