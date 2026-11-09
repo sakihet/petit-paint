@@ -189,6 +189,30 @@ impl PaintApp {
                 let Some(path) = path.await?? else {
                     return Ok(None);
                 };
+                let chosen = path.clone();
+                let path = with_png_extension(path);
+                // The save dialog only confirmed overwriting the name as typed
+                if path != chosen && path.exists() {
+                    let message = format!(
+                        "{} already exists. Do you want to replace it?",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                    let answer = this.update_in(cx, |this, window, cx| {
+                        this.confirming = true;
+                        window.prompt(
+                            PromptLevel::Warning,
+                            &message,
+                            None,
+                            &["Replace", "Cancel"],
+                            cx,
+                        )
+                    })?;
+                    let answer = answer.await;
+                    this.update(cx, |this, _| this.confirming = false)?;
+                    if answer? != 0 {
+                        return Ok(None);
+                    }
+                }
                 std::fs::write(&path, png?)?;
                 anyhow::Ok(Some(path))
             }
@@ -215,5 +239,43 @@ impl PaintApp {
                 .ok();
             saved
         })
+    }
+}
+
+/// Appends `.png` unless the path already ends with it, ignoring case.
+fn with_png_extension(path: PathBuf) -> PathBuf {
+    let is_png = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
+    if is_png {
+        return path;
+    }
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".png");
+    path.with_file_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_png_extension;
+    use std::path::{Path, PathBuf};
+
+    fn png_path(path: &str) -> PathBuf {
+        with_png_extension(Path::new(path).to_path_buf())
+    }
+
+    #[test]
+    fn appends_png_extension_when_missing() {
+        assert_eq!(png_path("/tmp/drawing"), Path::new("/tmp/drawing.png"));
+        assert_eq!(
+            png_path("/tmp/my.drawing"),
+            Path::new("/tmp/my.drawing.png")
+        );
+    }
+
+    #[test]
+    fn keeps_existing_png_extension() {
+        assert_eq!(png_path("/tmp/drawing.png"), Path::new("/tmp/drawing.png"));
+        assert_eq!(png_path("/tmp/drawing.PNG"), Path::new("/tmp/drawing.PNG"));
     }
 }
