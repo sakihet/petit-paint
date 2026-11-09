@@ -4,6 +4,8 @@ A small paint app written in Rust with [GPUI](https://www.gpui.rs/).
 
 It has only been tested on macOS.
 
+![Screenshot](docs/screenshot.png)
+
 ## Features
 
 - Tools: select, brush, eraser, eyedropper, fill, shape, text
