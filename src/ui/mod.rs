@@ -37,6 +37,7 @@ impl Render for PaintApp {
             .on_action(cx.listener(Self::swap_colors))
             .on_action(cx.listener(Self::thinner_brush))
             .on_action(cx.listener(Self::thicker_brush))
+            .on_drop(cx.listener(Self::open_dropped))
             .size_full()
             .text_color(theme.foreground)
             .child(self.options_bar(cx))

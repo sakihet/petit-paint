@@ -1,6 +1,6 @@
 use gpui_kit::component::{WindowExt as _, notification::Notification};
 use gpui_kit::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tiny_skia::Pixmap;
 
 use crate::{
@@ -114,8 +114,7 @@ impl PaintApp {
         self.confirm_discard(window, cx, |this, window, cx| this.choose_image(window, cx));
     }
 
-    /// Opens a PNG file as the canvas, at its size and with its transparency.
-    /// Replacing the canvas is one undo step, so an accidental open can be undone.
+    /// Asks for a PNG file and opens it.
     fn choose_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -124,38 +123,51 @@ impl PaintApp {
             prompt: Some("Open".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
-            let result = async {
-                let Some(path) = paths.await??.and_then(|paths| paths.into_iter().next()) else {
-                    return Ok(None);
-                };
-                let bytes = std::fs::read(&path)?;
-                let pixels = Pixmap::decode_png(&bytes)
-                    .map_err(|_| anyhow::anyhow!("{} is not a PNG image", path.display()))?;
-                if pixels.width() > MAX_CANVAS_SIDE || pixels.height() > MAX_CANVAS_SIDE {
-                    anyhow::bail!(
-                        "{}×{} is larger than the {MAX_CANVAS_SIDE}×{MAX_CANVAS_SIDE} limit",
-                        pixels.width(),
-                        pixels.height()
-                    );
+            match paths.await {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        this.update_in(cx, |this, window, cx| this.open_path(path, window, cx))
+                            .ok();
+                    }
                 }
-                anyhow::Ok(Some((path, pixels)))
-            }
-            .await;
-
-            match result {
-                Ok(Some((path, pixels))) => {
-                    this.update(cx, |this, cx| this.load_image(Some(path), pixels, cx))
-                        .ok();
-                }
-                Ok(None) => {}
-                Err(err) => {
+                Ok(Ok(None)) => {}
+                Ok(Err(err)) => {
                     let notification = Notification::error(format!("Failed to open: {err:#}"));
                     cx.update(|window, cx| window.push_notification(notification, cx))
                         .ok();
                 }
+                // The dialog went away with the window
+                Err(_) => {}
             }
         })
         .detach();
+    }
+
+    /// Opens the first of the files dropped on the window.
+    pub fn open_dropped(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = paths.paths().first().cloned() else {
+            return;
+        };
+        self.confirm_discard(window, cx, move |this, window, cx| {
+            this.open_path(path, window, cx)
+        });
+    }
+
+    /// Opens a PNG file as the canvas, at its size and with its transparency.
+    /// Replacing the canvas is one undo step, so an accidental open can be undone.
+    fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        match read_image(&path) {
+            Ok(pixels) => self.load_image(Some(path), pixels, cx),
+            Err(err) => {
+                let notification = Notification::error(format!("Failed to open: {err:#}"));
+                window.push_notification(notification, cx);
+            }
+        }
     }
 
     /// Swaps in `pixels` as the drawing, from the file at `path` or new when
@@ -289,6 +301,21 @@ impl PaintApp {
             saved
         })
     }
+}
+
+/// Reads the PNG file at `path`, if it fits on the canvas.
+fn read_image(path: &Path) -> anyhow::Result<Pixmap> {
+    let bytes = std::fs::read(path)?;
+    let pixels = Pixmap::decode_png(&bytes)
+        .map_err(|_| anyhow::anyhow!("{} is not a PNG image", path.display()))?;
+    if pixels.width() > MAX_CANVAS_SIDE || pixels.height() > MAX_CANVAS_SIDE {
+        anyhow::bail!(
+            "{}×{} is larger than the {MAX_CANVAS_SIDE}×{MAX_CANVAS_SIDE} limit",
+            pixels.width(),
+            pixels.height()
+        );
+    }
+    Ok(pixels)
 }
 
 /// Appends `.png` unless the path already ends with it, ignoring case.
