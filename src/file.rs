@@ -3,7 +3,9 @@ use gpui_kit::*;
 use std::path::PathBuf;
 use tiny_skia::Pixmap;
 
-use crate::{CloseWindow, MAX_CANVAS_SIDE, OpenImage, PaintApp, Save, SaveAs};
+use crate::{
+    CloseWindow, DEFAULT_CANVAS_SIZE, MAX_CANVAS_SIDE, NewImage, OpenImage, PaintApp, Save, SaveAs,
+};
 
 impl PaintApp {
     /// Whether the drawing has changes that were not saved. Undoing back to
@@ -95,6 +97,19 @@ impl PaintApp {
         }
     }
 
+    /// Starts over with a blank, transparent canvas at the default size, as
+    /// the app opens with. Like opening, this is one undo step.
+    pub fn new_image(&mut self, _: &NewImage, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_discard(window, cx, |this, _, cx| {
+            let pixels = Pixmap::new(
+                DEFAULT_CANVAS_SIZE.width.as_f32() as u32,
+                DEFAULT_CANVAS_SIZE.height.as_f32() as u32,
+            )
+            .expect("default canvas size is valid");
+            this.load_image(None, pixels, cx);
+        });
+    }
+
     pub fn open_image(&mut self, _: &OpenImage, window: &mut Window, cx: &mut Context<Self>) {
         self.confirm_discard(window, cx, |this, window, cx| this.choose_image(window, cx));
     }
@@ -129,7 +144,7 @@ impl PaintApp {
 
             match result {
                 Ok(Some((path, pixels))) => {
-                    this.update(cx, |this, cx| this.load_image(path, pixels, cx))
+                    this.update(cx, |this, cx| this.load_image(Some(path), pixels, cx))
                         .ok();
                 }
                 Ok(None) => {}
@@ -143,14 +158,16 @@ impl PaintApp {
         .detach();
     }
 
-    fn load_image(&mut self, path: PathBuf, pixels: Pixmap, cx: &mut Context<Self>) {
+    /// Swaps in `pixels` as the drawing, from the file at `path` or new when
+    /// there is none.
+    fn load_image(&mut self, path: Option<PathBuf>, pixels: Pixmap, cx: &mut Context<Self>) {
         self.deselect(cx);
         self.cancel_polygon(cx);
         self.text_edit = None;
         let undo = self.canvas.replace(pixels);
         self.record(undo, cx);
         self.canvas_size = self.canvas.size();
-        self.document_path = Some(path);
+        self.document_path = path;
         self.saved_version = self.canvas.version();
         cx.notify();
     }

@@ -32,6 +32,7 @@ icon_assets!(
         RotateCw,
         Scaling,
         Trash,
+        FilePlus,
         FolderOpen,
         Save,
     ]

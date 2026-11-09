@@ -30,6 +30,7 @@ actions!(
     [
         Undo,
         Redo,
+        NewImage,
         OpenImage,
         Save,
         SaveAs,
@@ -967,6 +968,7 @@ fn main() {
                 KeyBinding::new(with_modifier!("shift-z"), Redo, context),
                 KeyBinding::new(with_modifier!("s"), Save, context),
                 KeyBinding::new(with_modifier!("shift-s"), SaveAs, context),
+                KeyBinding::new(with_modifier!("n"), NewImage, context),
                 KeyBinding::new(with_modifier!("o"), OpenImage, context),
                 KeyBinding::new(with_modifier!("w"), CloseWindow, context),
                 KeyBinding::new(with_modifier!("a"), SelectAll, context),

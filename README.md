@@ -22,6 +22,7 @@ On Windows and Linux, use `Ctrl` in place of `Cmd`.
 | --- | --- |
 | Undo | `Cmd+Z` |
 | Redo | `Cmd+Shift+Z` (also `Ctrl+Y` on Windows and Linux) |
+| New | `Cmd+N` |
 | Open | `Cmd+O` |
 | Save | `Cmd+S` |
 | Save as | `Cmd+Shift+S` |

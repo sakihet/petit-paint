@@ -20,6 +20,7 @@ impl Render for PaintApp {
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_save_as))
+            .on_action(cx.listener(Self::new_image))
             .on_action(cx.listener(Self::open_image))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::select_all))
