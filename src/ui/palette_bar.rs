@@ -1,4 +1,6 @@
-use gpui_kit::component::{ActiveTheme as _, button::*, color_picker::ColorPicker, h_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, button::*, color_picker::ColorPicker, h_flex, tooltip::Tooltip,
+};
 use gpui_kit::*;
 
 use crate::{KEY_CONTEXT, MAX_RECENT_COLORS, PaintApp, SwapColors};
@@ -10,6 +12,7 @@ const PALETTE: [u32; 20] = [
     0x7092be, 0xc8bfe7,
 ];
 const SWATCH_SIZE: Pixels = px(18.0);
+const SWATCH_TOOLTIP: &str = "Left click: color 1 · Right click: color 2";
 
 impl PaintApp {
     pub(super) fn palette_bar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -24,6 +27,7 @@ impl PaintApp {
                 .border_color(theme.border)
                 .bg(color)
                 .cursor_pointer()
+                .tooltip(|window, cx| Tooltip::new(SWATCH_TOOLTIP).build(window, cx))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, window, cx| this.set_primary(color, window, cx)),
@@ -34,7 +38,7 @@ impl PaintApp {
                 )
         };
         // One row that keeps its size as colors are used, so the canvas below
-        // stays put; the hint gives way when the window is narrow
+        // stays put
         h_flex()
             .flex_none()
             .overflow_hidden()
@@ -81,14 +85,5 @@ impl PaintApp {
                         .into_any_element(),
                 }
             }))
-            .child(div().w(px(8.0)))
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("Left click: color 1 · Right click: color 2"),
-            )
     }
 }
