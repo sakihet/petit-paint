@@ -2,7 +2,10 @@
 name = "petit-paint"
 version = "0.1.0"
 edition = "2024"
+description = "A small paint app written in Rust with GPUI"
+repository = "https://github.com/sakihet/petit-paint"
 license = "MIT"
+publish = false
 
 [dependencies]
 anyhow = "1.0.104"

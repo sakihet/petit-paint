@@ -42,3 +42,5 @@ cargo run
 ## License
 
 MIT
+
+Toolbar icons are from [Lucide](https://lucide.dev/), licensed under the ISC License.
