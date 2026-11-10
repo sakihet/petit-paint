@@ -1,12 +1,13 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Selectable as _, button::*, checkbox::Checkbox, h_flex,
-    slider::Slider,
+    popover::Popover, slider::Slider, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::canvas::{BRUSHES, Orientation};
+use crate::pattern::{PATTERNS, Pattern};
 use crate::text::FONTS;
 use crate::tool::{SHAPES, Tool, brush_icon};
 use crate::{
@@ -101,7 +102,7 @@ impl PaintApp {
                 )
             })
             .when(self.tool == Tool::Fill, |this| {
-                this.child(
+                this.child(self.pattern_picker(cx)).child(
                     h_flex()
                         .gap_2()
                         .child("Tolerance")
@@ -129,6 +130,42 @@ impl PaintApp {
     }
 
     /// Tool options on the left, actions on the right.
+    /// One tile of `pattern` in color 1 and color 2, two screen pixels per pattern pixel.
+    /// A button showing the fill pattern, which opens a grid of patterns to pick from.
+    fn pattern_picker(&self, cx: &Context<Self>) -> impl IntoElement {
+        let app = cx.entity().downgrade();
+        let (color, secondary_color, current) =
+            (self.color, self.secondary_color, self.fill_pattern);
+        Popover::new("pattern-picker")
+            .trigger(
+                Button::new("pattern")
+                    .outline()
+                    .child(pattern_preview(current, color, secondary_color))
+                    .tooltip(current.name),
+            )
+            .content(move |_, _, cx| {
+                let rows = PATTERNS.chunks(5).map(|row| {
+                    h_flex().gap_1().children(row.iter().map(|&pattern| {
+                        let app = app.clone();
+                        Button::new(pattern.name)
+                            .outline()
+                            .child(pattern_preview(pattern, color, secondary_color))
+                            .tooltip(pattern.name)
+                            .selected(pattern == current)
+                            .on_click(cx.listener(move |state, _, window, cx| {
+                                app.update(cx, |this, cx| {
+                                    this.fill_pattern = pattern;
+                                    cx.notify();
+                                })
+                                .ok();
+                                state.dismiss(window, cx);
+                            }))
+                    }))
+                });
+                v_flex().gap_1().children(rows)
+            })
+    }
+
     pub(super) fn options_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let icon_button = |id: &'static str, icon: IconName| Button::new(id).ghost().icon(icon);
@@ -250,4 +287,19 @@ impl PaintApp {
                     ),
             )
     }
+}
+
+/// One tile of `pattern` in `color` and `secondary_color`, two screen pixels
+/// per pattern pixel.
+fn pattern_preview(pattern: Pattern, color: Hsla, secondary_color: Hsla) -> impl IntoElement {
+    let cell = px(2.0);
+    v_flex().children((0..8).map(|y| {
+        h_flex().children((0..8).map(move |x| {
+            div().size(cell).bg(if pattern.is_set(x, y) {
+                color
+            } else {
+                secondary_color
+            })
+        }))
+    }))
 }

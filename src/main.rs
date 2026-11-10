@@ -1,4 +1,4 @@
-use canvas::{Brush, Canvas, Change, DEFAULT_FILL_TOLERANCE, Grid, Orientation, StrokeLayer};
+use canvas::{Brush, Canvas, Change, DEFAULT_FILL_TOLERANCE, Fill, Grid, Orientation, StrokeLayer};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::{
     color_picker::{ColorPickerEvent, ColorPickerState},
@@ -6,6 +6,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 use pan::PanDrag;
+use pattern::Pattern;
 use selection::{SelectDrag, Selection};
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ mod assets;
 mod canvas;
 mod file;
 mod pan;
+mod pattern;
 mod selection;
 mod text;
 mod tool;
@@ -253,6 +255,8 @@ struct PaintApp {
     fill_tolerance: u8,
     /// Sets the fill tolerance in percent.
     fill_tolerance_slider: Entity<SliderState>,
+    /// The pattern the fill tool paints in color 1 and color 2.
+    fill_pattern: Pattern,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -403,6 +407,7 @@ impl PaintApp {
             width_slider,
             fill_tolerance: DEFAULT_FILL_TOLERANCE,
             fill_tolerance_slider,
+            fill_pattern: Pattern::SOLID,
             _subscriptions,
         }
     }
@@ -868,7 +873,18 @@ impl PaintApp {
 
     fn fill_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let color = self.active_color();
-        if let Some(undo) = self.canvas.flood_fill(position, color, self.fill_tolerance) {
+        // The pattern's other pixels take the other color
+        let background = if self.use_secondary {
+            self.color
+        } else {
+            self.secondary_color
+        };
+        let fill = Fill {
+            pattern: self.fill_pattern,
+            foreground: color,
+            background,
+        };
+        if let Some(undo) = self.canvas.flood_fill(position, fill, self.fill_tolerance) {
             self.record(undo, cx);
             self.remember_color(color);
         }

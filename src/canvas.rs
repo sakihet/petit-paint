@@ -6,6 +6,16 @@ use tiny_skia::{
 };
 
 use crate::Stroke;
+use crate::pattern::Pattern;
+
+/// What the fill tool paints: color 1 where the pattern is set and color 2
+/// elsewhere.
+#[derive(Clone, Copy, Debug)]
+pub struct Fill {
+    pub pattern: Pattern,
+    pub foreground: Hsla,
+    pub background: Hsla,
+}
 
 /// Grid lines drawn over the canvas view.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -269,19 +279,20 @@ impl Canvas {
     /// Fills the region connected to `position` whose pixels have about the
     /// same color, and returns the change that undoes it.
     ///
-    /// Returns `None` when `position` is outside the canvas or the region
-    /// already has `color`, since filling it would change nothing.
+    /// Returns `None` when `position` is outside the canvas or filling would
+    /// change nothing, as when the region already has the solid fill's color.
     pub fn flood_fill(
         &mut self,
         position: Point<Pixels>,
-        color: Hsla,
+        fill: Fill,
         tolerance: u8,
     ) -> Option<Change> {
         let (seed_x, seed_y) = self.pixel_at(position)?;
         let (width, height) = (self.pixmap.width() as usize, self.pixmap.height() as usize);
         let target = self.pixmap.pixels()[seed_y * width + seed_x].demultiply();
-        let fill = to_skia_color(color).to_color_u8();
-        if target == fill {
+        let foreground = to_skia_color(fill.foreground).to_color_u8();
+        let background = to_skia_color(fill.background).to_color_u8();
+        if fill.pattern.is_solid() && target == foreground {
             return None;
         }
         let matches = |c: ColorU8| {
@@ -340,12 +351,25 @@ impl Canvas {
         let rect = IntRect::from_ltrb(left as i32, top as i32, right as i32, bottom as i32)?;
         let undo = self.snapshot(rect)?;
 
-        let fill = fill.premultiply();
+        let (foreground, background) = (foreground.premultiply(), background.premultiply());
         let pixels = self.pixmap.pixels_mut();
+        let mut changed = false;
         for (y, start, end) in spans {
-            for pixel in &mut pixels[y * width + start..y * width + end] {
-                *pixel = source_over(fill, *pixel);
+            for x in start..end {
+                let pixel = &mut pixels[y * width + x];
+                let color = if fill.pattern.is_set(x, y) {
+                    foreground
+                } else {
+                    background
+                };
+                let filled = source_over(color, *pixel);
+                changed |= filled != *pixel;
+                *pixel = filled;
             }
+        }
+        // Refilling a pattern with itself leaves every pixel as it was
+        if !changed {
+            return None;
         }
         self.version += 1;
         Some(undo)
@@ -1032,6 +1056,8 @@ mod tests {
     use super::*;
     use gpui_kit::{point, rgb};
 
+    use crate::pattern::PATTERNS;
+
     const WHITE: u32 = 0xffffff;
 
     fn canvas(width: u32, height: u32) -> Canvas {
@@ -1044,6 +1070,26 @@ mod tests {
             color: rgb(color).into(),
             width: px(width),
             ..Default::default()
+        }
+    }
+
+    fn solid(color: Hsla) -> Fill {
+        Fill {
+            pattern: Pattern::SOLID,
+            foreground: color,
+            background: color,
+        }
+    }
+
+    fn pattern(name: &str) -> Pattern {
+        *PATTERNS.iter().find(|p| p.name == name).unwrap()
+    }
+
+    fn pattern_fill(pattern: Pattern) -> Fill {
+        Fill {
+            pattern,
+            foreground: rgb(0x000000).into(),
+            background: rgb(0xff0000).into(),
         }
     }
 
@@ -1163,7 +1209,7 @@ mod tests {
         let undo = canvas
             .flood_fill(
                 point(px(50.0), px(50.0)),
-                rgb(0xff0000).into(),
+                solid(rgb(0xff0000).into()),
                 DEFAULT_FILL_TOLERANCE,
             )
             .unwrap();
@@ -1182,10 +1228,73 @@ mod tests {
         let mut canvas = canvas(10, 10);
         let result = canvas.flood_fill(
             point(px(5.0), px(5.0)),
-            rgb(WHITE).into(),
+            solid(rgb(WHITE).into()),
             DEFAULT_FILL_TOLERANCE,
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn flood_fill_paints_the_pattern_in_both_colors() {
+        let mut canvas = canvas(16, 16);
+        let checkerboard = pattern("Checkerboard");
+        canvas
+            .flood_fill(point(px(5.0), px(5.0)), pattern_fill(checkerboard), 0)
+            .unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                let expected = if checkerboard.is_set(x as usize, y as usize) {
+                    (0, 0, 0)
+                } else {
+                    (255, 0, 0)
+                };
+                assert_eq!(rgb_at(&canvas, x, y), expected, "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn pattern_lines_up_with_the_canvas_across_separate_fills() {
+        // A wall splits the canvas into two regions filled one at a time
+        let mut canvas = canvas(20, 8);
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(0, 0, 255, 255);
+        canvas.pixmap.fill_rect(
+            tiny_skia::Rect::from_xywh(9.0, 0.0, 1.0, 8.0).unwrap(),
+            &paint,
+            Transform::identity(),
+            None,
+        );
+        let diagonals = pattern("Rising diagonals");
+        canvas
+            .flood_fill(point(px(2.0), px(2.0)), pattern_fill(diagonals), 0)
+            .unwrap();
+        canvas
+            .flood_fill(point(px(15.0), px(2.0)), pattern_fill(diagonals), 0)
+            .unwrap();
+        // Both sides follow the same tiling, as if filled at once
+        for y in 0..8 {
+            for x in (0..20).filter(|&x| x != 9) {
+                let black = rgb_at(&canvas, x, y) == (0, 0, 0);
+                assert_eq!(
+                    black,
+                    diagonals.is_set(x as usize, y as usize),
+                    "({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refilling_a_pattern_with_itself_does_nothing() {
+        let mut canvas = canvas(16, 16);
+        let stripes = pattern("Horizontal lines");
+        canvas
+            .flood_fill(point(px(0.0), px(1.0)), pattern_fill(stripes), 0)
+            .unwrap();
+        // The red run between the stripes is already what the pattern paints there
+        let again = canvas.flood_fill(point(px(0.0), px(1.0)), pattern_fill(stripes), 0);
+        assert!(again.is_none());
     }
 
     #[test]
@@ -1204,7 +1313,11 @@ mod tests {
             canvas
         };
         let fill = |canvas: &mut Canvas, tolerance| {
-            canvas.flood_fill(point(px(1.0), px(1.0)), rgb(0xff0000).into(), tolerance)
+            canvas.flood_fill(
+                point(px(1.0), px(1.0)),
+                solid(rgb(0xff0000).into()),
+                tolerance,
+            )
         };
 
         let mut exact = two_tone();
