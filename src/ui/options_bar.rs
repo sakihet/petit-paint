@@ -5,11 +5,15 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use std::cell::RefCell;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::rc::Rc;
 
-use crate::canvas::{BRUSHES, Orientation};
-use crate::pattern::{PATTERNS, Pattern};
+use crate::canvas::{BRUSHES, Fill, Orientation, fill_swatch};
+use crate::pattern::PATTERNS;
 use crate::text::FONTS;
 use crate::tool::{SHAPES, Tool, brush_icon};
+use crate::view::{ViewCache, paint_floating};
 use crate::{
     CropToSelection, KEY_CONTEXT, NewImage, OpenImage, PaintApp, Redo, Save, Undo,
     tolerance_percent,
@@ -129,43 +133,66 @@ impl PaintApp {
             })
     }
 
-    /// Tool options on the left, actions on the right.
-    /// One tile of `pattern` in color 1 and color 2, two screen pixels per pattern pixel.
     /// A button showing the fill pattern, which opens a grid of patterns to pick from.
     fn pattern_picker(&self, cx: &Context<Self>) -> impl IntoElement {
         let app = cx.entity().downgrade();
-        let (color, secondary_color, current) =
-            (self.color, self.secondary_color, self.fill_pattern);
+        let current = self.fill_pattern;
+        let fill = |pattern| Fill {
+            pattern,
+            foreground: self.color,
+            background: self.secondary_color,
+        };
+        let (zoom, previews) = (self.zoom(), self.pattern_previews.clone());
+        let button_preview = pattern_preview(
+            fill(current),
+            BUTTON_PREVIEW_SIZE,
+            zoom,
+            previews.clone(),
+            PATTERNS.len(),
+        );
+        let fills = PATTERNS.map(fill);
         Popover::new("pattern-picker")
             .trigger(
                 Button::new("pattern")
                     .outline()
-                    .child(pattern_preview(current, color, secondary_color))
+                    .child(button_preview)
                     .tooltip(current.name),
             )
             .content(move |_, _, cx| {
-                let rows = PATTERNS.chunks(5).map(|row| {
-                    h_flex().gap_1().children(row.iter().map(|&pattern| {
-                        let app = app.clone();
-                        Button::new(pattern.name)
-                            .outline()
-                            .child(pattern_preview(pattern, color, secondary_color))
-                            .tooltip(pattern.name)
-                            .selected(pattern == current)
-                            .on_click(cx.listener(move |state, _, window, cx| {
-                                app.update(cx, |this, cx| {
-                                    this.fill_pattern = pattern;
-                                    cx.notify();
-                                })
-                                .ok();
-                                state.dismiss(window, cx);
-                            }))
-                    }))
+                let rows = fills.chunks(5).enumerate().map(|(row, fills)| {
+                    h_flex()
+                        .gap_1()
+                        .children(fills.iter().enumerate().map(|(column, &fill)| {
+                            let app = app.clone();
+                            let pattern = fill.pattern;
+                            Button::new(pattern.name)
+                                .outline()
+                                .p_1()
+                                .h_auto()
+                                .child(pattern_preview(
+                                    fill,
+                                    PICKER_PREVIEW_SIZE,
+                                    zoom,
+                                    previews.clone(),
+                                    row * 5 + column,
+                                ))
+                                .tooltip(pattern.name)
+                                .selected(pattern == current)
+                                .on_click(cx.listener(move |state, _, window, cx| {
+                                    app.update(cx, |this, cx| {
+                                        this.fill_pattern = pattern;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                    state.dismiss(window, cx);
+                                }))
+                        }))
                 });
                 v_flex().gap_1().children(rows)
             })
     }
 
+    /// Tool options on the left, actions on the right.
     pub(super) fn options_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let icon_button = |id: &'static str, icon: IconName| Button::new(id).ghost().icon(icon);
@@ -289,17 +316,42 @@ impl PaintApp {
     }
 }
 
-/// One tile of `pattern` in `color` and `secondary_color`, two screen pixels
-/// per pattern pixel.
-fn pattern_preview(pattern: Pattern, color: Hsla, secondary_color: Hsla) -> impl IntoElement {
-    let cell = px(2.0);
-    v_flex().children((0..8).map(|y| {
-        h_flex().children((0..8).map(move |x| {
-            div().size(cell).bg(if pattern.is_set(x, y) {
-                color
-            } else {
-                secondary_color
-            })
-        }))
-    }))
+/// Side of the current pattern's preview on its button, in logical pixels.
+const BUTTON_PREVIEW_SIZE: f32 = 16.0;
+/// Side of each pattern's preview in the picker, in logical pixels.
+const PICKER_PREVIEW_SIZE: f32 = 40.0;
+
+/// A square of `fill` as it looks on the canvas at `zoom`, so the preview
+/// matches the fill. Past the zoom where a whole 8x8 tile no longer fits, the
+/// pattern is scaled down to fit one.
+fn pattern_preview(
+    fill: Fill,
+    side: f32,
+    zoom: f32,
+    previews: Rc<RefCell<[ViewCache; PATTERNS.len() + 1]>>,
+    index: usize,
+) -> impl IntoElement {
+    let zoom = zoom.min(side / 8.0);
+    let pixels = (side / zoom).ceil() as u32;
+    let mut hasher = DefaultHasher::new();
+    fill.pattern.rows.hash(&mut hasher);
+    for color in [fill.foreground, fill.background] {
+        [color.h, color.s, color.l, color.a]
+            .map(f32::to_bits)
+            .hash(&mut hasher);
+    }
+    let id = hasher.finish();
+    gpui_kit::canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let Some(swatch) = fill_swatch(fill, pixels, pixels) else {
+                return;
+            };
+            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                let cache = &mut previews.borrow_mut()[index];
+                paint_floating(window, &swatch, id, bounds.origin, zoom, cache);
+            });
+        },
+    )
+    .size(px(side))
 }

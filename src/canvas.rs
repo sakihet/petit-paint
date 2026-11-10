@@ -762,6 +762,23 @@ impl Canvas {
     }
 }
 
+/// A `width` by `height` piece painted with `fill`, starting at the pattern's
+/// top-left, to preview the fill.
+pub fn fill_swatch(fill: Fill, width: u32, height: u32) -> Option<Pixmap> {
+    let mut pixmap = Pixmap::new(width, height)?;
+    let foreground = to_skia_color(fill.foreground).premultiply().to_color_u8();
+    let background = to_skia_color(fill.background).premultiply().to_color_u8();
+    for (i, pixel) in pixmap.pixels_mut().iter_mut().enumerate() {
+        let (x, y) = (i % width as usize, i / width as usize);
+        *pixel = if fill.pattern.is_set(x, y) {
+            foreground
+        } else {
+            background
+        };
+    }
+    Some(pixmap)
+}
+
 /// Renders all of `pixmap` like [`Canvas::render_view`], returning the BGRA
 /// bytes and their size in device pixels.
 pub fn render_pixmap(pixmap: &Pixmap, pixels_per_canvas_pixel: f32) -> (Vec<u8>, Size<u32>) {
@@ -1283,6 +1300,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fill_swatch_matches_a_fill_of_the_canvas() {
+        let bricks = pattern("Bricks");
+        let swatch = fill_swatch(pattern_fill(bricks), 20, 12).unwrap();
+        let mut canvas = canvas(20, 12);
+        canvas
+            .flood_fill(point(px(3.0), px(3.0)), pattern_fill(bricks), 0)
+            .unwrap();
+        assert_eq!(swatch.pixels(), canvas.pixmap.pixels());
     }
 
     #[test]

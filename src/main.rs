@@ -6,7 +6,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 use pan::PanDrag;
-use pattern::Pattern;
+use pattern::{PATTERNS, Pattern};
 use selection::{SelectDrag, Selection};
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -257,6 +257,9 @@ struct PaintApp {
     fill_tolerance_slider: Entity<SliderState>,
     /// The pattern the fill tool paints in color 1 and color 2.
     fill_pattern: Pattern,
+    /// Previews of each pattern in the picker, then of the current pattern
+    /// on its button.
+    pattern_previews: Rc<RefCell<[ViewCache; PATTERNS.len() + 1]>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -408,6 +411,7 @@ impl PaintApp {
             fill_tolerance: DEFAULT_FILL_TOLERANCE,
             fill_tolerance_slider,
             fill_pattern: Pattern::SOLID,
+            pattern_previews: Rc::default(),
             _subscriptions,
         }
     }
