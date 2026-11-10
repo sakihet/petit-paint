@@ -1,11 +1,11 @@
 [package]
 name = "petit-paint"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A small paint app written in Rust with GPUI"
 repository = "https://github.com/sakihet/petit-paint"
 license = "MIT"
-publish = false
+publish = true
 
 [dependencies]
 anyhow = "1.0.104"

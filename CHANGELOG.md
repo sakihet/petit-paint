@@ -1,3 +1,35 @@
+## [0.2.0] - 2026-11-10
+
+### 🚀 Features
+
+- Add a tolerance slider to the fill tool
+- Save to the current file and add save as
+- Add new image command
+- Add single-key tool shortcuts
+- Swap colors with x
+- Change the brush width with brackets
+- Open images dropped on the window
+- Pan the canvas by dragging with space held
+- Open jpeg, bmp, webp and gif images
+- Save in the format named by the file extension
+- Crop to selection
+
+### 🐛 Bug Fixes
+
+- Keep the palette bar on one row as recent colors are added
+
+### 📚 Documentation
+
+- Move the remember_color doc comment back to its function
+- Add the release commit message to agents.md
+
+### 🚜 Refactor
+
+- Move the palette click hint into swatch tooltips
+
+### ⚙️ Miscellaneous Tasks
+
+- Add github actions workflow for build and test
 ## [0.1.0] - 2026-11-09
 
 ### 🚀 Features
