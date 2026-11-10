@@ -9,6 +9,7 @@ icon_assets!(
     ToolbarIcons,
     [
         SquareDashed,
+        Lasso,
         Paintbrush,
         Eraser,
         Pipette,

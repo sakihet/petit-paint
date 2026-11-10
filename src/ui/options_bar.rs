@@ -11,6 +11,7 @@ use std::rc::Rc;
 
 use crate::canvas::{BRUSHES, Fill, Orientation, fill_swatch};
 use crate::pattern::PATTERNS;
+use crate::selection::SELECT_SHAPES;
 use crate::text::FONTS;
 use crate::tool::{SHAPES, Tool, brush_icon};
 use crate::view::{ViewCache, paint_floating};
@@ -43,6 +44,26 @@ impl PaintApp {
                         .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
                             if let Some(&brush) = clicks.first().and_then(|ix| BRUSHES.get(*ix)) {
                                 this.brush = brush;
+                                cx.notify();
+                            }
+                        })),
+                )
+            })
+            .when(self.tool == Tool::Select, |this| {
+                this.child(
+                    ButtonGroup::new("select-shape")
+                        .outline()
+                        .children(SELECT_SHAPES.map(|shape| {
+                            Button::new(shape.label())
+                                .icon(shape.icon())
+                                .tooltip(shape.label())
+                                .selected(self.select_shape == shape)
+                        }))
+                        .on_click(cx.listener(|this, clicks: &Vec<usize>, _, cx| {
+                            if let Some(&shape) =
+                                clicks.first().and_then(|ix| SELECT_SHAPES.get(*ix))
+                            {
+                                this.select_shape = shape;
                                 cx.notify();
                             }
                         })),

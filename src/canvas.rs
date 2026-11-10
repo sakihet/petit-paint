@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
-use gpui_kit::{Hsla, Pixels, Point, Rgba, Size, px, size};
+use gpui_kit::{Hsla, Pixels, Point, Rgba, Size, point, px, size};
+use std::rc::Rc;
 use tiny_skia::{
     Color, ColorU8, FillRule, IntRect, LineCap, LineJoin, Paint, PathBuilder, Pixmap, PixmapPaint,
     PremultipliedColorU8, Stroke as SkiaStroke, Transform,
@@ -80,14 +81,30 @@ pub enum Orientation {
 
 /// Returns `pixmap` flipped or turned. Quarter turns swap width and height.
 pub fn reoriented(pixmap: &Pixmap, orientation: Orientation) -> Pixmap {
-    let (width, height) = (pixmap.width(), pixmap.height());
+    let (pixels, (width, height)) = reoriented_grid(
+        pixmap.pixels(),
+        pixmap.width(),
+        pixmap.height(),
+        orientation,
+    );
+    let mut out = Pixmap::new(width, height).expect("same area as a valid pixmap");
+    out.pixels_mut().copy_from_slice(&pixels);
+    out
+}
+
+/// Flips or turns a `width` by `height` grid of values stored row by row,
+/// returning them with their new width and height.
+fn reoriented_grid<T: Copy>(
+    source: &[T],
+    width: u32,
+    height: u32,
+    orientation: Orientation,
+) -> (Vec<T>, (u32, u32)) {
     let (new_width, new_height) = match orientation {
         Orientation::FlipHorizontal | Orientation::FlipVertical => (width, height),
         Orientation::RotateClockwise | Orientation::RotateCounterClockwise => (height, width),
     };
-    let mut out = Pixmap::new(new_width, new_height).expect("same area as a valid pixmap");
-    let source = pixmap.pixels();
-    let target = out.pixels_mut();
+    let mut target = source.to_vec();
     for y in 0..height {
         for x in 0..width {
             // Where pixel (x, y) lands
@@ -100,7 +117,116 @@ pub fn reoriented(pixmap: &Pixmap, orientation: Orientation) -> Pixmap {
             target[(ny * new_width + nx) as usize] = source[(y * width + x) as usize];
         }
     }
-    out
+    (target, (new_width, new_height))
+}
+
+/// The pixels a free-form selection covers within its bounding box.
+#[derive(Clone)]
+pub struct SelectionMask {
+    width: u32,
+    height: u32,
+    inside: Vec<bool>,
+    /// Pixel edges between covered and uncovered pixels, from one corner to
+    /// another, to draw the selection's outline along.
+    edges: Rc<[(Point<u32>, Point<u32>)]>,
+}
+
+impl SelectionMask {
+    /// Covers the pixels of a `width` by `height` box whose centers lie inside
+    /// `outline`, given relative to the box's top-left. Returns `None` when
+    /// that is no pixel at all.
+    pub fn from_outline(outline: &[Point<f32>], width: u32, height: u32) -> Option<Self> {
+        let (first, rest) = outline.split_first()?;
+        let mut builder = PathBuilder::new();
+        builder.move_to(first.x, first.y);
+        for p in rest {
+            builder.line_to(p.x, p.y);
+        }
+        builder.close();
+        let path = builder.finish()?;
+        let mut mask = tiny_skia::Mask::new(width, height)?;
+        // Without anti-aliasing a pixel is either in or out
+        mask.fill_path(&path, FillRule::Winding, false, Transform::identity());
+        let inside: Vec<bool> = mask.data().iter().map(|&coverage| coverage > 0).collect();
+        inside
+            .contains(&true)
+            .then(|| Self::new(width, height, inside))
+    }
+
+    fn new(width: u32, height: u32, inside: Vec<bool>) -> Self {
+        let mut mask = Self {
+            width,
+            height,
+            inside,
+            edges: Rc::new([]),
+        };
+        mask.edges = mask.find_edges().into();
+        mask
+    }
+
+    /// Whether the pixel at (`x`, `y`) from the box's top-left is selected.
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        (0..self.width as i32).contains(&x)
+            && (0..self.height as i32).contains(&y)
+            && self.inside[(y as u32 * self.width + x as u32) as usize]
+    }
+
+    pub fn edges(&self) -> Rc<[(Point<u32>, Point<u32>)]> {
+        self.edges.clone()
+    }
+
+    pub fn reorient(&mut self, orientation: Orientation) {
+        let (inside, (width, height)) =
+            reoriented_grid(&self.inside, self.width, self.height, orientation);
+        *self = Self::new(width, height, inside);
+    }
+
+    /// Walks each row and column boundary, joining neighboring unit edges into
+    /// one longer edge.
+    fn find_edges(&self) -> Vec<(Point<u32>, Point<u32>)> {
+        let (width, height) = (self.width as i32, self.height as i32);
+        let mut edges = Vec::new();
+        let mut collect =
+            |lines: i32, length: i32, differs: &dyn Fn(i32, i32) -> bool, horizontal: bool| {
+                for line in 0..=lines {
+                    let mut start = None;
+                    for along in 0..=length {
+                        let edge = along < length && differs(line, along);
+                        match (edge, start) {
+                            (true, None) => start = Some(along),
+                            (false, Some(from)) => {
+                                let (a, b) = if horizontal {
+                                    (point(from, line), point(along, line))
+                                } else {
+                                    (point(line, from), point(line, along))
+                                };
+                                edges.push((
+                                    point(a.x as u32, a.y as u32),
+                                    point(b.x as u32, b.y as u32),
+                                ));
+                                start = None;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            };
+        // Above row `y`, between it and the row before
+        collect(
+            height,
+            width,
+            &|y, x| self.contains(x, y - 1) != self.contains(x, y),
+            true,
+        );
+        // Left of column `x`
+        collect(
+            width,
+            height,
+            &|x, y| self.contains(x - 1, y) != self.contains(x, y),
+            false,
+        );
+        edges
+    }
 }
 
 /// Pixels lifted off the canvas or pasted, which float above it until dropped.
@@ -440,25 +566,53 @@ impl Canvas {
         }
     }
 
-    /// Returns a copy of the pixels in `rect`, clipped to the canvas.
-    pub fn copy(&self, rect: PixelRect) -> Option<Pixmap> {
-        self.pixmap.clone_rect(self.clip_rect(rect)?)
+    /// Returns a copy of the pixels in `rect`, clipped to the canvas. With a
+    /// `mask`, the pixels it leaves out are transparent.
+    pub fn copy(&self, rect: PixelRect, mask: Option<&SelectionMask>) -> Option<Pixmap> {
+        let source = self.clip_rect(rect)?;
+        let mut pixels = self.pixmap.clone_rect(source)?;
+        if let Some(mask) = mask {
+            let width = pixels.width();
+            for (i, pixel) in pixels.pixels_mut().iter_mut().enumerate() {
+                let (x, y) = in_selection(rect, source, i as u32, width);
+                if !mask.contains(x, y) {
+                    *pixel = PremultipliedColorU8::TRANSPARENT;
+                }
+            }
+        }
+        Some(pixels)
     }
 
-    /// Paints `rect` with the background color and returns the change that undoes it.
-    pub fn erase(&mut self, rect: PixelRect) -> Option<Change> {
-        let rect = self.clip_rect(rect)?;
-        let undo = self.snapshot(rect)?;
-        self.pixmap.fill_rect(
-            rect.to_rect(),
-            &Paint {
-                shader: tiny_skia::Shader::SolidColor(self.background),
-                blend_mode: tiny_skia::BlendMode::Source,
-                ..Default::default()
-            },
-            Transform::identity(),
-            None,
-        );
+    /// Paints `rect` with the background color, or only the pixels `mask`
+    /// covers, and returns the change that undoes it.
+    pub fn erase(&mut self, rect: PixelRect, mask: Option<&SelectionMask>) -> Option<Change> {
+        let source = self.clip_rect(rect)?;
+        let undo = self.snapshot(source)?;
+        let Some(mask) = mask else {
+            self.pixmap.fill_rect(
+                source.to_rect(),
+                &Paint {
+                    shader: tiny_skia::Shader::SolidColor(self.background),
+                    blend_mode: tiny_skia::BlendMode::Source,
+                    ..Default::default()
+                },
+                Transform::identity(),
+                None,
+            );
+            self.version += 1;
+            return Some(undo);
+        };
+        let background = self.background.premultiply().to_color_u8();
+        let canvas_width = self.pixmap.width() as usize;
+        let pixels = self.pixmap.pixels_mut();
+        for i in 0..source.width() * source.height() {
+            let (x, y) = in_selection(rect, source, i, source.width());
+            if mask.contains(x, y) {
+                let canvas_x = (rect.x + x) as usize;
+                let canvas_y = (rect.y + y) as usize;
+                pixels[canvas_y * canvas_width + canvas_x] = background;
+            }
+        }
         self.version += 1;
         Some(undo)
     }
@@ -485,12 +639,13 @@ impl Canvas {
         Some(undo)
     }
 
-    /// Lifts the pixels in `rect` off the canvas, leaving background behind.
-    pub fn lift(&mut self, rect: PixelRect) -> Option<Floating> {
+    /// Lifts the pixels in `rect` off the canvas, or only those `mask`
+    /// covers, leaving background behind.
+    pub fn lift(&mut self, rect: PixelRect, mask: Option<&SelectionMask>) -> Option<Floating> {
         let source = self.clip_rect(rect)?;
-        let pixels = self.pixmap.clone_rect(source)?;
+        let pixels = self.copy(rect, mask)?;
         let before = self.pixmap.clone();
-        self.erase(rect);
+        self.erase(rect, mask);
         Some(Floating {
             pixels,
             reoriented: false,
@@ -760,6 +915,15 @@ impl Canvas {
                 .copy_from_slice(&source[row * patch_width..][..patch_width]);
         }
     }
+}
+
+/// Where the `i`th pixel of `source`, part of the selection `rect` clipped to
+/// the canvas and `width` pixels wide, lies from the selection's top-left.
+fn in_selection(rect: PixelRect, source: IntRect, i: u32, width: u32) -> (i32, i32) {
+    (
+        source.x() - rect.x + (i % width) as i32,
+        source.y() - rect.y + (i / width) as i32,
+    )
 }
 
 /// A `width` by `height` piece painted with `fill`, starting at the pattern's
@@ -1408,7 +1572,7 @@ mod tests {
     #[test]
     fn moving_a_selection_is_one_undo_step() {
         let mut canvas = canvas_with_block();
-        let floating = canvas.lift(rect(2, 2, 4, 4)).unwrap();
+        let floating = canvas.lift(rect(2, 2, 4, 4), None).unwrap();
         // Lifting leaves background behind
         assert_eq!(rgb_at(&canvas, 3, 3), (255, 255, 255));
 
@@ -1424,7 +1588,7 @@ mod tests {
     #[test]
     fn dropping_lifted_pixels_in_place_records_nothing() {
         let mut canvas = canvas_with_block();
-        let floating = canvas.lift(rect(2, 2, 4, 4)).unwrap();
+        let floating = canvas.lift(rect(2, 2, 4, 4), None).unwrap();
         assert!(canvas.drop_floating(floating, point(2, 2), true).is_none());
         assert_eq!(rgb_at(&canvas, 3, 3), (0, 0, 0));
     }
@@ -1432,7 +1596,7 @@ mod tests {
     #[test]
     fn discarding_lifted_pixels_deletes_them() {
         let mut canvas = canvas_with_block();
-        let floating = canvas.lift(rect(2, 2, 4, 4)).unwrap();
+        let floating = canvas.lift(rect(2, 2, 4, 4), None).unwrap();
         let undo = canvas.drop_floating(floating, point(2, 2), false).unwrap();
         assert_eq!(rgb_at(&canvas, 3, 3), (255, 255, 255));
         canvas.apply(undo);
@@ -1442,7 +1606,7 @@ mod tests {
     #[test]
     fn pasting_clips_to_the_canvas_and_can_be_undone() {
         let mut canvas = canvas_with_block();
-        let pixels = canvas.copy(rect(2, 2, 4, 4)).unwrap();
+        let pixels = canvas.copy(rect(2, 2, 4, 4), None).unwrap();
         let floating = canvas.float(pixels);
         // Partly past the bottom-right corner
         let undo = canvas.drop_floating(floating, point(18, 18), true).unwrap();
@@ -1455,12 +1619,126 @@ mod tests {
     #[test]
     fn erase_paints_background_and_can_be_undone() {
         let mut canvas = canvas_with_block();
-        let undo = canvas.erase(rect(0, 0, 4, 4)).unwrap();
+        let undo = canvas.erase(rect(0, 0, 4, 4), None).unwrap();
         assert_eq!(rgb_at(&canvas, 3, 3), (255, 255, 255));
         // Outside the erased rect stays
         assert_eq!(rgb_at(&canvas, 5, 5), (0, 0, 0));
         canvas.apply(undo);
         assert_eq!(rgb_at(&canvas, 3, 3), (0, 0, 0));
+    }
+
+    /// A mask over a 4x4 box covering the triangle at its top-left corner.
+    fn corner_triangle() -> SelectionMask {
+        let outline = [point(0.0, 0.0), point(4.0, 0.0), point(0.0, 4.0)];
+        SelectionMask::from_outline(&outline, 4, 4).unwrap()
+    }
+
+    #[test]
+    fn mask_covers_the_pixels_centered_inside_the_outline() {
+        let mask = corner_triangle();
+        // Pixel (1, 1) is centered at (1.5, 1.5), inside the triangle's
+        // diagonal; pixel (2, 2) at (2.5, 2.5) is past it
+        assert!(mask.contains(0, 0));
+        assert!(mask.contains(1, 1));
+        assert!(mask.contains(3, 0));
+        assert!(!mask.contains(2, 2));
+        assert!(!mask.contains(3, 3));
+        assert!(!mask.contains(-1, 0));
+    }
+
+    #[test]
+    fn mask_with_nothing_inside_is_none() {
+        // A sliver along the box's top edge reaches no pixel center
+        let outline = [point(0.0, 0.0), point(4.0, 0.0), point(4.0, 0.2)];
+        assert!(SelectionMask::from_outline(&outline, 4, 4).is_none());
+    }
+
+    #[test]
+    fn mask_edges_trace_its_outline() {
+        let outline = [
+            point(1.0, 1.0),
+            point(3.0, 1.0),
+            point(3.0, 3.0),
+            point(1.0, 3.0),
+        ];
+        let mask = SelectionMask::from_outline(&outline, 4, 4).unwrap();
+        let mut edges: Vec<_> = mask
+            .edges()
+            .iter()
+            .map(|(a, b)| ((a.x, a.y), (b.x, b.y)))
+            .collect();
+        edges.sort();
+        // One edge per side of the 2x2 square, not one per pixel
+        assert_eq!(
+            edges,
+            [
+                ((1, 1), (1, 3)),
+                ((1, 1), (3, 1)),
+                ((1, 3), (3, 3)),
+                ((3, 1), (3, 3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn mask_flips_and_turns_with_the_pixels() {
+        let mut mask = corner_triangle();
+        mask.reorient(Orientation::FlipHorizontal);
+        assert!(mask.contains(3, 0));
+        assert!(!mask.contains(0, 3));
+        mask.reorient(Orientation::RotateClockwise);
+        // The top-right corner turns to the bottom-right
+        assert!(mask.contains(3, 3));
+        assert!(!mask.contains(0, 0));
+    }
+
+    #[test]
+    fn free_form_lift_takes_only_the_pixels_inside() {
+        let mut canvas = canvas_with_block();
+        let mask = corner_triangle();
+        let floating = canvas.lift(rect(2, 2, 4, 4), Some(&mask)).unwrap();
+        // The inside leaves background behind, the rest of the block stays
+        assert_eq!(rgb_at(&canvas, 2, 2), (255, 255, 255));
+        assert_eq!(rgb_at(&canvas, 5, 5), (0, 0, 0));
+        // Outside the outline the lifted pixels are transparent
+        assert_eq!(floating.pixels.pixel(3, 3).unwrap().alpha(), 0);
+
+        let undo = canvas.drop_floating(floating, point(10, 10), true).unwrap();
+        assert_eq!(rgb_at(&canvas, 10, 10), (0, 0, 0));
+        // The transparent part leaves the canvas under it as it was
+        assert_eq!(rgb_at(&canvas, 13, 13), (255, 255, 255));
+        canvas.apply(undo);
+        assert_eq!(rgb_at(&canvas, 2, 2), (0, 0, 0));
+        assert_eq!(rgb_at(&canvas, 10, 10), (255, 255, 255));
+    }
+
+    #[test]
+    fn free_form_copy_and_erase_keep_to_the_outline() {
+        let mut canvas = canvas_with_block();
+        let mask = corner_triangle();
+        let pixels = canvas.copy(rect(2, 2, 4, 4), Some(&mask)).unwrap();
+        assert_eq!(pixels.pixel(0, 0).unwrap().alpha(), 255);
+        assert_eq!(pixels.pixel(3, 3).unwrap().alpha(), 0);
+
+        let undo = canvas.erase(rect(2, 2, 4, 4), Some(&mask)).unwrap();
+        assert_eq!(rgb_at(&canvas, 2, 2), (255, 255, 255));
+        assert_eq!(rgb_at(&canvas, 5, 5), (0, 0, 0));
+        canvas.apply(undo);
+        assert_eq!(rgb_at(&canvas, 2, 2), (0, 0, 0));
+    }
+
+    #[test]
+    fn free_form_selection_past_the_edge_lines_up_with_its_mask() {
+        let mut canvas = canvas(8, 8);
+        canvas.pixmap.fill(Color::BLACK);
+        let mask = corner_triangle();
+        // The selection's box starts two pixels left of the canvas
+        canvas.erase(rect(-2, 2, 4, 4), Some(&mask)).unwrap();
+        // Selection pixel (2, 0), inside the triangle, is canvas pixel (0, 2);
+        // selection pixel (2, 3), outside it, is canvas pixel (0, 5)
+        assert_eq!(rgb_at(&canvas, 0, 2), (255, 255, 255));
+        assert_eq!(rgb_at(&canvas, 0, 5), (0, 0, 0));
+        assert_eq!(rgb_at(&canvas, 2, 2), (0, 0, 0));
     }
 
     #[test]
@@ -1870,7 +2148,7 @@ mod tests {
     fn flipping_a_selection_in_place_is_recorded() {
         let mut canvas = canvas_with_block();
         // Lift the left half of the block plus empty space to its left
-        let mut floating = canvas.lift(rect(0, 2, 4, 4)).unwrap();
+        let mut floating = canvas.lift(rect(0, 2, 4, 4), None).unwrap();
         floating.reorient(Orientation::FlipHorizontal);
         let undo = canvas.drop_floating(floating, point(0, 2), true).unwrap();
         // The block's left half (columns 2-3) now sits at columns 0-1

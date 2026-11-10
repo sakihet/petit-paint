@@ -3,7 +3,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::view::{paint_floating, paint_stroke, paint_view};
-use crate::{PaintApp, ResizeHandle};
+use crate::{PaintApp, ResizeHandle, Stroke};
 
 /// Side length of the square handles for resizing the canvas.
 const HANDLE_SIZE: Pixels = px(8.0);
@@ -23,6 +23,13 @@ impl PaintApp {
         let app = cx.entity();
 
         let zoom = self.zoom();
+        // A one-pixel line on screen along the free-form outline being dragged
+        let lasso = (!self.lasso.is_empty()).then(|| Stroke {
+            points: self.lasso.clone(),
+            color: rgb(SELECTION_COLOR).into(),
+            width: px(1.0 / zoom),
+            ..Default::default()
+        });
         // The canvas as displayed, at the current zoom
         let canvas_size = size(
             self.canvas_size.width * zoom,
@@ -131,7 +138,7 @@ impl PaintApp {
                                     &mut stroke_cache.borrow_mut(),
                                 );
                             }
-                            if let Some(stroke) = &preview {
+                            for stroke in preview.iter().chain(&lasso) {
                                 paint_stroke(window, stroke, bounds.origin, zoom);
                             }
                         });
@@ -141,16 +148,41 @@ impl PaintApp {
             )
             .when_some(self.selection.as_ref(), |this, selection| {
                 let rect = selection.rect;
+                let area = div()
+                    .absolute()
+                    .left(px(rect.x as f32 * zoom))
+                    .top(px(rect.y as f32 * zoom))
+                    .w(px(rect.width as f32 * zoom))
+                    .h(px(rect.height as f32 * zoom));
+                let Some(mask) = &selection.mask else {
+                    return this.child(
+                        area.border_1()
+                            .border_dashed()
+                            .border_color(rgb(SELECTION_COLOR)),
+                    );
+                };
+                let edges = mask.edges();
                 this.child(
-                    div()
-                        .absolute()
-                        .left(px(rect.x as f32 * zoom))
-                        .top(px(rect.y as f32 * zoom))
-                        .w(px(rect.width as f32 * zoom))
-                        .h(px(rect.height as f32 * zoom))
-                        .border_1()
-                        .border_dashed()
-                        .border_color(rgb(SELECTION_COLOR)),
+                    area.child(
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                let at = |p: Point<u32>| {
+                                    bounds.origin
+                                        + point(px(p.x as f32 * zoom), px(p.y as f32 * zoom))
+                                };
+                                let mut builder = PathBuilder::stroke(px(1.0));
+                                for &(from, to) in edges.iter() {
+                                    builder.move_to(at(from));
+                                    builder.line_to(at(to));
+                                }
+                                if let Ok(path) = builder.build() {
+                                    window.paint_path(path, rgb(SELECTION_COLOR));
+                                }
+                            },
+                        )
+                        .size_full(),
+                    ),
                 )
             })
             .when_some(self.text_edit.as_ref(), |this, edit| {

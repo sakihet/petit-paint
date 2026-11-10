@@ -7,7 +7,7 @@ use gpui_kit::component::{
 use gpui_kit::*;
 use pan::PanDrag;
 use pattern::{PATTERNS, Pattern};
-use selection::{SelectDrag, Selection};
+use selection::{SelectDrag, SelectShape, Selection};
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -177,8 +177,8 @@ struct PaintApp {
     canvas_size: Size<Pixels>,
     /// The stroke being drawn, not yet burned into `canvas`.
     current_stroke: Option<Stroke>,
-    /// Index in `current_stroke` of the point a straight line runs from while
-    /// Shift is held.
+    /// Index in `current_stroke` or `lasso` of the point a straight line runs
+    /// from while Shift is held.
     straight_from: Option<usize>,
     /// `current_stroke` rendered as it will be burned in, to preview it.
     stroke_preview: Option<StrokeLayer>,
@@ -220,6 +220,10 @@ struct PaintApp {
     view_cache: Rc<RefCell<ViewCache>>,
     selection: Option<Selection>,
     select_drag: Option<SelectDrag>,
+    /// How the select tool picks out pixels.
+    select_shape: SelectShape,
+    /// The free-form outline being dragged, in canvas coordinates.
+    lasso: Vec<Point<Pixels>>,
     /// Bumped whenever new floating pixels are created, to refresh their cached image.
     floating_id: u64,
     floating_cache: Rc<RefCell<ViewCache>>,
@@ -390,6 +394,8 @@ impl PaintApp {
             view_cache: Rc::default(),
             selection: None,
             select_drag: None,
+            select_shape: SelectShape::Rectangle,
+            lasso: Vec::new(),
             floating_id: 0,
             floating_cache: Rc::default(),
             visible_bounds: Rc::default(),
@@ -791,7 +797,7 @@ impl PaintApp {
             return;
         }
         if let Some(drag) = self.select_drag {
-            self.drag_select(drag, event.position, cx);
+            self.drag_select(drag, event.position, event.modifiers.shift, cx);
             return;
         }
         if let Some(drag) = &self.resize_drag {
@@ -826,7 +832,7 @@ impl PaintApp {
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_drag = None;
+        self.end_select(cx);
         self.pan_drag = None;
         if let Some(drag) = self.shape_drag.take()
             && drag.start != drag.end
@@ -967,10 +973,13 @@ impl PaintApp {
         if let Some(selection) = &mut self.selection {
             // Lift the selection so the change is one undo step with any move
             if selection.floating.is_none() {
-                selection.floating = self.canvas.lift(selection.rect);
+                selection.floating = self.canvas.lift(selection.rect, selection.mask.as_ref());
             }
             if let Some(floating) = &mut selection.floating {
                 floating.reorient(orientation);
+                if let Some(mask) = &mut selection.mask {
+                    mask.reorient(orientation);
+                }
                 let (width, height) = (floating.pixels.width(), floating.pixels.height());
                 // Turn about the selection's center
                 let rect = &mut selection.rect;
@@ -1022,7 +1031,7 @@ fn remember_color(recent: &mut Vec<Hsla>, color: Hsla) {
 /// is held, the stroke instead runs as one line from where it was pressed,
 /// snapped to a multiple of 45°; releasing it carries on freehand from the
 /// line's end.
-fn extend_stroke(
+pub fn extend_stroke(
     points: &mut Vec<Point<Pixels>>,
     straight_from: &mut Option<usize>,
     position: Point<Pixels>,
