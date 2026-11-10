@@ -123,6 +123,8 @@ pub fn brush_icon(brush: Brush) -> IconName {
     match brush {
         Brush::Pen => IconName::Pen,
         Brush::Pencil => IconName::Pencil,
+        Brush::NaturalPencil => IconName::PencilLine,
+        Brush::Crayon => IconName::Brush,
         Brush::Marker => IconName::Highlighter,
         Brush::Airbrush => IconName::SprayCan,
         Brush::Calligraphy => IconName::PenTool,

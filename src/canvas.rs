@@ -114,6 +114,10 @@ pub enum Brush {
     Pen,
     /// Hard-edged pixels with no anti-aliasing, for pixel art.
     Pencil,
+    /// Soft graphite, lighter than the pen and grainy.
+    NaturalPencil,
+    /// Waxy color with gaps where the paper's grain shows through.
+    Crayon,
     /// A flat-ended, half-transparent line.
     Marker,
     /// Dots sprayed at random around the line.
@@ -123,9 +127,11 @@ pub enum Brush {
 }
 
 /// Brushes in toolbar order.
-pub const BRUSHES: [Brush; 5] = [
+pub const BRUSHES: [Brush; 7] = [
     Brush::Pen,
     Brush::Pencil,
+    Brush::NaturalPencil,
+    Brush::Crayon,
     Brush::Marker,
     Brush::Airbrush,
     Brush::Calligraphy,
@@ -136,6 +142,8 @@ impl Brush {
         match self {
             Brush::Pen => "Pen",
             Brush::Pencil => "Pencil",
+            Brush::NaturalPencil => "Natural pencil",
+            Brush::Crayon => "Crayon",
             Brush::Marker => "Marker",
             Brush::Airbrush => "Airbrush",
             Brush::Calligraphy => "Calligraphy",
@@ -224,11 +232,14 @@ impl Canvas {
         let mut opaque = color;
         opaque.set_alpha(1.0);
         match stroke.brush {
-            Brush::Pen | Brush::Pencil | Brush::Marker => {
+            Brush::Pen | Brush::Pencil | Brush::NaturalPencil | Brush::Crayon | Brush::Marker => {
                 draw_line(&mut pixels, stroke, opaque, transform)
             }
             Brush::Airbrush => spray(&mut pixels, stroke, opaque, transform),
             Brush::Calligraphy => draw_nib(&mut pixels, stroke, opaque, transform),
+        }
+        if matches!(stroke.brush, Brush::NaturalPencil | Brush::Crayon) {
+            add_grain(&mut pixels, Point::new(rect.x(), rect.y()), stroke.brush);
         }
 
         let opacity = color.alpha()
@@ -883,6 +894,45 @@ fn spray(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Transfor
     }
 }
 
+/// Roughens a natural pencil or crayon line drawn on `pixels`, whose top-left
+/// is at `at` on the canvas. The grain belongs to the canvas position rather
+/// than the stroke, like paper's, so the part already drawn stays the same as
+/// the stroke grows.
+fn add_grain(pixels: &mut Pixmap, at: Point<i32>, brush: Brush) {
+    let width = pixels.width() as i32;
+    for (i, pixel) in pixels.pixels_mut().iter_mut().enumerate() {
+        if pixel.alpha() == 0 {
+            continue;
+        }
+        let x = at.x + i as i32 % width;
+        let y = at.y + i as i32 / width;
+        let fine = noise(x, y, 0);
+        let coarse = noise(x.div_euclid(3), y.div_euclid(3), 1);
+        let coverage = match brush {
+            // Graphite never covers fully, and is lighter where the grain is low
+            Brush::NaturalPencil => 0.3 + 0.5 * (0.8 * fine + 0.2 * coarse),
+            // Wax covers fully but skips the low spots, which come in clumps
+            _ if 0.4 * fine + 0.6 * coarse < 0.3 => 0.0,
+            _ => 1.0,
+        };
+        let scale = |c: u8| (c as f32 * coverage).round() as u8;
+        *pixel = PremultipliedColorU8::from_rgba(
+            scale(pixel.red()),
+            scale(pixel.green()),
+            scale(pixel.blue()),
+            scale(pixel.alpha()),
+        )
+        .unwrap_or(*pixel);
+    }
+}
+
+/// Returns a number in `0.0..1.0` fixed for the pixel at (`x`, `y`) and the
+/// `layer` of noise.
+fn noise(x: i32, y: i32, layer: u64) -> f32 {
+    let position = ((x as u32 as u64) << 32) | y as u32 as u64;
+    Random(position ^ layer.wrapping_mul(0xd6e8_feb8_6659_fd93)).next()
+}
+
 /// Sweeps a flat nib, `width` long and tilted 45°, along the line.
 fn draw_nib(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Transform) {
     let half = stroke.width.as_f32() / 2.0 * std::f32::consts::FRAC_1_SQRT_2;
@@ -1389,6 +1439,71 @@ mod tests {
                 let a = short.pixels.pixel(x, y).unwrap().alpha();
                 let b = long.pixels.pixel(x, y).unwrap().alpha();
                 assert_eq!(a, b, "({x}, {y})");
+            }
+        }
+    }
+
+    /// Pixels the stroke left on the canvas, and how many of them are black.
+    fn coverage(canvas: &Canvas) -> (usize, usize) {
+        let pixels = canvas.pixmap.pixels();
+        let marked = pixels.iter().filter(|p| p.red() < 255).count();
+        let black = pixels.iter().filter(|p| p.red() == 0).count();
+        (marked, black)
+    }
+
+    #[test]
+    fn crayon_leaves_gaps_inside_the_line() {
+        let mut canvas = canvas(60, 30);
+        canvas.draw_stroke(&brush_stroke(
+            Brush::Crayon,
+            &[(5.0, 15.0), (55.0, 15.0)],
+            10.0,
+        ));
+        // Down the middle, where the pen would cover every pixel
+        let row: Vec<_> = (10..50).map(|x| rgb_at(&canvas, x, 15)).collect();
+        let gaps = row.iter().filter(|&&c| c == (255, 255, 255)).count();
+        assert!(gaps > 0, "no gaps");
+        assert!(gaps < row.len() / 2, "{gaps} of {} are gaps", row.len());
+        // The wax itself is solid
+        assert!(row.contains(&(0, 0, 0)));
+    }
+
+    #[test]
+    fn natural_pencil_is_lighter_than_the_pen_and_grainy() {
+        let mut canvas = canvas(60, 30);
+        canvas.draw_stroke(&brush_stroke(
+            Brush::NaturalPencil,
+            &[(5.0, 15.0), (55.0, 15.0)],
+            6.0,
+        ));
+        let (marked, black) = coverage(&canvas);
+        assert!(marked > 0);
+        assert_eq!(black, 0);
+        // Many shades down the middle, not one even gray
+        let row: std::collections::BTreeSet<_> = (10..50).map(|x| rgb_at(&canvas, x, 15)).collect();
+        assert!(row.len() > 5, "{row:?}");
+        assert!(!row.contains(&(255, 255, 255)));
+    }
+
+    #[test]
+    fn grain_stays_put_as_the_stroke_grows() {
+        for brush in [Brush::Crayon, Brush::NaturalPencil] {
+            let mut short = canvas(100, 30);
+            short.draw_stroke(&brush_stroke(brush, &[(10.0, 15.0), (40.0, 15.0)], 8.0));
+            let mut long = canvas(100, 30);
+            long.draw_stroke(&brush_stroke(
+                brush,
+                &[(10.0, 15.0), (40.0, 15.0), (90.0, 15.0)],
+                8.0,
+            ));
+            for y in 0..30 {
+                for x in 0..36 {
+                    assert_eq!(
+                        rgb_at(&short, x, y),
+                        rgb_at(&long, x, y),
+                        "{brush:?} ({x}, {y})"
+                    );
+                }
             }
         }
     }

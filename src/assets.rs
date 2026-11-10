@@ -17,6 +17,8 @@ icon_assets!(
         Type,
         Pen,
         Pencil,
+        PencilLine,
+        Brush,
         Highlighter,
         SprayCan,
         PenTool,
