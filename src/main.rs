@@ -177,6 +177,9 @@ struct PaintApp {
     canvas_size: Size<Pixels>,
     /// The stroke being drawn, not yet burned into `canvas`.
     current_stroke: Option<Stroke>,
+    /// Index in `current_stroke` of the point a straight line runs from while
+    /// Shift is held.
+    straight_from: Option<usize>,
     /// `current_stroke` rendered as it will be burned in, to preview it.
     stroke_preview: Option<StrokeLayer>,
     /// Bumped whenever the stroke preview changes, to refresh its cached image.
@@ -360,6 +363,7 @@ impl PaintApp {
             redo_stack: Vec::new(),
             canvas_size: DEFAULT_CANVAS_SIZE,
             current_stroke: None,
+            straight_from: None,
             stroke_preview: None,
             stroke_preview_id: 0,
             stroke_cache: Rc::default(),
@@ -469,6 +473,7 @@ impl PaintApp {
             }
         };
         self.stroke_count += 1;
+        self.straight_from = None;
         self.current_stroke = Some(Stroke {
             points: vec![position],
             color,
@@ -810,7 +815,12 @@ impl PaintApp {
         }
         let position = self.to_canvas(event.position);
         if let Some(stroke) = &mut self.current_stroke {
-            stroke.points.push(position);
+            extend_stroke(
+                &mut stroke.points,
+                &mut self.straight_from,
+                position,
+                event.modifiers.shift,
+            );
             self.update_stroke_preview(cx);
         }
     }
@@ -1008,6 +1018,29 @@ fn remember_color(recent: &mut Vec<Hsla>, color: Hsla) {
     recent.truncate(MAX_RECENT_COLORS);
 }
 
+/// Adds `position` to a freehand stroke's `points`. While `straight` (Shift)
+/// is held, the stroke instead runs as one line from where it was pressed,
+/// snapped to a multiple of 45°; releasing it carries on freehand from the
+/// line's end.
+fn extend_stroke(
+    points: &mut Vec<Point<Pixels>>,
+    straight_from: &mut Option<usize>,
+    position: Point<Pixels>,
+    straight: bool,
+) {
+    if !straight {
+        *straight_from = None;
+        points.push(position);
+        return;
+    }
+    let Some(last) = points.len().checked_sub(1) else {
+        return;
+    };
+    let from = *straight_from.get_or_insert(last);
+    points.truncate(from + 1);
+    points.push(constrain(ShapeKind::Line, points[from], position));
+}
+
 /// Snaps a dragged shape so lines run at multiples of 45° and rectangles and
 /// ellipses come out square and circular, as Shift does in most paint apps.
 fn constrain(kind: ShapeKind, start: Point<Pixels>, end: Point<Pixels>) -> Point<Pixels> {
@@ -1100,8 +1133,61 @@ fn main() {
 #[cfg(test)]
 mod tests {
     // Not a glob: `gpui_kit::*` would bring in gpui's `test` macro in place of Rust's
-    use super::{MAX_RECENT_COLORS, SINGLE_KEY_CONTEXT, remember_color};
-    use gpui_kit::{Hsla, KeyBindingContextPredicate, KeyContext, rgb};
+    use super::{MAX_RECENT_COLORS, SINGLE_KEY_CONTEXT, extend_stroke, remember_color};
+    use gpui_kit::{Hsla, KeyBindingContextPredicate, KeyContext, Pixels, Point, point, px, rgb};
+
+    fn at(x: f32, y: f32) -> Point<Pixels> {
+        point(px(x), px(y))
+    }
+
+    #[test]
+    fn shift_keeps_the_stroke_one_straight_line() {
+        let (mut points, mut straight_from) = (vec![at(10.0, 10.0)], None);
+        for position in [at(30.0, 12.0), at(50.0, 14.0), at(70.0, 13.0)] {
+            extend_stroke(&mut points, &mut straight_from, position, true);
+        }
+        // A wobbly drag comes out as one horizontal line from the start
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0], at(10.0, 10.0));
+        assert!(
+            (points[1].y.as_f32() - 10.0).abs() < 0.001,
+            "{:?}",
+            points[1]
+        );
+        assert!(points[1].x.as_f32() > 69.0);
+    }
+
+    #[test]
+    fn shift_snaps_the_line_to_45_degrees() {
+        let (mut points, mut straight_from) = (vec![at(0.0, 0.0)], None);
+        extend_stroke(&mut points, &mut straight_from, at(40.0, 36.0), true);
+        let end = points[1];
+        assert!((end.x.as_f32() - end.y.as_f32()).abs() < 0.001, "{end:?}");
+    }
+
+    #[test]
+    fn releasing_shift_carries_on_freehand_from_the_line() {
+        let (mut points, mut straight_from) = (vec![at(0.0, 0.0)], None);
+        extend_stroke(&mut points, &mut straight_from, at(5.0, 3.0), false);
+        // The line starts where Shift was pressed, keeping the freehand part
+        extend_stroke(&mut points, &mut straight_from, at(5.0, 20.0), true);
+        extend_stroke(&mut points, &mut straight_from, at(6.0, 30.0), true);
+        assert_eq!(points.len(), 3);
+        assert_eq!(points[1], at(5.0, 3.0));
+        assert!(
+            (points[2].x.as_f32() - 5.0).abs() < 0.001,
+            "{:?}",
+            points[2]
+        );
+
+        extend_stroke(&mut points, &mut straight_from, at(20.0, 40.0), false);
+        assert_eq!(points.len(), 4);
+        assert_eq!(points[3], at(20.0, 40.0));
+        // Holding Shift again starts a new line from the latest point
+        extend_stroke(&mut points, &mut straight_from, at(40.0, 41.0), true);
+        assert_eq!(points.len(), 5);
+        assert_eq!(points[3], at(20.0, 40.0));
+    }
 
     #[test]
     fn single_key_shortcuts_are_off_while_typing() {
