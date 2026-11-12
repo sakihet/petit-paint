@@ -1874,11 +1874,11 @@ fn draw_nib(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Trans
 }
 
 /// A small deterministic random number generator (SplitMix64).
-struct Random(u64);
+pub(crate) struct Random(pub u64);
 
 impl Random {
     /// Returns a number in `0.0..1.0`.
-    fn next(&mut self) -> f32 {
+    pub fn next(&mut self) -> f32 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);

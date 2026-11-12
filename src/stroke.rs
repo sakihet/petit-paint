@@ -254,6 +254,96 @@ pub fn smooth(points: &[Point<Pixels>], closed: bool) -> Vec<Point<Pixels>> {
     curve
 }
 
+/// `points` moved a little to either side, up to about `amount` pixels, in
+/// gentle waves and small wobbles as a hand drawing them would, the same
+/// for the same `seed`. Points are added along long straight runs so they
+/// bend too. A `closed` line's waves meet up where it closes.
+pub fn roughen(
+    points: &[Point<Pixels>],
+    closed: bool,
+    amount: f32,
+    seed: u64,
+) -> Vec<Point<Pixels>> {
+    if points.len() < 2 || amount <= 0.0 {
+        return points.to_vec();
+    }
+    let xy = |p: &Point<Pixels>| (p.x.as_f32(), p.y.as_f32());
+    // Every few pixels, keeping the corners where they are
+    let step = (amount * 2.0).clamp(3.0, 10.0);
+    let mut dense = Vec::new();
+    let ends = if closed {
+        points.len()
+    } else {
+        points.len() - 1
+    };
+    for i in 0..ends {
+        let (a, b) = (xy(&points[i]), xy(&points[(i + 1) % points.len()]));
+        let length = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+        let parts = (length / step).ceil().max(1.0) as usize;
+        for part in 0..parts {
+            let t = part as f32 / parts as f32;
+            dense.push((a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t));
+        }
+    }
+    if !closed {
+        dense.push(xy(&points[points.len() - 1]));
+    }
+    let n = dense.len();
+    let mut along = vec![0.0f32; n];
+    for i in 1..n {
+        let (a, b) = (dense[i - 1], dense[i]);
+        along[i] = along[i - 1] + ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    }
+    let length = if closed {
+        let (a, b) = (dense[n - 1], dense[0]);
+        along[n - 1] + ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt()
+    } else {
+        along[n - 1]
+    };
+    // Waves of a few lengths at random phases; a closed line has a whole
+    // number of each, so they meet where it closes
+    let mut random = crate::canvas::Random(seed ^ 0x5bd1_e995_2f6b_8c4d);
+    let waves: Vec<(f32, f32, f32)> = [(80.0, 0.6), (30.0, 0.3), (12.0, 0.15)]
+        .iter()
+        .map(|&(wavelength, size)| {
+            let cycles = length / wavelength;
+            let cycles = if closed {
+                cycles.round().max(1.0)
+            } else {
+                cycles
+            };
+            let phase = random.next() * std::f32::consts::TAU;
+            (
+                cycles * std::f32::consts::TAU / length.max(1.0),
+                phase,
+                size,
+            )
+        })
+        .collect();
+    let at = |i: isize| {
+        if closed {
+            dense[i.rem_euclid(n as isize) as usize]
+        } else {
+            dense[i.clamp(0, n as isize - 1) as usize]
+        }
+    };
+    (0..n)
+        .map(|i| {
+            let (before, after) = (at(i as isize - 1), at(i as isize + 1));
+            let (dx, dy) = (after.0 - before.0, after.1 - before.1);
+            let norm = (dx * dx + dy * dy).sqrt().max(1e-6);
+            let (nx, ny) = (-dy / norm, dx / norm);
+            let shift: f32 = waves
+                .iter()
+                .map(|&(frequency, phase, size)| size * (along[i] * frequency + phase).sin())
+                .sum::<f32>()
+                * amount;
+            let (x, y) = dense[i];
+            point(px(x + nx * shift), px(y + ny * shift))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,5 +502,37 @@ mod tests {
             filled(),
         );
         assert!(whole.points.iter().any(|p| p.x < px(1.0)));
+    }
+
+    #[test]
+    fn roughening_keeps_corners_near_and_closes_up() {
+        let square = [
+            at(0.0, 0.0),
+            at(100.0, 0.0),
+            at(100.0, 100.0),
+            at(0.0, 100.0),
+        ];
+        let rough = roughen(&square, true, 3.0, 7);
+        assert!(rough.len() > 40, "points are added along the sides");
+        assert_eq!(
+            rough,
+            roughen(&square, true, 3.0, 7),
+            "the same for the same seed"
+        );
+        assert_ne!(rough, roughen(&square, true, 3.0, 8));
+        // No point strays further than about the amount
+        for p in &rough {
+            let (x, y) = (p.x.as_f32(), p.y.as_f32());
+            let off = x
+                .abs()
+                .min((x - 100.0).abs())
+                .min(y.abs())
+                .min((y - 100.0).abs());
+            assert!(off <= 3.2, "({x}, {y})");
+        }
+        let line = [at(0.0, 0.0), at(100.0, 0.0)];
+        let rough = roughen(&line, false, 2.0, 1);
+        assert_eq!(rough.first().unwrap().x, px(0.0));
+        assert_eq!(rough.last().unwrap().x, px(100.0));
     }
 }

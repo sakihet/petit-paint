@@ -16,7 +16,7 @@ use crate::canvas::{
 };
 use crate::filter::Filter;
 use crate::pattern::{PATTERNS, Pattern};
-use crate::stroke::{ArcKind, Gradient, Stroke, smooth};
+use crate::stroke::{ArcKind, Gradient, Stroke, roughen, smooth};
 use crate::text::{FontChoice, TextRenderer};
 use crate::tool::ShapeKind;
 use crate::{
@@ -198,16 +198,37 @@ struct Placement {
     /// rectangle as [x, y] pairs, or a mask, which can be a shape, the region around a
     /// pixel, or one of draw's named masks.
     clip: Option<ClipSpec>,
+    /// Move the line, or the shape's outline, up to about this many pixels to either
+    /// side in gentle waves, as if drawn by hand, from 0 to 16.
+    roughen: Option<f32>,
 }
 
 impl Placement {
-    fn apply(&self, strokes: &mut [Stroke], masks: &Masks) -> Result<()> {
+    /// Places `strokes`, which are one stroke or shape, the same `seed`
+    /// roughening each alike.
+    fn apply(&self, strokes: &mut [Stroke], seed: u64, masks: &Masks) -> Result<()> {
+        if let Some(amount) = self.roughen
+            && !(0.0..=16.0).contains(&amount)
+        {
+            bail!("roughen must be between 0 and 16, not {amount}");
+        }
         let (clip, mask) = match &self.clip {
             None => (None, None),
             Some(ClipSpec::Rectangle(rect)) => (Some(to_rect(*rect)?), None),
             Some(ClipSpec::Mask(mask)) => (None, Some(mask.build(masks)?)),
         };
         for stroke in strokes {
+            if let Some(amount) = self.roughen {
+                let rough = roughen(&stroke.points, stroke.closed, amount, seed);
+                // Pressure belongs to the points as they were
+                let pressure = Stroke {
+                    points: stroke.points.clone(),
+                    pressure: std::mem::take(&mut stroke.pressure),
+                    ..Default::default()
+                };
+                stroke.pressure = resample_pressure(&pressure, &rough);
+                stroke.points = rough;
+            }
             stroke.blend = self.blend.map_or(BlendMode::SourceOver, BlendMode::from);
             stroke.clip = clip;
             stroke.mask = mask.clone();
@@ -553,6 +574,14 @@ fn pressure_along(
         .collect()
 }
 
+/// `stroke`'s pressure at each of `points`, a reshaped copy of its line.
+fn resample_pressure(stroke: &Stroke, points: &[Point<Pixels>]) -> Vec<f32> {
+    if stroke.pressure.is_empty() {
+        return Vec::new();
+    }
+    pressure_along(&stroke.points, points, Some(&stroke.pressure), None)
+}
+
 impl StrokeSpec {
     fn build(&self, seed: u64, masks: &Masks) -> Result<Stroke> {
         if self.points.is_empty() {
@@ -588,7 +617,7 @@ impl StrokeSpec {
             ..Default::default()
         };
         self.placement
-            .apply(std::slice::from_mut(&mut stroke), masks)?;
+            .apply(std::slice::from_mut(&mut stroke), seed, masks)?;
         Ok(stroke)
     }
 }
@@ -817,7 +846,7 @@ impl ShapeSpec {
     }
 
     /// The fill, if any, then the outline, if any.
-    fn build(&self, masks: &Masks) -> Result<Vec<Stroke>> {
+    fn build(&self, seed: u64, masks: &Masks) -> Result<Vec<Stroke>> {
         let name = self.shape;
         let geometry = self.geometry();
         geometry.check()?;
@@ -852,7 +881,7 @@ impl ShapeSpec {
                 ..Default::default()
             }));
         }
-        self.placement.apply(&mut strokes, masks)?;
+        self.placement.apply(&mut strokes, seed, masks)?;
         Ok(strokes)
     }
 }
@@ -1234,12 +1263,13 @@ impl PaintServer {
     ) -> Result<String, String> {
         let mut images = self.images();
         let image = images.get_mut(params.image).map_err(message)?;
+        let seed = image.next_seed();
         let masks = Masks {
             canvas: &image.canvas,
             named: &BTreeMap::new(),
             naming: false,
         };
-        let strokes = params.shape.build(&masks).map_err(message)?;
+        let strokes = params.shape.build(seed, &masks).map_err(message)?;
         image.draw(&strokes).map_err(message)?;
         Ok(format!(
             "Drew {} on image {}",
@@ -1281,7 +1311,7 @@ impl PaintServer {
             };
             let built = match item {
                 DrawItem::Stroke(stroke) => stroke.build(seed, &masks).map(|s| vec![s]),
-                DrawItem::Shape(shape) => shape.build(&masks),
+                DrawItem::Shape(shape) => shape.build(seed, &masks),
             }
             .and_then(|built| {
                 if !built.iter().any(|stroke| image.canvas.reaches(stroke)) {
@@ -1708,6 +1738,7 @@ mod tests {
         Placement {
             blend: None,
             clip: None,
+            roughen: None,
         }
     }
 
@@ -2191,6 +2222,7 @@ mod tests {
             placement: Placement {
                 blend: Some(BlendName::Add),
                 clip: Some(ClipSpec::Rectangle([[0, 0], [100, 50]])),
+                ..placement()
             },
             ..shape(ShapeName::Ellipse, &[[20.0, 20.0], [80.0, 80.0]])
         };
@@ -2204,6 +2236,7 @@ mod tests {
             placement: Placement {
                 blend: None,
                 clip: Some(ClipSpec::Rectangle([[0, 60], [10, 70]])),
+                ..placement()
             },
             ..shape(ShapeName::Ellipse, &[[20.0, 20.0], [80.0, 40.0]])
         };
@@ -2443,6 +2476,38 @@ mod tests {
                 .to_string()
                 .contains("taper is a number of pixels or [start, end]"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn roughens_outlines_and_lines() {
+        let server = server();
+        let rough = rmcp::serde_json::json!([
+            {"type": "shape", "shape": "rectangle", "points": [[20, 20], [80, 80]], "fill": "#000000",
+             "outline": "#000000", "width": 2, "roughen": 4},
+        ]);
+        draw(&server, rough).unwrap();
+        // The top edge wanders above and below where it was
+        let top = |x: u32| (0..50).find(|&y| rgb_at(&server, x, y).0 < 128).unwrap();
+        let tops: Vec<u32> = (30..70).map(top).collect();
+        let (highest, lowest) = (*tops.iter().min().unwrap(), *tops.iter().max().unwrap());
+        assert!(
+            highest < 18 && lowest > 19,
+            "the top edge runs from {highest} to {lowest}"
+        );
+        assert!(lowest - highest <= 10, "{highest} to {lowest}");
+        assert_eq!(rgb_at(&server, 50, 50), (0, 0, 0));
+
+        let error = draw(
+            &server,
+            rmcp::serde_json::json!([
+                {"type": "stroke", "points": [[10, 10], [90, 90]], "color": "#000000", "roughen": 20},
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "item 1: roughen must be between 0 and 16, not 20; nothing was drawn"
         );
     }
 
