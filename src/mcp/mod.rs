@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::canvas::{Brush, DEFAULT_FILL_TOLERANCE, Fill, Orientation, PixelRect};
 use crate::pattern::{PATTERNS, Pattern};
-use crate::stroke::{ArcKind, Stroke, smooth};
+use crate::stroke::{ArcKind, Gradient, Stroke, smooth};
 use crate::text::{FontChoice, TextRenderer};
 use crate::tool::ShapeKind;
 use crate::{
@@ -226,6 +226,104 @@ impl StrokeSpec {
     }
 }
 
+/// What fills a shape: a color, or a gradient.
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[schemars(crate = "rmcp::schemars")]
+enum FillSpec {
+    /// A color as #rrggbb or #rrggbbaa.
+    Color(String),
+    Gradient(GradientSpec),
+}
+
+// By hand, so a wrong gradient is explained rather than reported as matching
+// neither a color nor a gradient
+impl<'de> Deserialize<'de> for FillSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match rmcp::serde_json::Value::deserialize(deserializer)? {
+            rmcp::serde_json::Value::String(color) => Ok(FillSpec::Color(color)),
+            other => GradientSpec::deserialize(other)
+                .map(FillSpec::Gradient)
+                .map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+/// Colors that change across a fill. Each stop is [position, color], with
+/// positions from 0 to 1 in order; beyond the ends, the end colors carry on.
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+enum GradientSpec {
+    /// Along the line from `from` to `to`, as {"linear": {"from": [x, y], "to": [x, y],
+    /// "stops": [[0, "#rrggbb"], [1, "#rrggbb"]]}}.
+    Linear {
+        from: [f32; 2],
+        to: [f32; 2],
+        stops: Vec<(f32, String)>,
+    },
+    /// Out from `center` to `radius` away, as {"radial": {"center": [x, y], "radius": r,
+    /// "stops": [[0, "#rrggbb"], [1, "#rrggbb00"]]}}. The fill ends where the shape
+    /// does, so for a glow that fades out, make the shape reach the radius.
+    Radial {
+        center: [f32; 2],
+        radius: f32,
+        stops: Vec<(f32, String)>,
+    },
+}
+
+impl FillSpec {
+    /// The fill's color, and the gradient that takes its place, if any.
+    fn parse(&self) -> Result<(Hsla, Option<Gradient>)> {
+        let gradient = match self {
+            FillSpec::Color(color) => return Ok((parse_color(color)?, None)),
+            FillSpec::Gradient(gradient) => gradient,
+        };
+        let stops = match gradient {
+            GradientSpec::Linear { stops, .. } | GradientSpec::Radial { stops, .. } => stops,
+        };
+        if stops.len() < 2 {
+            bail!("a gradient takes two or more stops");
+        }
+        let mut last = 0.0;
+        let stops = stops
+            .iter()
+            .map(|(position, color)| {
+                if !(last..=1.0).contains(position) {
+                    bail!("stop positions run from 0 to 1 in order, so {position} cannot follow {last}");
+                }
+                last = *position;
+                Ok((*position, parse_color(color)?))
+            })
+            .collect::<Result<_>>()?;
+        let at = |[x, y]: [f32; 2]| point(px(x), px(y));
+        let gradient = match *gradient {
+            GradientSpec::Linear { from, to, .. } => {
+                if from == to {
+                    bail!("a linear gradient's from and to must differ");
+                }
+                Gradient::Linear {
+                    from: at(from),
+                    to: at(to),
+                    stops,
+                }
+            }
+            GradientSpec::Radial { center, radius, .. } => {
+                if radius <= 0.0 {
+                    bail!("a radial gradient's radius must be more than 0");
+                }
+                Gradient::Radial {
+                    center: at(center),
+                    radius,
+                    stops,
+                }
+            }
+        };
+        // Opaque, as the gradient's colors carry their own transparency
+        Ok((gpui_kit::black(), Some(gradient)))
+    }
+}
+
 /// A line, rectangle, ellipse or polygon with an outline, a fill or both.
 #[derive(Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -237,9 +335,9 @@ struct ShapeSpec {
     points: Vec<[f32; 2]>,
     /// The outline's color as #rrggbb or #rrggbbaa. No outline when left out.
     outline: Option<String>,
-    /// The color to fill the inside with, as #rrggbb or #rrggbbaa. Not filled when
-    /// left out. A line has no inside.
-    fill: Option<String>,
+    /// What to fill the inside with: a color as #rrggbb or #rrggbbaa, or a linear or
+    /// radial gradient. Not filled when left out. A line or arc has no inside.
+    fill: Option<FillSpec>,
     /// The outline's width in pixels, from 1 to 32. 4 when left out.
     width: Option<f32>,
     /// For a polygon: a smooth curve through its corners instead of straight sides.
@@ -305,7 +403,7 @@ impl ShapeSpec {
             );
         }
         let outline = self.outline.as_deref().map(parse_color).transpose()?;
-        let fill = self.fill.as_deref().map(parse_color).transpose()?;
+        let fill = self.fill.as_ref().map(FillSpec::parse).transpose()?;
         let width = parse_width(self.width)?;
 
         let shape = |base: Stroke| match (name, angles) {
@@ -331,9 +429,10 @@ impl ShapeSpec {
             _ => Stroke::shape(ShapeKind::Ellipse, points[0], points[1], base),
         };
         let mut strokes = Vec::new();
-        if let Some(color) = fill {
+        if let Some((color, gradient)) = fill {
             strokes.push(shape(Stroke {
                 color,
+                gradient,
                 width: px(0.0),
                 filled: true,
                 ..Default::default()
@@ -1017,6 +1116,12 @@ fn message(error: anyhow::Error) -> String {
 mod tests {
     use super::*;
 
+    impl From<&str> for FillSpec {
+        fn from(color: &str) -> Self {
+            FillSpec::Color(color.into())
+        }
+    }
+
     /// A server with one white 100×100 image, id 1.
     fn server() -> PaintServer {
         let server = PaintServer::default();
@@ -1497,7 +1602,7 @@ mod tests {
                 ..shape(ShapeName::Ellipse, &box_)
             },
             ShapeSpec {
-                fill: black(),
+                fill: Some("#000000".into()),
                 start_angle: Some(0.0),
                 end_angle: Some(90.0),
                 ..shape(ShapeName::Arc, &box_)
@@ -1575,6 +1680,76 @@ mod tests {
         assert_eq!(rgb_at(&server, 50, 40), (0, 0, 0));
         assert_eq!(rgb_at(&server, 50, 60), (255, 255, 255));
         assert_eq!(rgb_at(&server, 10, 10), (128, 128, 128));
+    }
+
+    #[test]
+    fn fills_shapes_with_gradients() {
+        let server = server();
+        let drew = draw(
+            &server,
+            rmcp::serde_json::json!([
+                {"type": "shape", "shape": "rectangle", "points": [[0, 0], [100, 100]],
+                 "fill": {"linear": {"from": [0, 0], "to": [0, 100],
+                                     "stops": [[0, "#000000"], [1, "#0000ff"]]}}},
+                {"type": "shape", "shape": "ellipse", "points": [[20, 20], [80, 80]],
+                 "fill": {"radial": {"center": [50, 50], "radius": 30,
+                                     "stops": [[0, "#ffff00"], [1, "#ffff0000"]]}}},
+            ]),
+        );
+        drew.unwrap();
+        let (top, bottom) = (rgb_at(&server, 5, 1), rgb_at(&server, 5, 98));
+        assert!(top.2 < 10 && bottom.2 > 245, "{top:?} {bottom:?}");
+        let center = rgb_at(&server, 50, 50);
+        assert!(center.0 > 245 && center.1 > 245, "{center:?}");
+    }
+
+    #[test]
+    fn explains_wrong_gradients() {
+        let server = server();
+        let wrong = |fill: rmcp::serde_json::Value| {
+            let item = rmcp::serde_json::json!({
+                "type": "shape", "shape": "rectangle", "points": [[0, 0], [10, 10]], "fill": fill,
+            });
+            let params = rmcp::serde_json::json!({"image": 1, "items": [item]});
+            match rmcp::serde_json::from_value::<DrawParams>(params) {
+                Err(error) => error.to_string(),
+                Ok(params) => server.draw(Parameters(params)).unwrap_err(),
+            }
+        };
+        let stops = rmcp::serde_json::json!([[0, "#000000"], [1, "#ffffff"]]);
+        let cases = [
+            (rmcp::serde_json::json!({"conic": {}}), "conic"),
+            (
+                rmcp::serde_json::json!({"linear": {"from": [0, 0], "stops": stops}}),
+                "to",
+            ),
+            (
+                rmcp::serde_json::json!({"linear": {"from": [0, 0], "to": [0, 0], "stops": stops}}),
+                "differ",
+            ),
+            (
+                rmcp::serde_json::json!({"radial": {"center": [0, 0], "radius": 0, "stops": stops}}),
+                "radius",
+            ),
+            (
+                rmcp::serde_json::json!({"linear": {"from": [0, 0], "to": [9, 0], "stops": [[0, "#000000"]]}}),
+                "two or more",
+            ),
+            (
+                rmcp::serde_json::json!({"linear": {"from": [0, 0], "to": [9, 0],
+                                                    "stops": [[0.5, "#000000"], [0.2, "#ffffff"]]}}),
+                "in order",
+            ),
+            (
+                rmcp::serde_json::json!({"linear": {"from": [0, 0], "to": [9, 0],
+                                                    "stops": [[0, "black"], [1, "#ffffff"]]}}),
+                "not a color",
+            ),
+        ];
+        for (fill, expected) in cases {
+            let error = wrong(fill);
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
     }
 
     #[test]
@@ -1680,7 +1855,7 @@ mod tests {
             },
             shape(ShapeName::Rectangle, &[[0.0, 0.0], [5.0, 5.0]]),
             ShapeSpec {
-                fill: black(),
+                fill: Some("#000000".into()),
                 ..shape(ShapeName::Line, &[[0.0, 0.0], [5.0, 5.0]])
             },
             ShapeSpec {

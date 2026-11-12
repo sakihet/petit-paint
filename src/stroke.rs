@@ -27,6 +27,26 @@ pub struct Stroke {
     pub blend: BlendMode,
     /// Keeps the stroke inside this part of the canvas.
     pub clip: Option<PixelRect>,
+    /// Fills the inside with these colors in place of `color`.
+    pub gradient: Option<Gradient>,
+}
+
+/// Colors that change across a fill. Each stop is a position from 0 to 1
+/// and the color there; beyond the ends, the end colors carry on.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Gradient {
+    /// Along the line from `from` to `to`.
+    Linear {
+        from: Point<Pixels>,
+        to: Point<Pixels>,
+        stops: Vec<(f32, Hsla)>,
+    },
+    /// Out from `center` to `radius` away.
+    Radial {
+        center: Point<Pixels>,
+        radius: f32,
+        stops: Vec<(f32, Hsla)>,
+    },
 }
 
 impl Stroke {

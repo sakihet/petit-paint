@@ -7,7 +7,7 @@ use tiny_skia::{
 };
 
 use crate::pattern::Pattern;
-use crate::stroke::Stroke;
+use crate::stroke::{Gradient, Stroke};
 use crate::text::{FontChoice, TextRenderer};
 
 /// What the fill tool paints: color 1 where the pattern is set and color 2
@@ -1114,7 +1114,11 @@ fn draw_line(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Tran
         return;
     };
     if stroke.filled {
-        pixels.fill_path(&path, &paint, FillRule::Winding, transform, None);
+        let mut fill = paint.clone();
+        if let Some(shader) = stroke.gradient.as_ref().and_then(gradient_shader) {
+            fill.shader = shader;
+        }
+        pixels.fill_path(&path, &fill, FillRule::Winding, transform, None);
     }
     // A filled shape with no outline
     if stroke.width <= px(0.0) {
@@ -1286,6 +1290,39 @@ impl Random {
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^= z >> 31;
         (z >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
+/// A shader painting `gradient`, in canvas coordinates.
+fn gradient_shader(gradient: &Gradient) -> Option<tiny_skia::Shader<'static>> {
+    let stops = |stops: &[(f32, Hsla)]| {
+        stops
+            .iter()
+            .map(|&(position, color)| tiny_skia::GradientStop::new(position, to_skia_color(color)))
+            .collect()
+    };
+    let at = |p: Point<Pixels>| tiny_skia::Point::from_xy(p.x.as_f32(), p.y.as_f32());
+    match gradient {
+        Gradient::Linear { from, to, stops: s } => tiny_skia::LinearGradient::new(
+            at(*from),
+            at(*to),
+            stops(s),
+            tiny_skia::SpreadMode::Pad,
+            Transform::identity(),
+        ),
+        Gradient::Radial {
+            center,
+            radius,
+            stops: s,
+        } => tiny_skia::RadialGradient::new(
+            at(*center),
+            0.0,
+            at(*center),
+            *radius,
+            stops(s),
+            tiny_skia::SpreadMode::Pad,
+            Transform::identity(),
+        ),
     }
 }
 
@@ -1476,6 +1513,48 @@ mod tests {
         };
         assert!(!canvas.reaches(&elsewhere));
         assert!(canvas.draw_stroke(&elsewhere).is_none());
+    }
+
+    #[test]
+    fn fills_with_gradients() {
+        let mut canvas = canvas(100, 100);
+        let square = |gradient| Stroke {
+            width: px(0.0),
+            filled: true,
+            closed: true,
+            gradient: Some(gradient),
+            ..stroke(
+                &[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)],
+                0x000000,
+                0.0,
+            )
+        };
+        let (red, blue) = (rgb(0xff0000).into(), rgb(0x0000ff).into());
+        canvas.draw_stroke(&square(Gradient::Linear {
+            from: point(px(0.0), px(0.0)),
+            to: point(px(100.0), px(0.0)),
+            stops: vec![(0.0, red), (1.0, blue)],
+        }));
+        let (left, middle, right) = (
+            rgb_at(&canvas, 1, 50),
+            rgb_at(&canvas, 50, 50),
+            rgb_at(&canvas, 98, 50),
+        );
+        assert!(left.0 > 240 && left.2 < 15, "{left:?}");
+        assert!(right.2 > 240 && right.0 < 15, "{right:?}");
+        assert!(
+            middle.0.abs_diff(127) < 10 && middle.2.abs_diff(127) < 10,
+            "{middle:?}"
+        );
+
+        canvas.draw_stroke(&square(Gradient::Radial {
+            center: point(px(50.0), px(50.0)),
+            radius: 50.0,
+            stops: vec![(0.0, red), (1.0, gpui_kit::transparent_black())],
+        }));
+        assert!(rgb_at(&canvas, 50, 50).0 > 240);
+        // Past the radius the last stop, transparent, leaves the linear fill
+        assert_eq!(rgb_at(&canvas, 98, 98), right);
     }
 
     #[test]
