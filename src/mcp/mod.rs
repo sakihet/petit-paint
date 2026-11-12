@@ -908,6 +908,202 @@ impl ShapeSpec {
     }
 }
 
+/// Strokes laid across an area at random, for shading and texture.
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct HatchSpec {
+    /// Colors as #rrggbb or #rrggbbaa; each stroke takes one of them at random.
+    colors: Vec<String>,
+    /// The direction the strokes run, in degrees. 0 points right, and angles run
+    /// clockwise, so 90 points down. 45 when left out.
+    angle: Option<f32>,
+    /// How far each stroke's direction may differ from angle, either way, in degrees.
+    /// 10 when left out.
+    spread: Option<f32>,
+    /// The shortest and longest strokes, in pixels, as [shortest, longest]. [20, 40]
+    /// when left out.
+    length: Option<[f32; 2]>,
+    /// The thinnest and thickest strokes, from 1 to 32 pixels, as [thinnest,
+    /// thickest]. [3, 6] when left out.
+    width: Option<[f32; 2]>,
+    /// How many strokes, from 1 to 5000. Enough to cover the area about once when left
+    /// out.
+    count: Option<u32>,
+    /// The brush to draw with. The pen when left out.
+    brush: Option<BrushName>,
+    /// Where the light comes from, as [x, y]: strokes gather on the side of the area
+    /// away from it, shading it. Spread evenly when left out.
+    light: Option<[f32; 2]>,
+    /// Thin each stroke toward its ends, as draw_stroke's taper does.
+    taper: Option<TaperSpec>,
+    /// Fixes where the strokes go, so the same seed draws the same strokes. Different
+    /// each time when left out.
+    seed: Option<u64>,
+    /// The area to lay strokes in, which they are kept inside: two opposite corners of a
+    /// rectangle as [x, y] pairs, or a mask. Needed.
+    #[serde(flatten)]
+    placement: Placement,
+}
+
+impl HatchSpec {
+    fn build(&self, seed: u64, masks: &Masks) -> Result<Vec<Stroke>> {
+        if self.colors.is_empty() {
+            bail!("give one or more colors");
+        }
+        let colors = self
+            .colors
+            .iter()
+            .map(|color| parse_color(color))
+            .collect::<Result<Vec<_>>>()?;
+        let range = |name: &str, given: Option<[f32; 2]>, default: [f32; 2], max: f32| {
+            let [low, high] = given.unwrap_or(default);
+            let min = if name == "width" { MIN_WIDTH } else { 1.0 };
+            if low > high || low < min || high > max {
+                bail!(
+                    "{name} must be [shortest, longest] from {min} to {max}, not [{low}, {high}]"
+                );
+            }
+            Ok([low, high])
+        };
+        let lengths = range("length", self.length, [20.0, 40.0], 500.0)?;
+        let widths = range("width", self.width, [3.0, 6.0], MAX_WIDTH)?;
+        let spread = self.spread.unwrap_or(10.0);
+        if !(0.0..=180.0).contains(&spread) {
+            bail!("spread must be between 0 and 180, not {spread}");
+        }
+        if self.count.is_some_and(|count| !(1..=5000).contains(&count)) {
+            bail!("count must be between 1 and 5000");
+        }
+        let taper = self.taper.as_ref().map(TaperSpec::ends).transpose()?;
+        let brush = self.brush.map_or(Brush::Pen, Brush::from);
+        if brush == Brush::Smudge {
+            bail!("hatch lays down color, so it cannot use the smudge brush");
+        }
+
+        // Where strokes may go: inside the clip, on the image
+        let size = masks.canvas.pixels();
+        let (width, height) = (size.width() as f32, size.height() as f32);
+        let (inside, (left, top, right, bottom)): (Box<dyn Fn(f32, f32) -> bool>, _) =
+            match &self.placement.clip {
+                None => bail!("hatch takes a clip: the rectangle or mask to lay strokes in"),
+                Some(ClipSpec::Rectangle(rect)) => {
+                    let rect = to_rect(*rect)?;
+                    let area = (
+                        (rect.x as f32).max(0.0),
+                        (rect.y as f32).max(0.0),
+                        ((rect.x + rect.width as i32) as f32).min(width),
+                        ((rect.y + rect.height as i32) as f32).min(height),
+                    );
+                    (Box::new(|_, _| true), area)
+                }
+                Some(ClipSpec::Mask(spec)) => {
+                    let mask = spec.build(masks)?;
+                    let area = mask.limit((0.0, 0.0, width, height));
+                    let covers = move |x: f32, y: f32| mask.at(x as i32, y as i32) >= 128;
+                    (Box::new(covers), area)
+                }
+            };
+        if right <= left || bottom <= top {
+            bail!(
+                "the area lies entirely outside the {}×{} image",
+                size.width(),
+                size.height()
+            );
+        }
+        let mut random = crate::canvas::Random(self.seed.unwrap_or(seed));
+        let mut anywhere = || {
+            (
+                left + random.next() * (right - left),
+                top + random.next() * (bottom - top),
+            )
+        };
+        let covered = (0..400).filter(|_| {
+            let (x, y) = anywhere();
+            inside(x, y)
+        });
+        let share = covered.count() as f32 / 400.0;
+        if share == 0.0 {
+            bail!("the area to lay strokes in is empty");
+        }
+        let count = self.count.unwrap_or_else(|| {
+            let area = (right - left) * (bottom - top) * share;
+            let stroke = (lengths[0] + lengths[1]) / 2.0 * (widths[0] + widths[1]) / 2.0;
+            (area / stroke * 1.2).ceil().clamp(1.0, 5000.0) as u32
+        });
+        // How dark each place is: 0 on the side facing the light, 1 away from it
+        let center = ((left + right) / 2.0, (top + bottom) / 2.0);
+        let shade: Box<dyn Fn(f32, f32) -> f32> = match self.light {
+            None => Box::new(|_, _| 1.0),
+            Some([lx, ly]) => {
+                let (dx, dy) = (center.0 - lx, center.1 - ly);
+                let norm = (dx * dx + dy * dy).sqrt().max(1e-6);
+                let (dx, dy) = (dx / norm, dy / norm);
+                let reach = ((right - left) * dx.abs() + (bottom - top) * dy.abs()) / 2.0;
+                Box::new(move |x, y| {
+                    let along = (x - center.0) * dx + (y - center.1) * dy;
+                    (0.5 + along / (2.0 * reach.max(1.0))).clamp(0.0, 1.0)
+                })
+            }
+        };
+
+        let between = |random: &mut crate::canvas::Random, [low, high]: [f32; 2]| {
+            low + random.next() * (high - low)
+        };
+        let base = self.angle.unwrap_or(45.0);
+        let mut strokes = Vec::new();
+        let mut tries = 0;
+        while strokes.len() < count as usize && tries < count * 50 {
+            tries += 1;
+            let (x, y) = (
+                left + random.next() * (right - left),
+                top + random.next() * (bottom - top),
+            );
+            if !inside(x, y) || random.next() > 0.1 + 0.9 * shade(x, y) {
+                continue;
+            }
+            let angle = (base + (random.next() * 2.0 - 1.0) * spread).to_radians();
+            let (dx, dy) = (angle.cos(), angle.sin());
+            let half = between(&mut random, lengths) / 2.0;
+            // A slight bend, as a hand's stroke has
+            let bend = (random.next() - 0.5) * half * 0.2;
+            let original = to_points(&[
+                [x - dx * half, y - dy * half],
+                [x - dy * bend, y + dx * bend],
+                [x + dx * half, y + dy * half],
+            ]);
+            let points = smooth(&original, false);
+            let pressure = pressure_along(&original, &points, None, taper);
+            let color = colors[(random.next() * colors.len() as f32) as usize % colors.len()];
+            strokes.push(Stroke {
+                points,
+                pressure,
+                color,
+                width: px(between(&mut random, widths)),
+                brush,
+                ..Default::default()
+            });
+        }
+        if strokes.is_empty() {
+            bail!("no strokes fit in the area");
+        }
+        self.placement.apply(&mut strokes, seed, masks)?;
+        // Each stroke its own bristles and spray
+        for stroke in &mut strokes {
+            stroke.seed = (random.next().to_bits() as u64) << 20 ^ seed;
+        }
+        Ok(strokes)
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct HatchParams {
+    /// The image's id.
+    image: u32,
+    #[serde(flatten)]
+    hatch: HatchSpec,
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct DrawStrokeParams {
@@ -926,14 +1122,15 @@ struct DrawShapeParams {
     shape: ShapeSpec,
 }
 
-/// One thing for draw to draw: a stroke as draw_stroke takes it, or a shape
-/// as draw_shape takes it.
+/// One thing for draw to draw: a stroke as draw_stroke takes it, a shape
+/// as draw_shape takes it, or strokes as hatch lays them.
 #[derive(Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[schemars(crate = "rmcp::schemars")]
 enum DrawItem {
     Stroke(StrokeSpec),
     Shape(ShapeSpec),
+    Hatch(HatchSpec),
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -942,8 +1139,8 @@ struct DrawParams {
     /// The image's id.
     image: u32,
     /// What to draw, in order, later items over earlier ones. Each is
-    /// {"type": "stroke", ...} with draw_stroke's arguments or {"type": "shape", ...}
-    /// with draw_shape's, without the image.
+    /// {"type": "stroke", ...} with draw_stroke's arguments, {"type": "shape", ...}
+    /// with draw_shape's or {"type": "hatch", ...} with hatch's, without the image.
     items: Vec<DrawItem>,
     /// Masks by name, which items use as "clip": {"mask": "name"}, so one outline
     /// serves many items. They are made from the image as it is before drawing.
@@ -1334,6 +1531,7 @@ impl PaintServer {
             let built = match item {
                 DrawItem::Stroke(stroke) => stroke.build(seed, &masks).map(|s| vec![s]),
                 DrawItem::Shape(shape) => shape.build(seed, &masks),
+                DrawItem::Hatch(hatch) => hatch.build(seed, &masks),
             }
             .and_then(|built| {
                 if !built.iter().any(|stroke| image.canvas.reaches(stroke)) {
@@ -1352,6 +1550,29 @@ impl PaintServer {
         let count = params.items.len();
         let items = if count == 1 { "item" } else { "items" };
         Ok(format!("Drew {count} {items} on image {}", params.image))
+    }
+
+    #[tool(
+        description = "Lay many short strokes at random across a rectangle or mask, as one \
+        undo step: hatching, grass, fur, or brushwork on a wall. With light, they gather on \
+        the side away from it, shading with strokes instead of a gradient."
+    )]
+    fn hatch(&self, Parameters(params): Parameters<HatchParams>) -> Result<String, String> {
+        let mut images = self.images();
+        let image = images.get_mut(params.image).map_err(message)?;
+        let seed = image.next_seed();
+        let masks = Masks {
+            canvas: &image.canvas,
+            named: &BTreeMap::new(),
+            naming: false,
+        };
+        let strokes = params.hatch.build(seed, &masks).map_err(message)?;
+        image.draw(&strokes).map_err(message)?;
+        Ok(format!(
+            "Laid {} strokes on image {}",
+            strokes.len(),
+            params.image
+        ))
     }
 
     #[tool(
@@ -2597,6 +2818,100 @@ mod tests {
                 draw(&server, rmcp::serde_json::json!([item])).unwrap_err(),
                 error
             );
+        }
+    }
+
+    fn hatch(server: &PaintServer, params: rmcp::serde_json::Value) -> Result<String, String> {
+        let mut params = params;
+        params["image"] = 1.into();
+        server.hatch(Parameters(rmcp::serde_json::from_value(params).unwrap()))
+    }
+
+    /// How many of the pixels from (`x0`, `y0`) to (`x1`, `y1`) are not white.
+    fn painted(server: &PaintServer, (x0, y0): (u32, u32), (x1, y1): (u32, u32)) -> usize {
+        (y0..y1)
+            .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+            .filter(|&(x, y)| rgb_at(server, x, y) != (255, 255, 255))
+            .count()
+    }
+
+    #[test]
+    fn hatches_inside_the_clip_the_same_for_the_same_seed() {
+        let params = rmcp::serde_json::json!({
+            "colors": ["#000000", "#404040"], "clip": [[20, 20], [80, 80]], "seed": 3,
+        });
+        let first = server();
+        let laid = hatch(&first, params.clone()).unwrap();
+        assert!(laid.starts_with("Laid "), "{laid}");
+        assert!(painted(&first, (20, 20), (80, 80)) > 1800);
+        assert_eq!(painted(&first, (0, 0), (100, 19)), 0);
+        assert_eq!(painted(&first, (81, 0), (100, 100)), 0);
+        let second = server();
+        hatch(&second, params).unwrap();
+        let pixels = |server: &PaintServer| server.images().get(1).unwrap().canvas.pixels().clone();
+        assert!(pixels(&first) == pixels(&second));
+    }
+
+    #[test]
+    fn hatching_gathers_away_from_the_light() {
+        let server = server();
+        let params = rmcp::serde_json::json!({
+            "colors": ["#000000"], "clip": [[0, 0], [100, 100]], "width": [1, 2],
+            "length": [6, 10], "count": 400, "light": [0, 50], "seed": 1,
+        });
+        hatch(&server, params).unwrap();
+        let (lit, shaded) = (
+            painted(&server, (0, 0), (30, 100)),
+            painted(&server, (70, 0), (100, 100)),
+        );
+        assert!(lit * 2 < shaded, "{lit} lit, {shaded} shaded");
+    }
+
+    #[test]
+    fn hatches_in_draw_with_a_named_mask() {
+        let server = server();
+        let params = rmcp::serde_json::json!({"image": 1, "items": [
+            {"type": "hatch", "colors": ["#000000"], "clip": {"mask": "ball"}, "brush": "oil", "width": [4, 8],
+             "taper": 4, "jitter": 10},
+        ], "masks": {"ball": {"shape": "ellipse", "points": [[30, 30], [70, 70]]}}});
+        server
+            .draw(Parameters(rmcp::serde_json::from_value(params).unwrap()))
+            .unwrap();
+        assert!(painted(&server, (40, 40), (60, 60)) > 200);
+        assert_eq!(painted(&server, (0, 0), (25, 25)), 0);
+    }
+
+    #[test]
+    fn refuses_wrong_hatching() {
+        let server = server();
+        let wrong = [
+            (
+                rmcp::serde_json::json!({"colors": ["#000000"]}),
+                "hatch takes a clip: the rectangle or mask to lay strokes in",
+            ),
+            (
+                rmcp::serde_json::json!({"colors": [], "clip": [[0, 0], [9, 9]]}),
+                "give one or more colors",
+            ),
+            (
+                rmcp::serde_json::json!({"colors": ["#000000"], "clip": [[0, 0], [9, 9]], "brush": "smudge"}),
+                "hatch lays down color, so it cannot use the smudge brush",
+            ),
+            (
+                rmcp::serde_json::json!({"colors": ["#000000"], "clip": [[0, 0], [9, 9]], "length": [40, 20]}),
+                "length must be [shortest, longest] from 1 to 500, not [40, 20]",
+            ),
+            (
+                rmcp::serde_json::json!({"colors": ["#000000"], "clip": [[200, 200], [300, 300]]}),
+                "the area lies entirely outside the 100×100 image",
+            ),
+            (
+                rmcp::serde_json::json!({"colors": ["#000000"], "clip": [[0, 0], [9, 9]], "count": 0}),
+                "count must be between 1 and 5000",
+            ),
+        ];
+        for (params, error) in wrong {
+            assert_eq!(hatch(&server, params).unwrap_err(), error);
         }
     }
 

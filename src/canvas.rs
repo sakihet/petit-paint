@@ -402,7 +402,7 @@ impl ClipMask {
 
     /// How much of the canvas pixel at (`x`, `y`) a stroke may cover, from 0
     /// to 255.
-    fn at(&self, x: i32, y: i32) -> u8 {
+    pub(crate) fn at(&self, x: i32, y: i32) -> u8 {
         let (mx, my) = (x - self.x, y - self.y);
         let (width, height) = (self.coverage.width() as i32, self.coverage.height() as i32);
         let inside = if mx >= 0 && my >= 0 && mx < width && my < height {
@@ -415,7 +415,10 @@ impl ClipMask {
 
     /// Limits the box from (`left`, `top`) to (`right`, `bottom`) to the part
     /// a stroke may cover.
-    fn limit(&self, (left, top, right, bottom): (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+    pub(crate) fn limit(
+        &self,
+        (left, top, right, bottom): (f32, f32, f32, f32),
+    ) -> (f32, f32, f32, f32) {
         if self.inverted {
             return (left, top, right, bottom);
         }
