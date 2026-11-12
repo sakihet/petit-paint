@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use gpui_kit::component::{WindowExt as _, notification::Notification};
 use gpui_kit::*;
 use image::ImageFormat;
@@ -309,7 +310,8 @@ impl PaintApp {
 
 /// Reads the image file at `path`, if it fits on the canvas.
 pub fn read_image(path: &Path) -> anyhow::Result<Pixmap> {
-    let bytes = std::fs::read(path)?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
     let pixels = decode_image(&bytes).map_err(|_| {
         anyhow::anyhow!(
             "{} is not a PNG, JPEG, BMP, WebP or GIF image",
@@ -335,7 +337,8 @@ pub fn write_image(path: &Path, pixels: &Pixmap) -> anyhow::Result<()> {
             path.display()
         )
     })?;
-    std::fs::write(path, encode_image(pixels, format)?)?;
+    std::fs::write(path, encode_image(pixels, format)?)
+        .with_context(|| format!("could not write {}", path.display()))?;
     Ok(())
 }
 
