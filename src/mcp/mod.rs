@@ -10,17 +10,22 @@ use serde::Deserialize;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::canvas::Brush;
+use crate::canvas::{Brush, DEFAULT_FILL_TOLERANCE, Fill, Orientation, PixelRect};
+use crate::pattern::{PATTERNS, Pattern};
 use crate::stroke::Stroke;
+use crate::text::{FontChoice, TextRenderer};
 use crate::tool::ShapeKind;
-use crate::{DEFAULT_WIDTH, MAX_WIDTH, MIN_WIDTH};
+use crate::{
+    DEFAULT_FONT_SIZE, DEFAULT_WIDTH, MAX_CANVAS_SIDE, MAX_FONT_SIZE, MAX_WIDTH, MIN_FONT_SIZE,
+    MIN_WIDTH, tolerance_from_percent, tolerance_percent,
+};
 
 mod images;
 
 const INSTRUCTIONS: &str = "Draws raster images with petit-paint, a small paint app. \
 Create an image with new_image or open a file with open_image; each gets an id that the \
 other tools take. Draw on it with draw_stroke and draw_shape, or many strokes and shapes \
-at once with draw. Coordinates are in image \
+at once with draw; fill regions with fill and write with draw_text. Coordinates are in image \
 pixels from the top-left. Colors are #rrggbb or #rrggbbaa. Call view_image to look at the result, and save_image to write \
 it to a file. Relative paths are taken from the server's working directory.";
 
@@ -28,6 +33,8 @@ it to a file. Relative paths are taken from the server's working directory.";
 #[derive(Clone, Default)]
 pub struct PaintServer {
     images: Arc<Mutex<Images>>,
+    /// Made on first use, as creating one scans the installed fonts.
+    text_renderer: Arc<Mutex<Option<TextRenderer>>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -263,6 +270,135 @@ struct DrawParams {
     items: Vec<DrawItem>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct FillParams {
+    /// The image's id.
+    image: u32,
+    /// A pixel in the region to fill, as [x, y]. The region is the pixels connected to
+    /// it that have about the same color.
+    point: [f32; 2],
+    /// The color to fill with as #rrggbb or #rrggbbaa. With a pattern, the color of
+    /// its set pixels.
+    color: String,
+    /// How different a pixel's color may be and still be filled, in percent from 0
+    /// to 100. 25 when left out.
+    tolerance: Option<f32>,
+    /// An 8×8 pattern lined up with the image, so neighboring fills meet seamlessly:
+    /// solid, dark, checkerboard, light, sparse_dots, horizontal_lines, vertical_lines,
+    /// rising_diagonals, falling_diagonals, grid, crosshatch, bricks, zigzag, polka_dots
+    /// or weave. Solid when left out.
+    pattern: Option<String>,
+    /// The color of the pattern's other pixels, as #rrggbb or #rrggbbaa. Needed for
+    /// any pattern but solid.
+    second_color: Option<String>,
+}
+
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+enum FontName {
+    SansSerif,
+    Serif,
+    Monospace,
+    Cursive,
+    Fantasy,
+}
+
+impl From<FontName> for FontChoice {
+    fn from(name: FontName) -> Self {
+        match name {
+            FontName::SansSerif => FontChoice::SansSerif,
+            FontName::Serif => FontChoice::Serif,
+            FontName::Monospace => FontChoice::Monospace,
+            FontName::Cursive => FontChoice::Cursive,
+            FontName::Fantasy => FontChoice::Fantasy,
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct DrawTextParams {
+    /// The image's id.
+    image: u32,
+    /// The text, with lines separated by \n. Characters the font lacks, such as
+    /// Japanese in a Latin font, come from an installed font that has them.
+    text: String,
+    /// The top-left of where the text starts, as [x, y].
+    position: [i32; 2],
+    /// The text's color as #rrggbb or #rrggbbaa.
+    color: String,
+    /// Font size in pixels, from 8 to 144. 24 when left out.
+    size: Option<f32>,
+    /// The font. Sans serif when left out.
+    font: Option<FontName>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct RectParams {
+    /// The image's id.
+    image: u32,
+    /// Two opposite corners of the rectangle, as [x, y] pairs.
+    rect: [[i32; 2]; 2],
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct ResizeParams {
+    /// The image's id.
+    image: u32,
+    /// The new width in pixels, from 1 to 4096.
+    width: u32,
+    /// The new height in pixels, from 1 to 4096.
+    height: u32,
+}
+
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+enum FlipDirection {
+    /// Left and right swap.
+    Horizontal,
+    /// Top and bottom swap.
+    Vertical,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct FlipParams {
+    /// The image's id.
+    image: u32,
+    direction: FlipDirection,
+}
+
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+enum TurnDirection {
+    Clockwise,
+    Counterclockwise,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct TurnParams {
+    /// The image's id.
+    image: u32,
+    /// Which way to turn the image a quarter turn.
+    direction: TurnDirection,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct PickColorParams {
+    /// The image's id.
+    image: u32,
+    /// The pixel to read, as [x, y].
+    point: [f32; 2],
+}
+
 #[tool_router]
 impl PaintServer {
     #[tool(description = "Create a blank image and return its id.")]
@@ -429,6 +565,189 @@ impl PaintServer {
         Ok(format!("Drew {count} {items} on image {}", params.image))
     }
 
+    #[tool(
+        description = "Fill the region around a pixel that has about the same color, like a \
+        paint bucket, with a color or a two-color pattern."
+    )]
+    fn fill(&self, Parameters(params): Parameters<FillParams>) -> Result<String, String> {
+        let foreground = parse_color(&params.color).map_err(message)?;
+        let pattern = match &params.pattern {
+            Some(name) => find_pattern(name).map_err(message)?,
+            None => Pattern::SOLID,
+        };
+        let background = match (&params.second_color, pattern.is_solid()) {
+            (Some(color), _) => parse_color(color).map_err(message)?,
+            (None, true) => foreground,
+            (None, false) => {
+                return Err("a pattern other than solid needs a second_color".into());
+            }
+        };
+        let percent = params
+            .tolerance
+            .unwrap_or(tolerance_percent(DEFAULT_FILL_TOLERANCE));
+        if !(0.0..=100.0).contains(&percent) {
+            return Err(format!(
+                "tolerance must be between 0 and 100, not {percent}"
+            ));
+        }
+        let mut images = self.images();
+        let image = images.get_mut(params.image).map_err(message)?;
+        let [x, y] = params.point;
+        check_inside(image, x, y).map_err(message)?;
+        let fill = Fill {
+            pattern,
+            foreground,
+            background,
+        };
+        let undo = image
+            .canvas
+            .flood_fill(point(px(x), px(y)), fill, tolerance_from_percent(percent))
+            .ok_or("nothing changed, as the region already has that color")?;
+        image.history.record(undo);
+        Ok(format!(
+            "Filled around ({x}, {y}) on image {}",
+            params.image
+        ))
+    }
+
+    #[tool(description = "Write text on an image.")]
+    fn draw_text(&self, Parameters(params): Parameters<DrawTextParams>) -> Result<String, String> {
+        if params.text.trim().is_empty() {
+            return Err("the text has nothing to draw".into());
+        }
+        let color = parse_color(&params.color).map_err(message)?;
+        let size = params.size.unwrap_or(DEFAULT_FONT_SIZE);
+        if !(MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(&size) {
+            return Err(format!(
+                "size must be between {MIN_FONT_SIZE} and {MAX_FONT_SIZE}, not {size}"
+            ));
+        }
+        let font = params.font.map_or(FontChoice::SansSerif, FontChoice::from);
+        let mut images = self.images();
+        let image = images.get_mut(params.image).map_err(message)?;
+        let mut renderer = self
+            .text_renderer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let renderer = renderer.get_or_insert_with(TextRenderer::new);
+        let [x, y] = params.position;
+        let undo = image
+            .canvas
+            .draw_text(renderer, &params.text, font, size, color, point(x, y))
+            .ok_or_else(|| outside(image.size()))?;
+        image.history.record(undo);
+        Ok(format!("Drew text on image {}", params.image))
+    }
+
+    #[tool(description = "Erase a rectangle to the image's background.")]
+    fn erase(&self, Parameters(params): Parameters<RectParams>) -> Result<String, String> {
+        let mut images = self.images();
+        let image = images.get_mut(params.image).map_err(message)?;
+        let rect = to_rect(params.rect).map_err(message)?;
+        let undo = image
+            .canvas
+            .erase(rect, None)
+            .ok_or_else(|| outside(image.size()))?;
+        image.history.record(undo);
+        Ok(format!("Erased a rectangle on image {}", params.image))
+    }
+
+    #[tool(description = "Erase the whole image to its background.")]
+    fn clear(&self, Parameters(params): Parameters<ImageParams>) -> Result<String, String> {
+        let mut images = self.images();
+        let image = images.get_mut(params.image).map_err(message)?;
+        let undo = image.canvas.clear().map_err(message)?;
+        image.history.record(undo);
+        Ok(format!("Cleared image {}", params.image))
+    }
+
+    #[tool(
+        description = "Change an image's size, keeping the drawing at the top-left. Growing adds \
+        background; shrinking cuts off the right and bottom."
+    )]
+    fn resize(&self, Parameters(params): Parameters<ResizeParams>) -> Result<String, String> {
+        let (width, height) = (params.width, params.height);
+        let range = 1..=MAX_CANVAS_SIDE;
+        if !range.contains(&width) || !range.contains(&height) {
+            return Err(format!(
+                "width and height must be between 1 and {MAX_CANVAS_SIDE}, not {width}×{height}"
+            ));
+        }
+        let mut images = self.images();
+        let image = images.get_mut(params.image).map_err(message)?;
+        let undo = image.canvas.resize(width, height).map_err(message)?;
+        image.history.record(undo);
+        Ok(format!(
+            "Resized image {} to {width}×{height}",
+            params.image
+        ))
+    }
+
+    #[tool(description = "Cut an image down to a rectangle.")]
+    fn crop(&self, Parameters(params): Parameters<RectParams>) -> Result<String, String> {
+        let mut images = self.images();
+        let image = images.get_mut(params.image).map_err(message)?;
+        let rect = to_rect(params.rect).map_err(message)?;
+        let pixels = image
+            .canvas
+            .copy(rect, None)
+            .ok_or_else(|| outside(image.size()))?;
+        let undo = image.canvas.replace(pixels);
+        image.history.record(undo);
+        let size = image.size();
+        Ok(format!(
+            "Cropped image {} to {}×{}",
+            params.image, size.width, size.height
+        ))
+    }
+
+    #[tool(description = "Flip an image horizontally or vertically.")]
+    fn flip(&self, Parameters(params): Parameters<FlipParams>) -> Result<String, String> {
+        let orientation = match params.direction {
+            FlipDirection::Horizontal => Orientation::FlipHorizontal,
+            FlipDirection::Vertical => Orientation::FlipVertical,
+        };
+        self.reorient(params.image, orientation)?;
+        Ok(format!("Flipped image {}", params.image))
+    }
+
+    #[tool(description = "Turn an image a quarter turn, swapping its width and height.")]
+    fn turn(&self, Parameters(params): Parameters<TurnParams>) -> Result<String, String> {
+        let orientation = match params.direction {
+            TurnDirection::Clockwise => Orientation::RotateClockwise,
+            TurnDirection::Counterclockwise => Orientation::RotateCounterClockwise,
+        };
+        self.reorient(params.image, orientation)?;
+        Ok(format!("Turned image {}", params.image))
+    }
+
+    #[tool(
+        description = "Read the color of a pixel as #rrggbbaa.",
+        annotations(read_only_hint = true)
+    )]
+    fn pick_color(
+        &self,
+        Parameters(params): Parameters<PickColorParams>,
+    ) -> Result<String, String> {
+        let images = self.images();
+        let image = images.get(params.image).map_err(message)?;
+        let [x, y] = params.point;
+        check_inside(image, x, y).map_err(message)?;
+        let pixel = image
+            .canvas
+            .pixels()
+            .pixel(x as u32, y as u32)
+            .ok_or_else(|| outside(image.size()))?
+            .demultiply();
+        Ok(format!(
+            "#{:02x}{:02x}{:02x}{:02x}",
+            pixel.red(),
+            pixel.green(),
+            pixel.blue(),
+            pixel.alpha()
+        ))
+    }
+
     #[tool(description = "Take back the last change to an image.")]
     fn undo(&self, Parameters(params): Parameters<ImageParams>) -> Result<String, String> {
         let mut images = self.images();
@@ -466,6 +785,14 @@ impl ServerHandler for PaintServer {
 }
 
 impl PaintServer {
+    fn reorient(&self, id: u32, orientation: Orientation) -> Result<(), String> {
+        let mut images = self.images();
+        let image = images.get_mut(id).map_err(message)?;
+        let undo = image.canvas.reorient(orientation);
+        image.history.record(undo);
+        Ok(())
+    }
+
     fn images(&self) -> MutexGuard<'_, Images> {
         // A tool that panicked leaves the images as they were, which is still
         // better than refusing every later call
@@ -509,6 +836,53 @@ fn parse_width(width: Option<f32>) -> Result<Pixels> {
         bail!("width must be between {MIN_WIDTH} and {MAX_WIDTH}, not {width}");
     }
     Ok(px(width))
+}
+
+/// The pattern named `name`, as the fill tool's names are written in
+/// snake_case.
+fn find_pattern(name: &str) -> Result<Pattern> {
+    let snake_case = |pattern: &Pattern| pattern.name.to_lowercase().replace(' ', "_");
+    PATTERNS
+        .iter()
+        .find(|pattern| snake_case(pattern) == name)
+        .copied()
+        .ok_or_else(|| {
+            let names: Vec<String> = PATTERNS.iter().map(snake_case).collect();
+            anyhow::anyhow!("there is no {name:?} pattern; use {}", names.join(", "))
+        })
+}
+
+/// A rectangle from two opposite corners.
+fn to_rect([[x0, y0], [x1, y1]]: [[i32; 2]; 2]) -> Result<PixelRect> {
+    if x0 == x1 || y0 == y1 {
+        bail!("the rectangle from ({x0}, {y0}) to ({x1}, {y1}) is empty");
+    }
+    Ok(PixelRect {
+        x: x0.min(x1),
+        y: y0.min(y1),
+        width: x0.abs_diff(x1),
+        height: y0.abs_diff(y1),
+    })
+}
+
+/// Fails unless (`x`, `y`) is a pixel of `image`.
+fn check_inside(image: &images::Image, x: f32, y: f32) -> Result<()> {
+    let size = image.size();
+    if x < 0.0 || y < 0.0 || x >= size.width as f32 || y >= size.height as f32 {
+        bail!(
+            "({x}, {y}) is outside the {}×{} image",
+            size.width,
+            size.height
+        );
+    }
+    Ok(())
+}
+
+fn outside(size: gpui_kit::Size<u32>) -> String {
+    format!(
+        "nothing was changed, as it lies entirely outside the {}×{} image",
+        size.width, size.height
+    )
 }
 
 fn to_points(points: &[[f32; 2]]) -> Vec<Point<Pixels>> {
@@ -652,6 +1026,243 @@ mod tests {
             "items": [{"type": "star", "points": [[1, 1]]}],
         });
         assert!(rmcp::serde_json::from_value::<DrawParams>(unknown).is_err());
+    }
+
+    fn image(id: u32) -> Parameters<ImageParams> {
+        Parameters(ImageParams { image: id })
+    }
+
+    fn size(server: &PaintServer) -> (u32, u32) {
+        let size = server.images().get(1).unwrap().size();
+        (size.width, size.height)
+    }
+
+    fn fill(color: &str, point: [f32; 2]) -> FillParams {
+        FillParams {
+            image: 1,
+            point,
+            color: color.into(),
+            tolerance: None,
+            pattern: None,
+            second_color: None,
+        }
+    }
+
+    #[test]
+    fn fills_the_region_inside_an_outline() {
+        let server = server();
+        let outline = ShapeSpec {
+            outline: Some("#000000".into()),
+            ..shape(ShapeName::Rectangle, &[[20.0, 20.0], [80.0, 80.0]])
+        };
+        draw_shape(&server, outline).unwrap();
+        server
+            .fill(Parameters(fill("#ff0000", [50.0, 50.0])))
+            .unwrap();
+        assert_eq!(rgb_at(&server, 50, 50), (255, 0, 0));
+        assert_eq!(rgb_at(&server, 5, 5), (255, 255, 255));
+        server.undo(image(1)).unwrap();
+        assert_eq!(rgb_at(&server, 50, 50), (255, 255, 255));
+    }
+
+    #[test]
+    fn fills_with_a_pattern() {
+        let server = server();
+        let params = FillParams {
+            pattern: Some("checkerboard".into()),
+            second_color: Some("#0000ff".into()),
+            ..fill("#ff0000", [0.0, 0.0])
+        };
+        server.fill(Parameters(params)).unwrap();
+        assert_eq!(rgb_at(&server, 0, 0), (255, 0, 0));
+        assert_eq!(rgb_at(&server, 1, 0), (0, 0, 255));
+    }
+
+    #[test]
+    fn refuses_bad_fills() {
+        let server = server();
+        let cases = [
+            fill("#ff0000", [100.0, 50.0]),
+            fill("#ff0000", [-1.0, 50.0]),
+            // The image is already white
+            fill("#ffffff", [50.0, 50.0]),
+            FillParams {
+                tolerance: Some(101.0),
+                ..fill("#ff0000", [50.0, 50.0])
+            },
+            FillParams {
+                pattern: Some("stripes".into()),
+                ..fill("#ff0000", [50.0, 50.0])
+            },
+            FillParams {
+                pattern: Some("bricks".into()),
+                ..fill("#ff0000", [50.0, 50.0])
+            },
+        ];
+        for params in cases {
+            assert!(server.fill(Parameters(params)).is_err());
+        }
+        assert!(server.undo(image(1)).is_err());
+    }
+
+    #[test]
+    fn every_pattern_has_a_name_fill_takes() {
+        for pattern in PATTERNS {
+            let name = pattern.name.to_lowercase().replace(' ', "_");
+            assert_eq!(find_pattern(&name).unwrap(), pattern);
+        }
+    }
+
+    fn text(text: &str, position: [i32; 2]) -> DrawTextParams {
+        DrawTextParams {
+            image: 1,
+            text: text.into(),
+            position,
+            color: "#000000".into(),
+            size: Some(32.0),
+            font: None,
+        }
+    }
+
+    #[test]
+    fn draws_text_and_undoes_it() {
+        let server = server();
+        server.draw_text(Parameters(text("Hi", [10, 10]))).unwrap();
+        let images = server.images();
+        let pixels = images.get(1).unwrap().canvas.pixels();
+        let inked = (0..100)
+            .flat_map(|y| (0..100).map(move |x| (x, y)))
+            .filter(|&(x, y)| pixels.pixel(x, y).unwrap().red() < 128)
+            .count();
+        assert!(inked > 20, "{inked}");
+        drop(images);
+        server.undo(image(1)).unwrap();
+        assert_eq!(rgb_at(&server, 20, 25), (255, 255, 255));
+    }
+
+    #[test]
+    fn refuses_bad_text() {
+        let server = server();
+        for params in [
+            text("  ", [10, 10]),
+            text("Hi", [500, 500]),
+            DrawTextParams {
+                size: Some(200.0),
+                ..text("Hi", [10, 10])
+            },
+        ] {
+            assert!(server.draw_text(Parameters(params)).is_err());
+        }
+    }
+
+    #[test]
+    fn erases_a_rectangle_and_clears_the_image() {
+        let server = server();
+        server
+            .fill(Parameters(fill("#ff0000", [0.0, 0.0])))
+            .unwrap();
+        let rect = |rect| Parameters(RectParams { image: 1, rect });
+        server.erase(rect([[60, 60], [20, 20]])).unwrap();
+        assert_eq!(rgb_at(&server, 40, 40), (255, 255, 255));
+        assert_eq!(rgb_at(&server, 10, 10), (255, 0, 0));
+        assert!(server.erase(rect([[20, 20], [20, 60]])).is_err());
+        assert!(server.erase(rect([[200, 200], [300, 300]])).is_err());
+
+        server.clear(image(1)).unwrap();
+        assert_eq!(rgb_at(&server, 10, 10), (255, 255, 255));
+        server.undo(image(1)).unwrap();
+        assert_eq!(rgb_at(&server, 10, 10), (255, 0, 0));
+    }
+
+    #[test]
+    fn resizes_and_crops() {
+        let server = server();
+        let resize = |width, height| {
+            server.resize(Parameters(ResizeParams {
+                image: 1,
+                width,
+                height,
+            }))
+        };
+        resize(200, 50).unwrap();
+        assert_eq!(size(&server), (200, 50));
+        assert!(resize(0, 50).is_err());
+        assert!(resize(200, MAX_CANVAS_SIDE + 1).is_err());
+
+        let crop = |rect| server.crop(Parameters(RectParams { image: 1, rect }));
+        crop([[10, 10], [40, 30]]).unwrap();
+        assert_eq!(size(&server), (30, 20));
+        // Only the part on the image is kept
+        crop([[20, 10], [100, 100]]).unwrap();
+        assert_eq!(size(&server), (10, 10));
+        assert!(crop([[50, 50], [60, 60]]).is_err());
+
+        server.undo(image(1)).unwrap();
+        server.undo(image(1)).unwrap();
+        server.undo(image(1)).unwrap();
+        assert_eq!(size(&server), (100, 100));
+    }
+
+    #[test]
+    fn flips_and_turns() {
+        let server = server();
+        server
+            .resize(Parameters(ResizeParams {
+                image: 1,
+                width: 100,
+                height: 40,
+            }))
+            .unwrap();
+        server
+            .fill(Parameters(fill("#ff0000", [0.0, 0.0])))
+            .unwrap();
+        server
+            .erase(Parameters(RectParams {
+                image: 1,
+                rect: [[50, 0], [100, 40]],
+            }))
+            .unwrap();
+        server
+            .flip(Parameters(FlipParams {
+                image: 1,
+                direction: FlipDirection::Horizontal,
+            }))
+            .unwrap();
+        assert_eq!(rgb_at(&server, 90, 20), (255, 0, 0));
+        assert_eq!(rgb_at(&server, 10, 20), (255, 255, 255));
+        server
+            .turn(Parameters(TurnParams {
+                image: 1,
+                direction: TurnDirection::Clockwise,
+            }))
+            .unwrap();
+        assert_eq!(size(&server), (40, 100));
+        assert_eq!(rgb_at(&server, 20, 90), (255, 0, 0));
+    }
+
+    #[test]
+    fn picks_colors() {
+        let server = server();
+        let pick = |point| server.pick_color(Parameters(PickColorParams { image: 1, point }));
+        assert_eq!(pick([5.0, 5.0]).unwrap(), "#ffffffff");
+        server
+            .fill(Parameters(fill("#12345680", [0.0, 0.0])))
+            .unwrap();
+        assert!(pick([99.5, 0.0]).unwrap().starts_with("#"));
+        assert!(pick([100.0, 0.0]).is_err());
+        let empty = PaintServer::default();
+        empty
+            .new_image(Parameters(NewImageParams {
+                width: 4,
+                height: 4,
+                background: None,
+            }))
+            .unwrap();
+        let transparent = empty.pick_color(Parameters(PickColorParams {
+            image: 1,
+            point: [0.0, 0.0],
+        }));
+        assert_eq!(transparent.unwrap(), "#00000000");
     }
 
     #[test]

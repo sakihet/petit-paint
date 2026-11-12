@@ -669,8 +669,6 @@ impl Canvas {
 
     /// Draws `text` starting at `anchor`, its top-left, and returns the
     /// change that undoes it. Lines are separated by `\n`.
-    // For the MCP server's draw_text tool, which is not in yet
-    #[allow(dead_code)]
     pub fn draw_text(
         &mut self,
         renderer: &mut TextRenderer,
