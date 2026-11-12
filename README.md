@@ -67,10 +67,10 @@ Images are kept in memory by id until they are saved. Coordinates are in image p
 | --- | --- |
 | `new_image` | Create a blank image, transparent or with a background color |
 | `open_image` / `save_image` | Open or save a PNG, JPEG, BMP, WebP or GIF file |
-| `view_image` | Return the image as PNG so the agent can look at it |
+| `view_image` | Return the image, or part of it scaled up, as PNG so the agent can look at it |
 | `list_images` / `close_image` | List the open images, or close one to free its memory |
 | `draw_stroke` | Draw a line through points with a brush |
-| `draw_shape` | Draw a line, rectangle, ellipse or polygon with an outline, a fill or both |
+| `draw_shape` | Draw a line, rectangle, ellipse, polygon, arc, pie or chord with an outline, a fill or both |
 | `draw` | Draw many strokes and shapes in one call, as one undo step |
 | `fill` | Fill a region with a color or a pattern, like the fill tool |
 | `draw_text` | Write text |
@@ -78,6 +78,8 @@ Images are kept in memory by id until they are saved. Coordinates are in image p
 | `resize` / `crop` / `flip` / `turn` | Change the image's size, shape or orientation |
 | `pick_color` | Read the color of a pixel |
 | `undo` / `redo` | Take back or redo changes, separately for each image |
+
+Shapes can be filled with linear or radial gradients and rectangles can have rounded corners. Strokes and polygons can be drawn as smooth curves through their points. Any stroke or shape can be blended with what is under it (normal, add, screen or multiply) and clipped to a rectangle.
 
 ## License
 
