@@ -15,6 +15,9 @@ pub struct Stroke {
     pub color: Hsla,
     /// Zero draws only the fill, with no outline.
     pub width: Pixels,
+    /// How hard the brush presses at each point, from 0 to 1, scaling
+    /// `width` there. Empty presses fully everywhere.
+    pub pressure: Vec<f32>,
     /// Connects the last point back to the first.
     pub closed: bool,
     /// Fills the inside with `color` as well.

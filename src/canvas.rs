@@ -1430,6 +1430,19 @@ fn draw_line(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Tran
     if stroke.width <= px(0.0) {
         return;
     }
+    if !stroke.pressure.is_empty() {
+        // Circles close together, as wide as the brush presses at each
+        let pressure = Pressure::new(stroke);
+        let mut builder = PathBuilder::new();
+        let radius = stroke.width.as_f32() / 2.0;
+        for ((x, y), _, distance) in along_line(&stroke.points, (radius / 4.0).clamp(0.25, 1.0)) {
+            builder.push_circle(x, y, (radius * pressure.at(distance)).max(0.25));
+        }
+        if let Some(path) = builder.finish() {
+            pixels.fill_path(&path, &paint, FillRule::Winding, transform, None);
+        }
+        return;
+    }
     let style = SkiaStroke {
         width: stroke.width.as_f32(),
         // Markers have flat tips; round caps make the rest join smoothly
@@ -1452,14 +1465,16 @@ fn draw_line(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Tran
 /// fixed steps along it and seeded per step from the stroke's seed, so the
 /// part already drawn stays the same as the stroke grows.
 fn spray(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Transform) {
-    let radius = stroke.width.as_f32().max(1.0);
-    let spacing = (radius / 2.0).max(1.0);
-    let dots_per_step = (radius * radius * 0.1).ceil().clamp(1.0, 200.0) as usize;
+    let full = stroke.width.as_f32().max(1.0);
+    let spacing = (full / 2.0).max(1.0);
+    let pressure = Pressure::new(stroke);
     let mut paint = Paint::default();
     paint.set_color(color);
     paint.anti_alias = false;
 
-    let mut spray_at = |step: u64, x: f32, y: f32| {
+    let mut spray_at = |step: u64, x: f32, y: f32, distance: f32| {
+        let radius = (full * pressure.at(distance)).max(0.5);
+        let dots_per_step = (radius * radius * 0.1).ceil().clamp(1.0, 200.0) as usize;
         let mut random = Random(stroke.seed ^ step.wrapping_mul(0x9e37_79b9_7f4a_7c15));
         for _ in 0..dots_per_step {
             let angle = random.next() * std::f32::consts::TAU;
@@ -1477,9 +1492,9 @@ fn spray(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Transfor
         return;
     };
     let mut step = 0;
-    spray_at(step, first.x.as_f32(), first.y.as_f32());
-    // Distance along the line since the last step
-    let mut travelled = 0.0;
+    spray_at(step, first.x.as_f32(), first.y.as_f32(), 0.0);
+    // Distance along the line since the last step, and to the segment's start
+    let (mut travelled, mut start) = (0.0, 0.0);
     for pair in stroke.points.windows(2) {
         let (from, to) = (pair[0], pair[1]);
         let (dx, dy) = ((to.x - from.x).as_f32(), (to.y - from.y).as_f32());
@@ -1488,10 +1503,12 @@ fn spray(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Transfor
         while along <= length {
             step += 1;
             let t = along / length;
-            spray_at(step, from.x.as_f32() + dx * t, from.y.as_f32() + dy * t);
+            let (x, y) = (from.x.as_f32() + dx * t, from.y.as_f32() + dy * t);
+            spray_at(step, x, y, start + along);
             along += spacing;
         }
         travelled = length - (along - spacing);
+        start += length;
     }
 }
 
@@ -1627,6 +1644,7 @@ fn paint_oil(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Tran
     let pressing = (width * 0.4).min(length * 0.3).max(0.01);
     let mut random = Random(stroke.seed ^ 0x0f1e_2d3c_4b5a_6978);
     let (tx, ty) = (transform.tx, transform.ty);
+    let pressure = Pressure::new(stroke);
     for bristle in 0..bristles {
         let across = (bristle as f32 + 0.5) / bristles as f32 - 0.5;
         let bristle_color = shade(color, (random.next() - 0.5) * 0.24);
@@ -1642,14 +1660,15 @@ fn paint_oil(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Tran
             }
             // The bristle wanders slowly from side to side
             let wander = smooth_noise(distance / 12.0, layer) - 0.5;
-            let offset = across * width + wander * gap * 0.8;
+            let pressed = pressure.at(distance);
+            let offset = (across * width + wander * gap * 0.8) * pressed;
             // Pressed down gently at first
             let press = (distance / pressing).min(1.0);
             let alpha = 0.7 * load.sqrt() * (0.3 + 0.7 * press);
             dab(
                 pixels,
                 (x - dy * offset + tx, y + dx * offset + ty),
-                radius,
+                radius * pressed.max(0.4),
                 bristle_color,
                 alpha,
             );
@@ -1658,8 +1677,8 @@ fn paint_oil(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Tran
     // Ridges along both edges: lit where the edge faces the top-left
     let ridge = (width / 14.0).clamp(0.7, 2.0);
     for side in [-1.0f32, 1.0] {
-        let edge = side * (width / 2.0 - ridge);
         for &((x, y), (dx, dy), distance) in samples.iter().step_by(2) {
+            let edge = side * (width / 2.0 - ridge) * pressure.at(distance);
             let (nx, ny) = (-dy * side, dx * side);
             let facing = -(nx + ny) * std::f32::consts::FRAC_1_SQRT_2;
             let load = 1.0 - distance / dry_length;
@@ -1676,6 +1695,52 @@ fn paint_oil(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Tran
                 alpha,
             );
         }
+    }
+}
+
+/// How hard a stroke's brush presses along it, from its points' pressure.
+struct Pressure<'a> {
+    /// How far along the stroke each point is.
+    distances: Vec<f32>,
+    pressure: &'a [f32],
+}
+
+impl<'a> Pressure<'a> {
+    fn new(stroke: &'a Stroke) -> Self {
+        let mut distances = Vec::with_capacity(stroke.points.len());
+        let mut travelled = 0.0;
+        for (i, p) in stroke.points.iter().enumerate() {
+            if i > 0 {
+                let q = stroke.points[i - 1];
+                travelled += ((p.x - q.x).as_f32().powi(2) + (p.y - q.y).as_f32().powi(2)).sqrt();
+            }
+            distances.push(travelled);
+        }
+        Pressure {
+            distances,
+            pressure: &stroke.pressure,
+        }
+    }
+
+    /// The pressure `distance` along the stroke, between its points'.
+    fn at(&self, distance: f32) -> f32 {
+        if self.pressure.len() != self.distances.len() || self.pressure.is_empty() {
+            return 1.0;
+        }
+        let next = self.distances.partition_point(|&d| d < distance);
+        if next == 0 {
+            return self.pressure[0];
+        }
+        if next == self.distances.len() {
+            return self.pressure[next - 1];
+        }
+        let (d0, d1) = (self.distances[next - 1], self.distances[next]);
+        let t = if d1 > d0 {
+            (distance - d0) / (d1 - d0)
+        } else {
+            1.0
+        };
+        self.pressure[next - 1] + (self.pressure[next] - self.pressure[next - 1]) * t
     }
 }
 
@@ -1746,6 +1811,9 @@ fn mix_wet_paint(pixels: &mut Pixmap, under: &Pixmap, at: Point<i32>) {
     }
 }
 
+/// A point the nib passes through, and how hard it presses there.
+type NibEnd = ((f32, f32), f32);
+
 /// Sweeps a flat nib, `width` long and tilted 45°, along the line.
 fn draw_nib(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Transform) {
     let half = stroke.width.as_f32() / 2.0 * std::f32::consts::FRAC_1_SQRT_2;
@@ -1756,16 +1824,25 @@ fn draw_nib(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Trans
     paint.anti_alias = true;
 
     let xy = |p: &Point<Pixels>| (p.x.as_f32(), p.y.as_f32());
-    let segments: Vec<((f32, f32), (f32, f32))> = match stroke.points.as_slice() {
+    let pressed = |i: usize| stroke.pressure.get(i).copied().unwrap_or(1.0);
+    // Each end of each segment, and how hard the nib presses there
+    let segments: Vec<(NibEnd, NibEnd)> = match stroke.points.as_slice() {
         [] => return,
         // A click prints the nib itself, one pixel wide
         [only] => {
             let (x, y) = xy(only);
-            vec![((x - 0.5, y - 0.5), (x + 0.5, y + 0.5))]
+            vec![(
+                ((x - 0.5, y - 0.5), pressed(0)),
+                ((x + 0.5, y + 0.5), pressed(0)),
+            )]
         }
-        points => points
-            .windows(2)
-            .map(|pair| (xy(&pair[0]), xy(&pair[1])))
+        points => (1..points.len())
+            .map(|i| {
+                (
+                    (xy(&points[i - 1]), pressed(i - 1)),
+                    (xy(&points[i]), pressed(i)),
+                )
+            })
             .collect(),
     };
 
@@ -1774,12 +1851,12 @@ fn draw_nib(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Trans
     // segment's quad winds the same way, so overlaps add up rather than
     // cancel out under the nonzero fill rule
     let mut builder = PathBuilder::new();
-    for (a, b) in segments {
+    for ((a, pa), (b, pb)) in segments {
         let mut corners = [
-            (a.0 + nx, a.1 + ny),
-            (b.0 + nx, b.1 + ny),
-            (b.0 - nx, b.1 - ny),
-            (a.0 - nx, a.1 - ny),
+            (a.0 + nx * pa, a.1 + ny * pa),
+            (b.0 + nx * pb, b.1 + ny * pb),
+            (b.0 - nx * pb, b.1 - ny * pb),
+            (a.0 - nx * pa, a.1 - ny * pa),
         ];
         let cross = (b.0 - a.0) * ny - (b.1 - a.1) * nx;
         if cross < 0.0 {

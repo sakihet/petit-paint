@@ -447,8 +447,110 @@ struct StrokeSpec {
     brush: Option<BrushName>,
     /// Draw a smooth curve through the points instead of straight lines between them.
     smooth: Option<bool>,
+    /// Thin the line toward its ends, as a brush lifted off the paper does: how many
+    /// pixels each end takes to reach the full width, as one number for both ends or
+    /// [start, end].
+    taper: Option<TaperSpec>,
+    /// How hard the brush presses at each point, from 0 to 1, scaling the width there,
+    /// so the line swells and thins along its length: one number for each point.
+    pressure: Option<Vec<f32>>,
     #[serde(flatten)]
     placement: Placement,
+}
+
+/// How far a stroke's ends take to reach its full width.
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[schemars(crate = "rmcp::schemars")]
+enum TaperSpec {
+    /// The same at both ends.
+    Both(f32),
+    /// At the start and at the end.
+    Ends([f32; 2]),
+}
+
+// By hand, so a wrong taper is explained rather than reported as matching
+// neither form
+impl<'de> Deserialize<'de> for TaperSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = rmcp::serde_json::Value::deserialize(deserializer)?;
+        if let Some(both) = value.as_f64() {
+            return Ok(TaperSpec::Both(both as f32));
+        }
+        <[f32; 2]>::deserialize(value)
+            .map(TaperSpec::Ends)
+            .map_err(|_| serde::de::Error::custom("taper is a number of pixels or [start, end]"))
+    }
+}
+
+impl TaperSpec {
+    fn ends(&self) -> Result<[f32; 2]> {
+        let ends = match *self {
+            TaperSpec::Both(both) => [both, both],
+            TaperSpec::Ends(ends) => ends,
+        };
+        if ends.iter().any(|&end| end < 0.0) {
+            bail!("taper cannot be negative");
+        }
+        Ok(ends)
+    }
+}
+
+/// How hard the brush presses at each of `points`, from `given` at each of
+/// the `original` points the line was drawn through, and thinned toward the
+/// ends by `taper`. Empty when the brush presses fully everywhere.
+fn pressure_along(
+    original: &[Point<Pixels>],
+    points: &[Point<Pixels>],
+    given: Option<&[f32]>,
+    taper: Option<[f32; 2]>,
+) -> Vec<f32> {
+    if given.is_none() && taper.is_none() {
+        return Vec::new();
+    }
+    let distances = |points: &[Point<Pixels>]| {
+        let mut travelled = 0.0;
+        let mut distances = vec![0.0];
+        for pair in points.windows(2) {
+            let (dx, dy) = (
+                (pair[1].x - pair[0].x).as_f32(),
+                (pair[1].y - pair[0].y).as_f32(),
+            );
+            travelled += (dx * dx + dy * dy).sqrt();
+            distances.push(travelled);
+        }
+        distances
+    };
+    let (from, to) = (distances(original), distances(points));
+    let (from_length, length) = (*from.last().unwrap_or(&0.0), *to.last().unwrap_or(&0.0));
+    to.iter()
+        .map(|&distance| {
+            // The same share of the way along the line as drawn
+            let along = if length > 0.0 {
+                distance / length * from_length
+            } else {
+                0.0
+            };
+            let pressed = given.map_or(1.0, |given| {
+                let next = from.partition_point(|&d| d < along).min(given.len() - 1);
+                if next == 0 {
+                    return given[0];
+                }
+                let (d0, d1) = (from[next - 1], from[next]);
+                let t = if d1 > d0 {
+                    (along - d0) / (d1 - d0)
+                } else {
+                    1.0
+                };
+                given[next - 1] + (given[next] - given[next - 1]) * t.clamp(0.0, 1.0)
+            });
+            let thinned = taper.map_or(1.0, |[start, end]| {
+                let ramp = |d: f32, over: f32| if over > 0.0 { (d / over).min(1.0) } else { 1.0 };
+                ramp(distance, start).min(ramp(length - distance, end))
+            });
+            pressed * thinned
+        })
+        .collect()
 }
 
 impl StrokeSpec {
@@ -456,12 +558,29 @@ impl StrokeSpec {
         if self.points.is_empty() {
             bail!("give at least one point");
         }
-        let mut points = to_points(&self.points);
-        if self.smooth == Some(true) {
-            points = smooth(&points, false);
+        let original = to_points(&self.points);
+        let points = if self.smooth == Some(true) {
+            smooth(&original, false)
+        } else {
+            original.clone()
+        };
+        if let Some(pressure) = &self.pressure {
+            if pressure.len() != self.points.len() {
+                bail!(
+                    "pressure takes one number for each of the {} points, not {}",
+                    self.points.len(),
+                    pressure.len()
+                );
+            }
+            if pressure.iter().any(|p| !(0.0..=1.0).contains(p)) {
+                bail!("pressure must be between 0 and 1");
+            }
         }
+        let taper = self.taper.as_ref().map(TaperSpec::ends).transpose()?;
+        let pressure = pressure_along(&original, &points, self.pressure.as_deref(), taper);
         let mut stroke = Stroke {
             points,
+            pressure,
             color: parse_color(&self.color)?,
             width: parse_width(self.width)?,
             brush: self.brush.map_or(Brush::Pen, Brush::from),
@@ -1603,6 +1722,8 @@ mod tests {
             width: None,
             brush: None,
             smooth: None,
+            taper: None,
+            pressure: None,
             placement: placement(),
         }
     }
@@ -2249,6 +2370,80 @@ mod tests {
         for (params, error) in wrong {
             assert_eq!(filter(&server, params).unwrap_err(), error);
         }
+    }
+
+    /// How many pixels down column `x` are darker than light gray.
+    fn thickness(server: &PaintServer, x: u32) -> usize {
+        (0..100).filter(|&y| rgb_at(server, x, y).0 < 200).count()
+    }
+
+    #[test]
+    fn tapers_and_presses_strokes() {
+        for brush in ["pen", "oil", "calligraphy", "airbrush"] {
+            let server = server();
+            let line = rmcp::serde_json::json!([
+                {"type": "stroke", "points": [[10, 50], [90, 50]], "color": "#000000", "width": 20,
+                 "brush": brush, "taper": [40, 0]},
+            ]);
+            draw(&server, line).unwrap();
+            let (start, middle) = (thickness(&server, 14), thickness(&server, 70));
+            assert!(
+                start * 2 < middle,
+                "{brush}: {start} at the start, {middle} later"
+            );
+        }
+        let server = server();
+        let swelling = rmcp::serde_json::json!([
+            {"type": "stroke", "points": [[10, 50], [50, 50], [90, 50]], "color": "#000000",
+             "width": 20, "pressure": [0.2, 1, 0.2], "smooth": true},
+        ]);
+        draw(&server, swelling).unwrap();
+        let (end, middle) = (thickness(&server, 15), thickness(&server, 50));
+        assert!(
+            end * 2 < middle,
+            "{end} near the end, {middle} in the middle"
+        );
+    }
+
+    #[test]
+    fn refuses_wrong_pressure_and_taper() {
+        let server = server();
+        let wrong = [
+            (
+                rmcp::serde_json::json!({"pressure": [1]}),
+                "item 1: pressure takes one number for each of the 2 points, not 1; nothing was drawn",
+            ),
+            (
+                rmcp::serde_json::json!({"pressure": [1, 2]}),
+                "item 1: pressure must be between 0 and 1; nothing was drawn",
+            ),
+            (
+                rmcp::serde_json::json!({"taper": -1}),
+                "item 1: taper cannot be negative; nothing was drawn",
+            ),
+        ];
+        for (options, error) in wrong {
+            let mut item = rmcp::serde_json::json!({"type": "stroke", "points": [[10, 50], [90, 50]], "color": "#000000"});
+            item.as_object_mut()
+                .unwrap()
+                .extend(options.as_object().unwrap().clone());
+            assert_eq!(
+                draw(&server, rmcp::serde_json::json!([item])).unwrap_err(),
+                error
+            );
+        }
+        let params = rmcp::serde_json::json!({"image": 1, "items": [
+            {"type": "stroke", "points": [[10, 50], [90, 50]], "color": "#000000", "taper": "long"},
+        ]});
+        let error = rmcp::serde_json::from_value::<DrawParams>(params)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("taper is a number of pixels or [start, end]"),
+            "{error}"
+        );
     }
 
     #[test]
