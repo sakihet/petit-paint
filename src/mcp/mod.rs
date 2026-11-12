@@ -7,10 +7,13 @@ use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabiliti
 use rmcp::schemars::JsonSchema;
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::canvas::{Brush, DEFAULT_FILL_TOLERANCE, Fill, Orientation, PixelRect};
+use crate::canvas::{
+    Brush, Canvas, ClipMask, DEFAULT_FILL_TOLERANCE, Fill, Orientation, PixelRect,
+};
 use crate::pattern::{PATTERNS, Pattern};
 use crate::stroke::{ArcKind, Gradient, Stroke, smooth};
 use crate::text::{FontChoice, TextRenderer};
@@ -182,19 +185,167 @@ impl From<BlendName> for BlendMode {
 struct Placement {
     /// How it combines with the colors under it. Normal when left out.
     blend: Option<BlendName>,
-    /// Two opposite corners of a rectangle, as [x, y] pairs, to draw inside of. The
-    /// rest of the image is left as it is.
-    clip: Option<[[i32; 2]; 2]>,
+    /// Where to draw, leaving the rest of the image as it is: two opposite corners of a
+    /// rectangle as [x, y] pairs, or a mask, which can be a shape, the region around a
+    /// pixel, or one of draw's named masks.
+    clip: Option<ClipSpec>,
 }
 
 impl Placement {
-    fn apply(&self, strokes: &mut [Stroke]) -> Result<()> {
-        let clip = self.clip.map(to_rect).transpose()?;
+    fn apply(&self, strokes: &mut [Stroke], masks: &Masks) -> Result<()> {
+        let (clip, mask) = match &self.clip {
+            None => (None, None),
+            Some(ClipSpec::Rectangle(rect)) => (Some(to_rect(*rect)?), None),
+            Some(ClipSpec::Mask(mask)) => (None, Some(mask.build(masks)?)),
+        };
         for stroke in strokes {
             stroke.blend = self.blend.map_or(BlendMode::SourceOver, BlendMode::from);
             stroke.clip = clip;
+            stroke.mask = mask.clone();
         }
         Ok(())
+    }
+}
+
+/// Where a stroke or shape may draw.
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[schemars(crate = "rmcp::schemars")]
+enum ClipSpec {
+    /// Two opposite corners of a rectangle, as [x, y] pairs.
+    Rectangle([[i32; 2]; 2]),
+    Mask(MaskSpec),
+}
+
+// By hand, so a wrong mask is explained rather than reported as matching
+// neither a rectangle nor a mask
+impl<'de> Deserialize<'de> for ClipSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use rmcp::serde_json::Value;
+        match Value::deserialize(deserializer)? {
+            rect @ Value::Array(_) => <[[i32; 2]; 2]>::deserialize(rect)
+                .map(ClipSpec::Rectangle)
+                .map_err(serde::de::Error::custom),
+            mask @ Value::Object(_) => MaskSpec::deserialize(mask)
+                .map(ClipSpec::Mask)
+                .map_err(serde::de::Error::custom),
+            other => Err(serde::de::Error::custom(format!(
+                "clip is a rectangle's two corners or a mask such as {{\"shape\": ...}}, \
+                 not {other}"
+            ))),
+        }
+    }
+}
+
+/// An area with soft edges to draw inside of, or outside of. It is one of: a shape,
+/// as {"shape": "ellipse", "points": [[x, y], [x, y]]} with the options draw_shape
+/// takes; the region around a pixel that has about the same color, as fill finds it,
+/// as {"region": [x, y]}; or one of draw's named masks, as {"mask": "name"}.
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct MaskSpec {
+    /// A rectangle, ellipse, polygon, pie or chord to draw inside of.
+    shape: Option<ShapeName>,
+    /// The shape's points, as draw_shape takes them.
+    points: Option<Vec<[f32; 2]>>,
+    /// For a polygon: a smooth curve through its corners.
+    smooth: Option<bool>,
+    /// For a rectangle: how far its corners are rounded, in pixels.
+    radius: Option<f32>,
+    /// For a pie or chord: where it starts, in degrees clockwise from pointing right.
+    start_angle: Option<f32>,
+    /// For a pie or chord: where it ends, in degrees clockwise from start_angle.
+    end_angle: Option<f32>,
+    /// A pixel, as [x, y], whose region of about the same color to draw inside of. The
+    /// region is found in the image as it is before drawing.
+    region: Option<[f32; 2]>,
+    /// For a region: how different a pixel's color may be and still be in it, in
+    /// percent from 0 to 100. 25 when left out.
+    tolerance: Option<f32>,
+    /// The name of one of draw's masks.
+    mask: Option<String>,
+    /// Draw outside the area instead of inside it.
+    outside: Option<bool>,
+}
+
+/// What masks are made from: the image as it is before drawing, and draw's
+/// named masks.
+struct Masks<'a> {
+    canvas: &'a Canvas,
+    named: &'a BTreeMap<String, Arc<ClipMask>>,
+}
+
+impl MaskSpec {
+    fn build(&self, masks: &Masks) -> Result<Arc<ClipMask>> {
+        let kinds = [
+            self.shape.is_some(),
+            self.region.is_some(),
+            self.mask.is_some(),
+        ];
+        if kinds.iter().filter(|&&given| given).count() != 1 {
+            bail!("a mask takes one of shape, region or mask");
+        }
+        let size = masks.canvas.pixels();
+        let outside = || {
+            anyhow::anyhow!(
+                "the mask lies entirely outside the {}×{} image",
+                size.width(),
+                size.height()
+            )
+        };
+        let has_shape_options = self.points.is_some()
+            || self.smooth.is_some()
+            || self.radius.is_some()
+            || self.start_angle.is_some()
+            || self.end_angle.is_some();
+        let mask = if let Some(name) = self.shape {
+            if self.tolerance.is_some() {
+                bail!("tolerance is for region masks");
+            }
+            if matches!(name, ShapeName::Line | ShapeName::Arc) {
+                bail!("{} has no inside to draw in", name.label());
+            }
+            let points = self
+                .points
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("a shape mask takes points"))?;
+            let geometry = Geometry {
+                name,
+                points,
+                smooth: self.smooth,
+                radius: self.radius,
+                start_angle: self.start_angle,
+                end_angle: self.end_angle,
+            };
+            geometry.check()?;
+            let outline = geometry.outline(Stroke::default());
+            Arc::new(masks.canvas.shape_mask(&outline).ok_or_else(outside)?)
+        } else if let Some([x, y]) = self.region {
+            if has_shape_options {
+                bail!("points, smooth, radius and angles are for shape masks");
+            }
+            let size = (size.width() as f32, size.height() as f32);
+            if x < 0.0 || y < 0.0 || x >= size.0 || y >= size.1 {
+                bail!("({x}, {y}) is outside the {}×{} image", size.0, size.1);
+            }
+            let tolerance = parse_tolerance(self.tolerance)?;
+            let mask = masks.canvas.region_mask(point(px(x), px(y)), tolerance);
+            Arc::new(mask.ok_or_else(outside)?)
+        } else {
+            let name = self.mask.as_deref().unwrap_or_default();
+            if has_shape_options || self.tolerance.is_some() {
+                bail!("a named mask takes nothing but its name and outside");
+            }
+            let mask = masks.named.get(name).ok_or_else(|| {
+                anyhow::anyhow!("there is no mask named {name:?}; name it in draw's masks")
+            })?;
+            mask.clone()
+        };
+        Ok(if self.outside == Some(true) {
+            Arc::new((*mask).clone().inverted())
+        } else {
+            mask
+        })
     }
 }
 
@@ -218,7 +369,7 @@ struct StrokeSpec {
 }
 
 impl StrokeSpec {
-    fn build(&self, seed: u64) -> Result<Stroke> {
+    fn build(&self, seed: u64, masks: &Masks) -> Result<Stroke> {
         if self.points.is_empty() {
             bail!("give at least one point");
         }
@@ -234,7 +385,8 @@ impl StrokeSpec {
             seed,
             ..Default::default()
         };
-        self.placement.apply(std::slice::from_mut(&mut stroke))?;
+        self.placement
+            .apply(std::slice::from_mut(&mut stroke), masks)?;
         Ok(stroke)
     }
 }
@@ -367,24 +519,35 @@ struct ShapeSpec {
     placement: Placement,
 }
 
-impl ShapeSpec {
-    /// The fill, if any, then the outline, if any.
-    fn build(&self) -> Result<Vec<Stroke>> {
-        let name = self.shape;
-        let points = to_points(&self.points);
-        let two = points.len() == 2;
+/// The form of a shape, which shapes and masks share.
+struct Geometry<'a> {
+    name: ShapeName,
+    points: &'a [[f32; 2]],
+    smooth: Option<bool>,
+    radius: Option<f32>,
+    start_angle: Option<f32>,
+    end_angle: Option<f32>,
+}
+
+impl Geometry<'_> {
+    /// Fails unless the points and options fit the shape.
+    fn check(&self) -> Result<()> {
+        let name = self.name;
+        let count = self.points.len();
         let (takes, fits) = match name {
-            ShapeName::Line => ("a line takes its two ends", two),
-            ShapeName::Rectangle => ("a rectangle takes two opposite corners", two),
-            ShapeName::Ellipse => ("an ellipse takes two opposite corners of its box", two),
+            ShapeName::Line => ("a line takes its two ends", count == 2),
+            ShapeName::Rectangle => ("a rectangle takes two opposite corners", count == 2),
+            ShapeName::Ellipse => (
+                "an ellipse takes two opposite corners of its box",
+                count == 2,
+            ),
             ShapeName::Arc | ShapeName::Pie | ShapeName::Chord => (
                 "an arc, pie or chord takes two opposite corners of its ellipse's box",
-                two,
+                count == 2,
             ),
-            ShapeName::Polygon => ("a polygon takes three or more corners", points.len() >= 3),
+            ShapeName::Polygon => ("a polygon takes three or more corners", count >= 3),
         };
         if !fits {
-            let count = points.len();
             bail!(
                 "{takes}, not {count} {}",
                 if count == 1 { "point" } else { "points" }
@@ -397,15 +560,65 @@ impl ShapeSpec {
         if self.radius.is_some() && name != ShapeName::Rectangle {
             bail!("radius is for rectangles, not {}", name.label());
         }
-        let angles = match (self.start_angle, self.end_angle) {
-            (Some(from), Some(to)) if arc => Some((from, to)),
-            (None, None) if !arc => None,
+        match (self.start_angle, self.end_angle) {
+            (Some(_), Some(_)) if arc => {}
+            (None, None) if !arc => {}
             _ if arc => bail!("{} takes both start_angle and end_angle", name.label()),
             _ => bail!("start_angle and end_angle are for arcs, pies and chords"),
-        };
+        }
         if self.radius.is_some_and(|radius| radius < 0.0) {
             bail!("radius cannot be negative");
         }
+        Ok(())
+    }
+
+    /// The shape's outline, drawn with `base`'s color, width and fill. The
+    /// geometry must have passed [`Self::check`].
+    fn outline(&self, base: Stroke) -> Stroke {
+        let points = to_points(self.points);
+        let angles = self.start_angle.zip(self.end_angle).unwrap_or((0.0, 360.0));
+        match self.name {
+            ShapeName::Polygon if self.smooth == Some(true) => Stroke {
+                // Curves join smoothly
+                sharp_corners: false,
+                ..Stroke::polygon(smooth(&points, true), true, base)
+            },
+            ShapeName::Polygon => Stroke::polygon(points, true, base),
+            ShapeName::Rectangle => match self.radius {
+                Some(radius) => Stroke::rounded_rectangle(points[0], points[1], radius, base),
+                None => Stroke::shape(ShapeKind::Rectangle, points[0], points[1], base),
+            },
+            ShapeName::Line => Stroke::shape(ShapeKind::Line, points[0], points[1], base),
+            ShapeName::Ellipse => Stroke::shape(ShapeKind::Ellipse, points[0], points[1], base),
+            ShapeName::Arc | ShapeName::Pie | ShapeName::Chord => {
+                let kind = match self.name {
+                    ShapeName::Arc => ArcKind::Arc,
+                    ShapeName::Pie => ArcKind::Pie,
+                    _ => ArcKind::Chord,
+                };
+                Stroke::arc(points[0], points[1], angles.0, angles.1, kind, base)
+            }
+        }
+    }
+}
+
+impl ShapeSpec {
+    fn geometry(&self) -> Geometry<'_> {
+        Geometry {
+            name: self.shape,
+            points: &self.points,
+            smooth: self.smooth,
+            radius: self.radius,
+            start_angle: self.start_angle,
+            end_angle: self.end_angle,
+        }
+    }
+
+    /// The fill, if any, then the outline, if any.
+    fn build(&self, masks: &Masks) -> Result<Vec<Stroke>> {
+        let name = self.shape;
+        let geometry = self.geometry();
+        geometry.check()?;
         if self.outline.is_none() && self.fill.is_none() {
             bail!("give an outline color, a fill color or both");
         }
@@ -419,28 +632,7 @@ impl ShapeSpec {
         let fill = self.fill.as_ref().map(FillSpec::parse).transpose()?;
         let width = parse_width(self.width)?;
 
-        let shape = |base: Stroke| match (name, angles) {
-            (ShapeName::Polygon, _) if self.smooth == Some(true) => Stroke {
-                // Curves join smoothly
-                sharp_corners: false,
-                ..Stroke::polygon(smooth(&points, true), true, base)
-            },
-            (ShapeName::Polygon, _) => Stroke::polygon(points.clone(), true, base),
-            (ShapeName::Rectangle, _) => match self.radius {
-                Some(radius) => Stroke::rounded_rectangle(points[0], points[1], radius, base),
-                None => Stroke::shape(ShapeKind::Rectangle, points[0], points[1], base),
-            },
-            (ShapeName::Line, _) => Stroke::shape(ShapeKind::Line, points[0], points[1], base),
-            (ShapeName::Arc | ShapeName::Pie | ShapeName::Chord, Some((from, to))) => {
-                let kind = match name {
-                    ShapeName::Arc => ArcKind::Arc,
-                    ShapeName::Pie => ArcKind::Pie,
-                    _ => ArcKind::Chord,
-                };
-                Stroke::arc(points[0], points[1], from, to, kind, base)
-            }
-            _ => Stroke::shape(ShapeKind::Ellipse, points[0], points[1], base),
-        };
+        let shape = |base: Stroke| geometry.outline(base);
         let mut strokes = Vec::new();
         if let Some((color, gradient)) = fill {
             strokes.push(shape(Stroke {
@@ -458,7 +650,7 @@ impl ShapeSpec {
                 ..Default::default()
             }));
         }
-        self.placement.apply(&mut strokes)?;
+        self.placement.apply(&mut strokes, masks)?;
         Ok(strokes)
     }
 }
@@ -500,6 +692,9 @@ struct DrawParams {
     /// {"type": "stroke", ...} with draw_stroke's arguments or {"type": "shape", ...}
     /// with draw_shape's, without the image.
     items: Vec<DrawItem>,
+    /// Masks by name, which items use as "clip": {"mask": "name"}, so one outline
+    /// serves many items. They are made from the image as it is before drawing.
+    masks: Option<BTreeMap<String, MaskSpec>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -742,7 +937,12 @@ impl PaintServer {
     ) -> Result<String, String> {
         let mut images = self.images();
         let image = images.get_mut(params.image).map_err(message)?;
-        let stroke = params.stroke.build(image.next_seed()).map_err(message)?;
+        let seed = image.next_seed();
+        let masks = Masks {
+            canvas: &image.canvas,
+            named: &BTreeMap::new(),
+        };
+        let stroke = params.stroke.build(seed, &masks).map_err(message)?;
         image.draw(&[stroke]).map_err(message)?;
         Ok(format!("Drew a stroke on image {}", params.image))
     }
@@ -755,9 +955,13 @@ impl PaintServer {
         &self,
         Parameters(params): Parameters<DrawShapeParams>,
     ) -> Result<String, String> {
-        let strokes = params.shape.build().map_err(message)?;
         let mut images = self.images();
         let image = images.get_mut(params.image).map_err(message)?;
+        let masks = Masks {
+            canvas: &image.canvas,
+            named: &BTreeMap::new(),
+        };
+        let strokes = params.shape.build(&masks).map_err(message)?;
         image.draw(&strokes).map_err(message)?;
         Ok(format!(
             "Drew {} on image {}",
@@ -777,11 +981,31 @@ impl PaintServer {
         let mut images = self.images();
         let image = images.get_mut(params.image).map_err(message)?;
         let size = image.size();
+        let mut named = BTreeMap::new();
+        for (name, spec) in params.masks.iter().flatten() {
+            let masks = Masks {
+                canvas: &image.canvas,
+                named: &BTreeMap::new(),
+            };
+            let mask = if spec.mask.is_some() {
+                Err(anyhow::anyhow!("a named mask cannot be another named mask"))
+            } else {
+                spec.build(&masks)
+            };
+            let mask =
+                mask.map_err(|error| format!("mask {name:?}: {error:#}; nothing was drawn"))?;
+            named.insert(name.clone(), mask);
+        }
         let mut strokes = Vec::new();
         for (index, item) in params.items.iter().enumerate() {
+            let seed = image.next_seed();
+            let masks = Masks {
+                canvas: &image.canvas,
+                named: &named,
+            };
             let built = match item {
-                DrawItem::Stroke(stroke) => stroke.build(image.next_seed()).map(|s| vec![s]),
-                DrawItem::Shape(shape) => shape.build(),
+                DrawItem::Stroke(stroke) => stroke.build(seed, &masks).map(|s| vec![s]),
+                DrawItem::Shape(shape) => shape.build(&masks),
             }
             .and_then(|built| {
                 if !built.iter().any(|stroke| image.canvas.reaches(stroke)) {
@@ -819,14 +1043,7 @@ impl PaintServer {
                 return Err("a pattern other than solid needs a second_color".into());
             }
         };
-        let percent = params
-            .tolerance
-            .unwrap_or(tolerance_percent(DEFAULT_FILL_TOLERANCE));
-        if !(0.0..=100.0).contains(&percent) {
-            return Err(format!(
-                "tolerance must be between 0 and 100, not {percent}"
-            ));
-        }
+        let tolerance = parse_tolerance(params.tolerance).map_err(message)?;
         let mut images = self.images();
         let image = images.get_mut(params.image).map_err(message)?;
         let [x, y] = params.point;
@@ -838,7 +1055,7 @@ impl PaintServer {
         };
         let undo = image
             .canvas
-            .flood_fill(point(px(x), px(y)), fill, tolerance_from_percent(percent))
+            .flood_fill(point(px(x), px(y)), fill, tolerance)
             .ok_or("nothing changed, as the region already has that color")?;
         image.history.record(undo);
         Ok(format!(
@@ -1063,6 +1280,16 @@ fn parse_color(text: &str) -> Result<Hsla> {
         (8, Some(value)) => Ok(rgba(value).into()),
         _ => bail!("{text:?} is not a color; use #rrggbb or #rrggbbaa"),
     }
+}
+
+/// A fill tolerance from a percentage from 0 to 100, the fill tool's
+/// default when left out.
+fn parse_tolerance(percent: Option<f32>) -> Result<u8> {
+    let percent = percent.unwrap_or(tolerance_percent(DEFAULT_FILL_TOLERANCE));
+    if !(0.0..=100.0).contains(&percent) {
+        bail!("tolerance must be between 0 and 100, not {percent}");
+    }
+    Ok(tolerance_from_percent(percent))
 }
 
 /// A width in pixels from `MIN_WIDTH` to `MAX_WIDTH`, `DEFAULT_WIDTH` when
@@ -1658,7 +1885,7 @@ mod tests {
             fill: Some("#404040".into()),
             placement: Placement {
                 blend: Some(BlendName::Add),
-                clip: Some([[0, 0], [100, 50]]),
+                clip: Some(ClipSpec::Rectangle([[0, 0], [100, 50]])),
             },
             ..shape(ShapeName::Ellipse, &[[20.0, 20.0], [80.0, 80.0]])
         };
@@ -1671,7 +1898,7 @@ mod tests {
             fill: Some("#ffffff".into()),
             placement: Placement {
                 blend: None,
-                clip: Some([[0, 60], [10, 70]]),
+                clip: Some(ClipSpec::Rectangle([[0, 60], [10, 70]])),
             },
             ..shape(ShapeName::Ellipse, &[[20.0, 20.0], [80.0, 40.0]])
         };
@@ -1768,6 +1995,142 @@ mod tests {
             let error = wrong(fill);
             assert!(error.contains(expected), "{expected}: {error}");
         }
+    }
+
+    #[test]
+    fn keeps_shading_inside_and_outside_a_shape() {
+        let server = server();
+        draw(
+            &server,
+            rmcp::serde_json::json!([
+                {"type": "shape", "shape": "rectangle", "points": [[0, 0], [100, 100]], "fill": "#000000",
+                 "clip": {"shape": "ellipse", "points": [[20, 20], [80, 80]]}},
+                {"type": "shape", "shape": "rectangle", "points": [[0, 0], [100, 100]], "fill": "#ff0000",
+                 "clip": {"shape": "ellipse", "points": [[20, 20], [80, 80]], "outside": true}},
+            ]),
+        )
+        .unwrap();
+        assert_eq!(rgb_at(&server, 50, 50), (0, 0, 0));
+        assert_eq!(rgb_at(&server, 22, 22), (255, 0, 0));
+        assert_eq!(rgb_at(&server, 50, 5), (255, 0, 0));
+    }
+
+    #[test]
+    fn region_masks_shade_what_is_already_drawn() {
+        let server = server();
+        let face = ShapeSpec {
+            fill: Some("#f0c8a0".into()),
+            ..shape(ShapeName::Ellipse, &[[20.0, 10.0], [80.0, 90.0]])
+        };
+        draw_shape(&server, face).unwrap();
+        // A wide shadow across the bottom stays on the face
+        let shadow = rmcp::serde_json::json!([
+            {"type": "shape", "shape": "rectangle", "points": [[0, 60], [100, 100]], "fill": "#80604080",
+             "blend": "multiply", "clip": {"region": [50, 50], "tolerance": 10}},
+        ]);
+        draw(&server, shadow).unwrap();
+        let (lit, shaded) = (rgb_at(&server, 50, 40), rgb_at(&server, 50, 80));
+        assert_eq!(lit, (240, 200, 160));
+        assert!(shaded.0 < 220, "{shaded:?}");
+        assert_eq!(rgb_at(&server, 5, 80), (255, 255, 255));
+    }
+
+    #[test]
+    fn named_masks_serve_many_items() {
+        let server = server();
+        let params = rmcp::serde_json::json!({
+            "image": 1,
+            "masks": {"top": {"shape": "rectangle", "points": [[0, 0], [100, 50]]}},
+            "items": [
+                {"type": "stroke", "points": [[20, 0], [20, 100]], "color": "#000000", "width": 6,
+                 "clip": {"mask": "top"}},
+                {"type": "stroke", "points": [[80, 0], [80, 100]], "color": "#0000ff", "width": 6,
+                 "clip": {"mask": "top", "outside": true}},
+            ],
+        });
+        server
+            .draw(Parameters(rmcp::serde_json::from_value(params).unwrap()))
+            .unwrap();
+        assert_eq!(rgb_at(&server, 20, 30), (0, 0, 0));
+        assert_eq!(rgb_at(&server, 20, 70), (255, 255, 255));
+        assert_eq!(rgb_at(&server, 80, 30), (255, 255, 255));
+        assert_eq!(rgb_at(&server, 80, 70), (0, 0, 255));
+    }
+
+    #[test]
+    fn explains_wrong_masks_and_draws_nothing() {
+        let server = server();
+        let wrong = |masks: rmcp::serde_json::Value, clip: rmcp::serde_json::Value| {
+            let params = rmcp::serde_json::json!({
+                "image": 1,
+                "masks": masks,
+                "items": [{"type": "stroke", "points": [[10, 10], [90, 90]], "color": "#000000", "clip": clip}],
+            });
+            match rmcp::serde_json::from_value::<DrawParams>(params) {
+                Err(error) => error.to_string(),
+                Ok(params) => server.draw(Parameters(params)).unwrap_err(),
+            }
+        };
+        let none = rmcp::serde_json::json!({});
+        let cases = [
+            (
+                none.clone(),
+                rmcp::serde_json::json!({"mask": "face"}),
+                "no mask named",
+            ),
+            (
+                none.clone(),
+                rmcp::serde_json::json!({}),
+                "one of shape, region or mask",
+            ),
+            (
+                none.clone(),
+                rmcp::serde_json::json!({"shape": "ellipse", "region": [5, 5]}),
+                "one of shape, region or mask",
+            ),
+            (
+                none.clone(),
+                rmcp::serde_json::json!({"shape": "ellipse"}),
+                "takes points",
+            ),
+            (
+                none.clone(),
+                rmcp::serde_json::json!({"shape": "arc", "points": [[0, 0], [9, 9]], "start_angle": 0, "end_angle": 90}),
+                "no inside",
+            ),
+            (
+                none.clone(),
+                rmcp::serde_json::json!({"shape": "ellipse", "points": [[200, 200], [300, 300]]}),
+                "outside the 100×100 image",
+            ),
+            (
+                none.clone(),
+                rmcp::serde_json::json!({"region": [500, 5]}),
+                "outside",
+            ),
+            (
+                none.clone(),
+                rmcp::serde_json::json!({"region": [5, 5], "points": [[0, 0], [1, 1]]}),
+                "for shape masks",
+            ),
+            (
+                none.clone(),
+                rmcp::serde_json::json!({"region": [5, 5], "tolerance": 200}),
+                "tolerance",
+            ),
+            (none.clone(), rmcp::serde_json::json!("everywhere"), "clip"),
+            (
+                rmcp::serde_json::json!({"a": {"mask": "b"}}),
+                rmcp::serde_json::json!({"mask": "a"}),
+                "mask \"a\": a named mask cannot be another",
+            ),
+        ];
+        for (masks, clip, expected) in cases {
+            let error = wrong(masks, clip.clone());
+            assert!(error.contains(expected), "{clip}: {expected}: {error}");
+        }
+        assert_eq!(rgb_at(&server, 50, 50), (255, 255, 255));
+        assert!(server.undo(image(1)).is_err());
     }
 
     #[test]

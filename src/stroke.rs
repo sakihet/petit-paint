@@ -1,6 +1,7 @@
-use crate::canvas::{Brush, PixelRect};
+use crate::canvas::{Brush, ClipMask, PixelRect};
 use crate::tool::ShapeKind;
 use gpui_kit::{Hsla, Pixels, Point, point, px};
+use std::sync::Arc;
 use tiny_skia::BlendMode;
 
 /// A line through `points`: a brush stroke or a shape's outline. Points are
@@ -27,6 +28,8 @@ pub struct Stroke {
     pub blend: BlendMode,
     /// Keeps the stroke inside this part of the canvas.
     pub clip: Option<PixelRect>,
+    /// Keeps the stroke inside, or outside, an area with soft edges.
+    pub mask: Option<Arc<ClipMask>>,
     /// Fills the inside with these colors in place of `color`.
     pub gradient: Option<Gradient>,
 }

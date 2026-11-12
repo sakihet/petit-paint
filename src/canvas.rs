@@ -288,6 +288,57 @@ impl Brush {
     }
 }
 
+/// A soft-edged area that a stroke is kept inside of, or outside of. Only
+/// the box around the area is kept, so masks stay small on a large canvas.
+#[derive(Clone)]
+pub struct ClipMask {
+    /// The canvas pixel at the top-left of `coverage`.
+    x: i32,
+    y: i32,
+    /// How much of each pixel is inside the area, from 0 to 255.
+    coverage: tiny_skia::Mask,
+    /// Keeps strokes outside the area instead.
+    inverted: bool,
+}
+
+impl ClipMask {
+    /// The same area, keeping strokes on its other side.
+    pub fn inverted(self) -> Self {
+        ClipMask {
+            inverted: !self.inverted,
+            ..self
+        }
+    }
+
+    /// How much of the canvas pixel at (`x`, `y`) a stroke may cover, from 0
+    /// to 255.
+    fn at(&self, x: i32, y: i32) -> u8 {
+        let (mx, my) = (x - self.x, y - self.y);
+        let (width, height) = (self.coverage.width() as i32, self.coverage.height() as i32);
+        let inside = if mx >= 0 && my >= 0 && mx < width && my < height {
+            self.coverage.data()[(my * width + mx) as usize]
+        } else {
+            0
+        };
+        if self.inverted { 255 - inside } else { inside }
+    }
+
+    /// Limits the box from (`left`, `top`) to (`right`, `bottom`) to the part
+    /// a stroke may cover.
+    fn limit(&self, (left, top, right, bottom): (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+        if self.inverted {
+            return (left, top, right, bottom);
+        }
+        let (x, y) = (self.x as f32, self.y as f32);
+        (
+            left.max(x),
+            top.max(y),
+            right.min(x + self.coverage.width() as f32),
+            bottom.min(y + self.coverage.height() as f32),
+        )
+    }
+}
+
 /// A stroke rendered on its own, to blend onto the canvas with its top-left at `at`.
 pub struct StrokeLayer {
     pub pixels: Pixmap,
@@ -416,6 +467,23 @@ impl Canvas {
                 .unwrap_or(*pixel);
             }
         }
+        if let Some(mask) = &stroke.mask {
+            let width = pixels.width() as i32;
+            for (i, pixel) in pixels.pixels_mut().iter_mut().enumerate() {
+                let (x, y) = (rect.x() + i as i32 % width, rect.y() + i as i32 / width);
+                let coverage = mask.at(x, y) as u16;
+                if coverage < 255 {
+                    let scale = |c: u8| ((c as u16 * coverage + 127) / 255) as u8;
+                    *pixel = PremultipliedColorU8::from_rgba(
+                        scale(pixel.red()),
+                        scale(pixel.green()),
+                        scale(pixel.blue()),
+                        scale(pixel.alpha()),
+                    )
+                    .unwrap_or(PremultipliedColorU8::TRANSPARENT);
+                }
+            }
+        }
         Some(StrokeLayer {
             pixels,
             at: Point::new(rect.x(), rect.y()),
@@ -434,13 +502,52 @@ impl Canvas {
         tolerance: u8,
     ) -> Option<Change> {
         let (seed_x, seed_y) = self.pixel_at(position)?;
-        let (width, height) = (self.pixmap.width() as usize, self.pixmap.height() as usize);
+        let width = self.pixmap.width() as usize;
         let target = self.pixmap.pixels()[seed_y * width + seed_x].demultiply();
         let foreground = to_skia_color(fill.foreground).to_color_u8();
         let background = to_skia_color(fill.background).to_color_u8();
         if fill.pattern.is_solid() && target == foreground {
             return None;
         }
+        let spans = self.region(seed_x, seed_y, tolerance);
+
+        let left = spans.iter().map(|&(_, start, _)| start).min()?;
+        let right = spans.iter().map(|&(_, _, end)| end).max()?;
+        let top = spans.iter().map(|&(y, _, _)| y).min()?;
+        let bottom = spans.iter().map(|&(y, _, _)| y).max()? + 1;
+        let rect = IntRect::from_ltrb(left as i32, top as i32, right as i32, bottom as i32)?;
+        let undo = self.snapshot(rect)?;
+
+        let (foreground, background) = (foreground.premultiply(), background.premultiply());
+        let pixels = self.pixmap.pixels_mut();
+        let mut changed = false;
+        for (y, start, end) in spans {
+            for x in start..end {
+                let pixel = &mut pixels[y * width + x];
+                let color = if fill.pattern.is_set(x, y) {
+                    foreground
+                } else {
+                    background
+                };
+                let filled = source_over(color, *pixel);
+                changed |= filled != *pixel;
+                *pixel = filled;
+            }
+        }
+        // Refilling a pattern with itself leaves every pixel as it was
+        if !changed {
+            return None;
+        }
+        self.version += 1;
+        Some(undo)
+    }
+
+    /// The pixels connected to (`seed_x`, `seed_y`) whose color is within
+    /// `tolerance` of its color in every channel, as rows of (y, start, end)
+    /// with `end` past the last pixel.
+    fn region(&self, seed_x: usize, seed_y: usize, tolerance: u8) -> Vec<(usize, usize, usize)> {
+        let (width, height) = (self.pixmap.width() as usize, self.pixmap.height() as usize);
+        let target = self.pixmap.pixels()[seed_y * width + seed_x].demultiply();
         let matches = |c: ColorU8| {
             c.red().abs_diff(target.red()) <= tolerance
                 && c.green().abs_diff(target.green()) <= tolerance
@@ -490,35 +597,87 @@ impl Canvas {
             }
         }
 
-        let left = spans.iter().map(|&(_, start, _)| start).min()?;
-        let right = spans.iter().map(|&(_, _, end)| end).max()?;
-        let top = spans.iter().map(|&(y, _, _)| y).min()?;
-        let bottom = spans.iter().map(|&(y, _, _)| y).max()? + 1;
-        let rect = IntRect::from_ltrb(left as i32, top as i32, right as i32, bottom as i32)?;
-        let undo = self.snapshot(rect)?;
+        spans
+    }
 
-        let (foreground, background) = (foreground.premultiply(), background.premultiply());
-        let pixels = self.pixmap.pixels_mut();
-        let mut changed = false;
+    /// A mask over the inside of `outline`, closed from its last point back
+    /// to its first, with anti-aliased edges. Returns `None` when it lies
+    /// entirely outside the canvas.
+    pub fn shape_mask(&self, outline: &Stroke) -> Option<ClipMask> {
+        let (first, rest) = outline.points.split_first()?;
+        let mut builder = PathBuilder::new();
+        builder.move_to(first.x.as_f32(), first.y.as_f32());
+        for p in rest {
+            builder.line_to(p.x.as_f32(), p.y.as_f32());
+        }
+        builder.close();
+        let path = builder.finish()?;
+        let bounds = path.bounds();
+        let rect = self.clip(
+            bounds.left() - 1.0,
+            bounds.top() - 1.0,
+            bounds.right() + 1.0,
+            bounds.bottom() + 1.0,
+        )?;
+        let mut coverage = tiny_skia::Mask::new(rect.width(), rect.height())?;
+        let transform = Transform::from_translate(-rect.x() as f32, -rect.y() as f32);
+        coverage.fill_path(&path, FillRule::Winding, true, transform);
+        Some(ClipMask {
+            x: rect.x(),
+            y: rect.y(),
+            coverage,
+            inverted: false,
+        })
+    }
+
+    /// A mask over the region around `position` that has about the same
+    /// color, as [`Self::flood_fill`] finds it, softened by a pixel at its
+    /// edges. Returns `None` when `position` is outside the canvas.
+    pub fn region_mask(&self, position: Point<Pixels>, tolerance: u8) -> Option<ClipMask> {
+        let (seed_x, seed_y) = self.pixel_at(position)?;
+        let spans = self.region(seed_x, seed_y, tolerance);
+        // One pixel round the region, for the softened edge
+        let left = spans
+            .iter()
+            .map(|&(_, start, _)| start)
+            .min()?
+            .saturating_sub(1);
+        let top = spans.iter().map(|&(y, _, _)| y).min()?.saturating_sub(1);
+        let right =
+            (spans.iter().map(|&(_, _, end)| end).max()? + 1).min(self.pixmap.width() as usize);
+        let bottom =
+            (spans.iter().map(|&(y, _, _)| y).max()? + 2).min(self.pixmap.height() as usize);
+        let (width, height) = (right - left, bottom - top);
+        let mut inside = vec![0u8; width * height];
         for (y, start, end) in spans {
-            for x in start..end {
-                let pixel = &mut pixels[y * width + x];
-                let color = if fill.pattern.is_set(x, y) {
-                    foreground
-                } else {
-                    background
-                };
-                let filled = source_over(color, *pixel);
-                changed |= filled != *pixel;
-                *pixel = filled;
+            let row = (y - top) * width;
+            inside[row + start - left..row + end - left].fill(255);
+        }
+        // Average each pixel with its neighbors, so the edge fades over a pixel
+        let at = |x: isize, y: isize| {
+            if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
+                0
+            } else {
+                inside[y as usize * width + x as usize] as u32
             }
-        }
-        // Refilling a pattern with itself leaves every pixel as it was
-        if !changed {
-            return None;
-        }
-        self.version += 1;
-        Some(undo)
+        };
+        let softened = (0..height as isize)
+            .flat_map(|y| (0..width as isize).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let sum: u32 = (-1..=1)
+                    .flat_map(|dy| (-1..=1).map(move |dx| (dx, dy)))
+                    .map(|(dx, dy)| at(x + dx, y + dy))
+                    .sum();
+                (sum / 9) as u8
+            })
+            .collect();
+        let size = tiny_skia::IntSize::from_wh(width as u32, height as u32)?;
+        Some(ClipMask {
+            x: left as i32,
+            y: top as i32,
+            coverage: tiny_skia::Mask::from_vec(softened, size)?,
+            inverted: false,
+        })
     }
 
     /// Returns the color at `position`, or `None` when it is outside the canvas.
@@ -971,6 +1130,9 @@ impl Canvas {
             top = top.max(clip.y as f32);
             right = right.min((clip.x + clip.width as i32) as f32);
             bottom = bottom.min((clip.y + clip.height as i32) as f32);
+        }
+        if let Some(mask) = &stroke.mask {
+            (left, top, right, bottom) = mask.limit((left, top, right, bottom));
         }
         self.clip(left, top, right, bottom)
     }
@@ -1555,6 +1717,90 @@ mod tests {
         assert!(rgb_at(&canvas, 50, 50).0 > 240);
         // Past the radius the last stop, transparent, leaves the linear fill
         assert_eq!(rgb_at(&canvas, 98, 98), right);
+    }
+
+    fn square(x: f32, y: f32, side: f32) -> Stroke {
+        Stroke {
+            closed: true,
+            ..stroke(
+                &[(x, y), (x + side, y), (x + side, y + side), (x, y + side)],
+                0x000000,
+                0.0,
+            )
+        }
+    }
+
+    fn masked(mask: ClipMask) -> Stroke {
+        Stroke {
+            width: px(0.0),
+            filled: true,
+            mask: Some(std::sync::Arc::new(mask)),
+            ..square(0.0, 0.0, 100.0)
+        }
+    }
+
+    #[test]
+    fn shape_masks_keep_strokes_inside_with_soft_edges() {
+        let mut canvas = canvas(100, 100);
+        let circle = Stroke::shape(
+            crate::tool::ShapeKind::Ellipse,
+            point(px(20.0), px(20.0)),
+            point(px(80.0), px(80.0)),
+            Stroke::default(),
+        );
+        let mask = canvas.shape_mask(&circle).unwrap();
+        canvas.draw_stroke(&masked(mask.clone())).unwrap();
+        assert_eq!(rgb_at(&canvas, 50, 50), (0, 0, 0));
+        assert_eq!(rgb_at(&canvas, 22, 22), (255, 255, 255));
+        // Where the edge cuts across pixels, they are neither black nor white
+        let edge: Vec<u8> = (26..32).map(|i| rgb_at(&canvas, i, i).0).collect();
+        assert!(edge.iter().any(|&v| v > 0 && v < 255), "{edge:?}");
+
+        let mut outside = self::canvas(100, 100);
+        outside.draw_stroke(&masked(mask.inverted())).unwrap();
+        assert_eq!(rgb_at(&outside, 50, 50), (255, 255, 255));
+        assert_eq!(rgb_at(&outside, 22, 22), (0, 0, 0));
+    }
+
+    #[test]
+    fn region_masks_follow_what_is_drawn() {
+        let mut canvas = canvas(100, 100);
+        // A red square to shade, inside a white canvas
+        canvas.draw_stroke(&Stroke {
+            width: px(0.0),
+            filled: true,
+            color: rgb(0xff0000).into(),
+            ..square(30.0, 30.0, 40.0)
+        });
+        let mask = canvas.region_mask(point(px(50.0), px(50.0)), 10).unwrap();
+        canvas
+            .draw_stroke(&Stroke {
+                color: rgb(0x0000ff).into(),
+                ..masked(mask)
+            })
+            .unwrap();
+        assert_eq!(rgb_at(&canvas, 50, 50), (0, 0, 255));
+        assert_eq!(rgb_at(&canvas, 32, 32), (0, 0, 255));
+        assert_eq!(rgb_at(&canvas, 10, 10), (255, 255, 255));
+        assert_eq!(rgb_at(&canvas, 28, 50), (255, 255, 255));
+        assert!(canvas.region_mask(point(px(150.0), px(50.0)), 10).is_none());
+    }
+
+    #[test]
+    fn strokes_outside_a_mask_do_not_reach_the_canvas() {
+        let canvas = canvas(100, 100);
+        let mask = canvas.shape_mask(&square(0.0, 0.0, 20.0)).unwrap();
+        let far = Stroke {
+            mask: Some(std::sync::Arc::new(mask.clone())),
+            ..stroke(&[(60.0, 60.0), (90.0, 60.0)], 0x000000, 4.0)
+        };
+        assert!(!canvas.reaches(&far));
+        let everywhere_else = Stroke {
+            mask: Some(std::sync::Arc::new(mask.inverted())),
+            ..far
+        };
+        assert!(canvas.reaches(&everywhere_else));
+        assert!(canvas.shape_mask(&square(200.0, 200.0, 20.0)).is_none());
     }
 
     #[test]
