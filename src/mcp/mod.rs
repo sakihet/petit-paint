@@ -31,7 +31,9 @@ Create an image with new_image or open a file with open_image; each gets an id t
 other tools take. Draw on it with draw_stroke and draw_shape, or many strokes and shapes \
 at once with draw; fill regions with fill and write with draw_text. Shapes can be filled \
 with gradients, polygons and strokes drawn as smooth curves, and anything blended (add for \
-light, multiply for shadow) or clipped to a rectangle. Coordinates are in image \
+light, multiply for shadow) or clipped. A clip is a rectangle or a mask: a shape, or the \
+region around a pixel of about the same color, which keeps shading inside something already \
+drawn; draw can name masks once for many items. Coordinates are in image \
 pixels from the top-left. Colors are #rrggbb or #rrggbbaa. Call view_image to look at the result, and save_image to write \
 it to a file. Relative paths are taken from the server's working directory.";
 
