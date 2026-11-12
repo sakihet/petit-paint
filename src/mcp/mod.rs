@@ -33,7 +33,8 @@ at once with draw; fill regions with fill and write with draw_text. Shapes can b
 with gradients, polygons and strokes drawn as smooth curves, and anything blended (add for \
 light, multiply for shadow) or clipped. A clip is a rectangle or a mask: a shape, or the \
 region around a pixel of about the same color, which keeps shading inside something already \
-drawn; draw can name masks once for many items. Coordinates are in image \
+drawn. Masks combine with all and any, and one with outside is cut out of the rest, as for \
+a crescent moon; draw can name masks once for many items. Coordinates are in image \
 pixels from the top-left. Colors are #rrggbb or #rrggbbaa. Call view_image to look at the result, and save_image to write \
 it to a file. Relative paths are taken from the server's working directory.";
 

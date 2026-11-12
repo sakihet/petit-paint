@@ -79,7 +79,7 @@ Images are kept in memory by id until they are saved. Coordinates are in image p
 | `pick_color` | Read the color of a pixel |
 | `undo` / `redo` | Take back or redo changes, separately for each image |
 
-Shapes can be filled with linear or radial gradients and rectangles can have rounded corners. Strokes and polygons can be drawn as smooth curves through their points. Any stroke or shape can be blended with what is under it (normal, add, screen or multiply) and clipped: to a rectangle, to a shape, or to the region around a pixel that has about the same color, keeping inside or outside it with soft edges. `draw` can name masks once for many of its items to use.
+Shapes can be filled with linear or radial gradients and rectangles can have rounded corners. Strokes and polygons can be drawn as smooth curves through their points. Any stroke or shape can be blended with what is under it (normal, add, screen or multiply) and clipped: to a rectangle, to a shape, or to the region around a pixel that has about the same color, keeping inside or outside it with soft edges. Masks combine with `all` and `any`, so one can be cut out of another, as for a crescent moon. `draw` can name masks once for many of its items to use.
 
 ## License
 
