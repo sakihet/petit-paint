@@ -21,6 +21,7 @@ use zoom::DEFAULT_ZOOM_INDEX;
 mod assets;
 mod canvas;
 mod file;
+mod mcp;
 mod pan;
 mod pattern;
 mod selection;
@@ -1012,6 +1013,14 @@ fn constrain(kind: ShapeKind, start: Point<Pixels>, end: Point<Pixels>) -> Point
 }
 
 fn main() {
+    // `petit-paint mcp` serves MCP over stdio instead of opening a window
+    if std::env::args().nth(1).as_deref() == Some("mcp") {
+        if let Err(error) = mcp::run() {
+            eprintln!("petit-paint: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // The toolbar's icons and those gpui-kit's components draw, such as the
     // checkbox's check mark
     gpui_kit::application()
