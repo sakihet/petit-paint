@@ -69,6 +69,17 @@ struct SaveImageParams {
 
 #[derive(Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
+struct ViewImageParams {
+    /// The image's id.
+    image: u32,
+    /// Two opposite corners of a part to look at closely, as [x, y] pairs. The part is
+    /// scaled up as far as fits 1024×1024, up to 16 times, with each pixel a sharp
+    /// square. The whole image when left out.
+    region: Option<[[i32; 2]; 2]>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 struct ImageParams {
     /// The image's id.
     image: u32,
@@ -665,18 +676,23 @@ impl PaintServer {
     }
 
     #[tool(
-        description = "Look at an image. It comes back as PNG, scaled down to fit 1024×1024 when \
-        it is larger.",
+        description = "Look at an image, or closely at part of it. It comes back as PNG, scaled \
+        down to fit 1024×1024 when it is larger.",
         annotations(read_only_hint = true)
     )]
     fn view_image(
         &self,
-        Parameters(params): Parameters<ImageParams>,
+        Parameters(params): Parameters<ViewImageParams>,
     ) -> Result<CallToolResult, String> {
         let images = self.images();
         let size = images.get(params.image).map_err(message)?.size();
-        let (png, shown) = images.view(params.image).map_err(message)?;
+        let region = params.region.map(to_rect).transpose().map_err(message)?;
+        let (png, shown) = images.view(params.image, region).map_err(message)?;
         let mut description = format!("Image {}, {}×{}", params.image, size.width, size.height);
+        if let Some(region) = params.region {
+            let [[x0, y0], [x1, y1]] = region;
+            description += &format!(", the part from ({x0}, {y0}) to ({x1}, {y1})");
+        }
         if shown != size {
             description += &format!(", shown at {}×{}", shown.width, shown.height);
         }

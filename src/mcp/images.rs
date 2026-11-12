@@ -3,10 +3,10 @@ use gpui_kit::{Hsla, Size, size};
 use image::{ImageBuffer, Rgba, imageops};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use tiny_skia::{IntSize, Pixmap};
+use tiny_skia::{FilterQuality, IntSize, Pixmap, PixmapPaint, Transform};
 
 use crate::MAX_CANVAS_SIDE;
-use crate::canvas::Canvas;
+use crate::canvas::{Canvas, PixelRect};
 use crate::file::{read_image, write_image};
 use crate::history::History;
 use crate::stroke::Stroke;
@@ -14,6 +14,8 @@ use crate::stroke::Stroke;
 /// Longest side of the picture view_image returns. Larger images are scaled
 /// down to it, which keeps the reply small for the agent reading it.
 pub const MAX_VIEW_SIDE: u32 = 1024;
+/// How far view_image scales up part of an image.
+const MAX_ZOOM: u32 = 16;
 
 /// An image open in the server, with its own undo history.
 pub struct Image {
@@ -130,8 +132,27 @@ impl Images {
 
     /// Image `id` as PNG, scaled down to fit `MAX_VIEW_SIDE`, with the size
     /// it was encoded at.
-    pub fn view(&self, id: u32) -> Result<(Vec<u8>, Size<u32>)> {
-        let pixels = fit(self.get(id)?.canvas.pixels(), MAX_VIEW_SIDE);
+    ///
+    /// Given a `region`, only that part, scaled up by the largest whole
+    /// number up to `MAX_ZOOM` that still fits, with each pixel a sharp square.
+    pub fn view(&self, id: u32, region: Option<PixelRect>) -> Result<(Vec<u8>, Size<u32>)> {
+        let canvas = &self.get(id)?.canvas;
+        let pixels = match region {
+            None => fit(canvas.pixels(), MAX_VIEW_SIDE),
+            Some(region) => {
+                let part = canvas.copy(region, None).ok_or_else(|| {
+                    let size = canvas.pixels();
+                    anyhow!(
+                        "the region lies entirely outside the {}×{} image",
+                        size.width(),
+                        size.height()
+                    )
+                })?;
+                let longest = part.width().max(part.height());
+                let zoom = (MAX_VIEW_SIDE / longest).clamp(1, MAX_ZOOM);
+                fit(&enlarge(&part, zoom), MAX_VIEW_SIDE)
+            }
+        };
         let png = pixels.encode_png()?;
         Ok((png, size(pixels.width(), pixels.height())))
     }
@@ -139,6 +160,27 @@ impl Images {
 
 fn missing(id: u32) -> anyhow::Error {
     anyhow!("there is no image {id}; create or open one first")
+}
+
+/// `pixels` scaled up `zoom` times, each pixel becoming a square.
+fn enlarge(pixels: &Pixmap, zoom: u32) -> Pixmap {
+    if zoom == 1 {
+        return pixels.clone();
+    }
+    let mut enlarged =
+        Pixmap::new(pixels.width() * zoom, pixels.height() * zoom).expect("zoomed size is valid");
+    enlarged.draw_pixmap(
+        0,
+        0,
+        pixels.as_ref(),
+        &PixmapPaint {
+            quality: FilterQuality::Nearest,
+            ..Default::default()
+        },
+        Transform::from_scale(zoom as f32, zoom as f32),
+        None,
+    );
+    enlarged
 }
 
 /// `pixels` scaled down so neither side exceeds `max_side`, keeping its
@@ -271,14 +313,14 @@ mod tests {
     fn views_small_images_as_they_are_and_scales_large_ones_down() {
         let mut images = Images::default();
         let small = images.create(300, 200, white()).unwrap();
-        let (png, shown) = images.view(small).unwrap();
+        let (png, shown) = images.view(small, None).unwrap();
         assert_eq!(shown, size(300, 200));
         assert_eq!(image::guess_format(&png).unwrap(), image::ImageFormat::Png);
 
         let large = images
             .create(MAX_CANVAS_SIDE, MAX_CANVAS_SIDE / 4, white())
             .unwrap();
-        let (png, shown) = images.view(large).unwrap();
+        let (png, shown) = images.view(large, None).unwrap();
         assert_eq!(shown, size(MAX_VIEW_SIDE, MAX_VIEW_SIDE / 4));
         let decoded = image::load_from_memory(&png).unwrap();
         assert_eq!(
@@ -292,5 +334,44 @@ mod tests {
         let pixels = Pixmap::new(4000, 1).unwrap();
         let fitted = fit(&pixels, 100);
         assert_eq!((fitted.width(), fitted.height()), (100, 1));
+    }
+
+    #[test]
+    fn views_part_of_an_image_scaled_up_with_sharp_pixels() {
+        let mut images = Images::default();
+        let id = images.create(200, 100, white()).unwrap();
+        let image = images.get_mut(id).unwrap();
+        image.canvas.draw_stroke(&Stroke {
+            points: vec![point(px(10.5), px(10.5))],
+            color: rgb(0x000000).into(),
+            width: px(1.0),
+            brush: crate::canvas::Brush::Pencil,
+            ..Default::default()
+        });
+        let region = PixelRect {
+            x: 8,
+            y: 8,
+            width: 32,
+            height: 16,
+        };
+        let (png, shown) = images.view(id, Some(region)).unwrap();
+        // 32 pixels across, 16 times over, fits 1024
+        assert_eq!(shown, size(512, 256));
+        let decoded = image::load_from_memory(&png).unwrap().into_rgba8();
+        // Pixel (10, 10) is the square from (32, 32) to (48, 48), and nothing blurs
+        assert_eq!(decoded.get_pixel(40, 40).0, [0, 0, 0, 255]);
+        assert_eq!(decoded.get_pixel(32, 32).0, [0, 0, 0, 255]);
+        assert_eq!(decoded.get_pixel(31, 40).0, [255, 255, 255, 255]);
+
+        let outside = PixelRect { x: 300, ..region };
+        assert!(images.view(id, Some(outside)).is_err());
+        // A larger region is scaled up only as far as fits
+        let whole = PixelRect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 100,
+        };
+        assert_eq!(images.view(id, Some(whole)).unwrap().1, size(1000, 500));
     }
 }
