@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::canvas::{Brush, DEFAULT_FILL_TOLERANCE, Fill, Orientation, PixelRect};
 use crate::pattern::{PATTERNS, Pattern};
-use crate::stroke::Stroke;
+use crate::stroke::{ArcKind, Stroke, smooth};
 use crate::text::{FontChoice, TextRenderer};
 use crate::tool::ShapeKind;
 use crate::{
@@ -107,7 +107,7 @@ impl From<BrushName> for Brush {
     }
 }
 
-#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "snake_case")]
 #[schemars(crate = "rmcp::schemars")]
 enum ShapeName {
@@ -115,15 +115,24 @@ enum ShapeName {
     Rectangle,
     Ellipse,
     Polygon,
+    /// Part of an ellipse's curve.
+    Arc,
+    /// A slice of an ellipse, closed through its center.
+    Pie,
+    /// Part of an ellipse, closed by a straight line between the curve's ends.
+    Chord,
 }
 
-impl From<ShapeName> for ShapeKind {
-    fn from(name: ShapeName) -> Self {
-        match name {
-            ShapeName::Line => ShapeKind::Line,
-            ShapeName::Rectangle => ShapeKind::Rectangle,
-            ShapeName::Ellipse => ShapeKind::Ellipse,
-            ShapeName::Polygon => ShapeKind::Polygon,
+impl ShapeName {
+    fn label(self) -> &'static str {
+        match self {
+            ShapeName::Line => "a line",
+            ShapeName::Rectangle => "a rectangle",
+            ShapeName::Ellipse => "an ellipse",
+            ShapeName::Polygon => "a polygon",
+            ShapeName::Arc => "an arc",
+            ShapeName::Pie => "a pie",
+            ShapeName::Chord => "a chord",
         }
     }
 }
@@ -141,6 +150,8 @@ struct StrokeSpec {
     width: Option<f32>,
     /// The brush to draw with. The pen when left out.
     brush: Option<BrushName>,
+    /// Draw a smooth curve through the points instead of straight lines between them.
+    smooth: Option<bool>,
 }
 
 impl StrokeSpec {
@@ -148,8 +159,12 @@ impl StrokeSpec {
         if self.points.is_empty() {
             bail!("give at least one point");
         }
+        let mut points = to_points(&self.points);
+        if self.smooth == Some(true) {
+            points = smooth(&points, false);
+        }
         Ok(Stroke {
-            points: to_points(&self.points),
+            points,
             color: parse_color(&self.color)?,
             width: parse_width(self.width)?,
             brush: self.brush.map_or(Brush::Pen, Brush::from),
@@ -165,7 +180,8 @@ impl StrokeSpec {
 struct ShapeSpec {
     shape: ShapeName,
     /// As [x, y] pairs: a line's two ends, two opposite corners of a rectangle or of
-    /// the box around an ellipse, or a polygon's three or more corners in order.
+    /// the box around an ellipse (for an arc, pie or chord, of its whole ellipse), or a
+    /// polygon's three or more corners in order.
     points: Vec<[f32; 2]>,
     /// The outline's color as #rrggbb or #rrggbbaa. No outline when left out.
     outline: Option<String>,
@@ -174,42 +190,91 @@ struct ShapeSpec {
     fill: Option<String>,
     /// The outline's width in pixels, from 1 to 32. 4 when left out.
     width: Option<f32>,
+    /// For a polygon: a smooth curve through its corners instead of straight sides.
+    smooth: Option<bool>,
+    /// For a rectangle: how far its corners are rounded, in pixels.
+    radius: Option<f32>,
+    /// For an arc, pie or chord: where it starts, in degrees. 0 points right, and
+    /// angles run clockwise, so 90 points down.
+    start_angle: Option<f32>,
+    /// For an arc, pie or chord: where it ends, in degrees, going clockwise from
+    /// start_angle.
+    end_angle: Option<f32>,
 }
 
 impl ShapeSpec {
     /// The fill, if any, then the outline, if any.
     fn build(&self) -> Result<Vec<Stroke>> {
-        let kind = ShapeKind::from(self.shape);
+        let name = self.shape;
         let points = to_points(&self.points);
-        let (name, fits) = match kind {
-            ShapeKind::Line => ("a line takes its two ends", points.len() == 2),
-            ShapeKind::Rectangle => ("a rectangle takes two opposite corners", points.len() == 2),
-            ShapeKind::Ellipse => (
-                "an ellipse takes two opposite corners of its box",
-                points.len() == 2,
+        let two = points.len() == 2;
+        let (takes, fits) = match name {
+            ShapeName::Line => ("a line takes its two ends", two),
+            ShapeName::Rectangle => ("a rectangle takes two opposite corners", two),
+            ShapeName::Ellipse => ("an ellipse takes two opposite corners of its box", two),
+            ShapeName::Arc | ShapeName::Pie | ShapeName::Chord => (
+                "an arc, pie or chord takes two opposite corners of its ellipse's box",
+                two,
             ),
-            ShapeKind::Polygon => ("a polygon takes three or more corners", points.len() >= 3),
+            ShapeName::Polygon => ("a polygon takes three or more corners", points.len() >= 3),
         };
         if !fits {
             let count = points.len();
             bail!(
-                "{name}, not {count} {}",
+                "{takes}, not {count} {}",
                 if count == 1 { "point" } else { "points" }
             );
+        }
+        let arc = matches!(name, ShapeName::Arc | ShapeName::Pie | ShapeName::Chord);
+        if self.smooth.is_some() && name != ShapeName::Polygon {
+            bail!("smooth is for polygons, not {}", name.label());
+        }
+        if self.radius.is_some() && name != ShapeName::Rectangle {
+            bail!("radius is for rectangles, not {}", name.label());
+        }
+        let angles = match (self.start_angle, self.end_angle) {
+            (Some(from), Some(to)) if arc => Some((from, to)),
+            (None, None) if !arc => None,
+            _ if arc => bail!("{} takes both start_angle and end_angle", name.label()),
+            _ => bail!("start_angle and end_angle are for arcs, pies and chords"),
+        };
+        if self.radius.is_some_and(|radius| radius < 0.0) {
+            bail!("radius cannot be negative");
         }
         if self.outline.is_none() && self.fill.is_none() {
             bail!("give an outline color, a fill color or both");
         }
-        if kind == ShapeKind::Line && self.fill.is_some() {
-            bail!("a line has no inside to fill; give it an outline color");
+        if matches!(name, ShapeName::Line | ShapeName::Arc) && self.fill.is_some() {
+            bail!(
+                "{} has no inside to fill; give it an outline color",
+                name.label()
+            );
         }
         let outline = self.outline.as_deref().map(parse_color).transpose()?;
         let fill = self.fill.as_deref().map(parse_color).transpose()?;
         let width = parse_width(self.width)?;
 
-        let shape = |base: Stroke| match kind {
-            ShapeKind::Polygon => Stroke::polygon(points.clone(), true, base),
-            _ => Stroke::shape(kind, points[0], points[1], base),
+        let shape = |base: Stroke| match (name, angles) {
+            (ShapeName::Polygon, _) if self.smooth == Some(true) => Stroke {
+                // Curves join smoothly
+                sharp_corners: false,
+                ..Stroke::polygon(smooth(&points, true), true, base)
+            },
+            (ShapeName::Polygon, _) => Stroke::polygon(points.clone(), true, base),
+            (ShapeName::Rectangle, _) => match self.radius {
+                Some(radius) => Stroke::rounded_rectangle(points[0], points[1], radius, base),
+                None => Stroke::shape(ShapeKind::Rectangle, points[0], points[1], base),
+            },
+            (ShapeName::Line, _) => Stroke::shape(ShapeKind::Line, points[0], points[1], base),
+            (ShapeName::Arc | ShapeName::Pie | ShapeName::Chord, Some((from, to))) => {
+                let kind = match name {
+                    ShapeName::Arc => ArcKind::Arc,
+                    ShapeName::Pie => ArcKind::Pie,
+                    _ => ArcKind::Chord,
+                };
+                Stroke::arc(points[0], points[1], from, to, kind, base)
+            }
+            _ => Stroke::shape(ShapeKind::Ellipse, points[0], points[1], base),
         };
         let mut strokes = Vec::new();
         if let Some(color) = fill {
@@ -511,8 +576,8 @@ impl PaintServer {
     }
 
     #[tool(
-        description = "Draw a line, rectangle, ellipse or polygon, with an outline, a fill or \
-        both."
+        description = "Draw a line, rectangle, ellipse, polygon, arc, pie or chord, with an \
+        outline, a fill or both."
     )]
     fn draw_shape(
         &self,
@@ -524,7 +589,7 @@ impl PaintServer {
         image.draw(&strokes).map_err(message)?;
         Ok(format!(
             "Drew {} on image {}",
-            shape_name(params.shape.shape.into()),
+            params.shape.shape.label(),
             params.image
         ))
     }
@@ -889,15 +954,6 @@ fn to_points(points: &[[f32; 2]]) -> Vec<Point<Pixels>> {
     points.iter().map(|&[x, y]| point(px(x), px(y))).collect()
 }
 
-fn shape_name(kind: ShapeKind) -> &'static str {
-    match kind {
-        ShapeKind::Line => "a line",
-        ShapeKind::Rectangle => "a rectangle",
-        ShapeKind::Ellipse => "an ellipse",
-        ShapeKind::Polygon => "a polygon",
-    }
-}
-
 fn message(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
@@ -932,6 +988,10 @@ mod tests {
             outline: None,
             fill: None,
             width: None,
+            smooth: None,
+            radius: None,
+            start_angle: None,
+            end_angle: None,
         }
     }
 
@@ -945,6 +1005,7 @@ mod tests {
             color: "#000000".into(),
             width: None,
             brush: None,
+            smooth: None,
         }
     }
 
@@ -1263,6 +1324,139 @@ mod tests {
             point: [0.0, 0.0],
         }));
         assert_eq!(transparent.unwrap(), "#00000000");
+    }
+
+    #[test]
+    fn smooth_strokes_curve_between_their_points() {
+        let server = server();
+        let zigzag = [[10.0, 80.0], [50.0, 20.0], [90.0, 80.0]];
+        draw_stroke(&server, stroke(&zigzag)).unwrap();
+        let straight = server.images().get(1).unwrap().canvas.pixels().clone();
+        server.undo(image(1)).unwrap();
+        let curved = StrokeSpec {
+            smooth: Some(true),
+            ..stroke(&zigzag)
+        };
+        draw_stroke(&server, curved).unwrap();
+        let images = server.images();
+        let curved = images.get(1).unwrap().canvas.pixels();
+        assert_ne!(curved.data(), straight.data());
+        // The curve still passes through the middle point
+        let pixel = curved.pixel(50, 21).unwrap();
+        assert!(pixel.red() < 128, "{pixel:?}");
+    }
+
+    #[test]
+    fn rounds_a_rectangle_and_draws_a_smooth_polygon() {
+        let server = server();
+        let rounded = ShapeSpec {
+            fill: Some("#ff0000".into()),
+            radius: Some(20.0),
+            ..shape(ShapeName::Rectangle, &[[10.0, 10.0], [90.0, 90.0]])
+        };
+        draw_shape(&server, rounded).unwrap();
+        assert_eq!(rgb_at(&server, 50, 50), (255, 0, 0));
+        assert_eq!(rgb_at(&server, 50, 11), (255, 0, 0));
+        // The corner is cut away
+        assert_eq!(rgb_at(&server, 11, 11), (255, 255, 255));
+
+        let blob = ShapeSpec {
+            fill: Some("#0000ff".into()),
+            smooth: Some(true),
+            ..shape(
+                ShapeName::Polygon,
+                &[[30.0, 30.0], [70.0, 30.0], [70.0, 70.0], [30.0, 70.0]],
+            )
+        };
+        draw_shape(&server, blob).unwrap();
+        assert_eq!(rgb_at(&server, 50, 50), (0, 0, 255));
+        // The curve passes through the corners and bulges out between them
+        assert_eq!(rgb_at(&server, 50, 27), (0, 0, 255));
+        assert_eq!(rgb_at(&server, 50, 22), (255, 0, 0));
+    }
+
+    #[test]
+    fn draws_arcs_pies_and_chords() {
+        let server = server();
+        let box_ = [[10.0, 10.0], [90.0, 90.0]];
+        // The top half of a circle, like a sun on the horizon
+        let pie = ShapeSpec {
+            fill: Some("#ff0000".into()),
+            start_angle: Some(180.0),
+            end_angle: Some(360.0),
+            ..shape(ShapeName::Chord, &box_)
+        };
+        draw_shape(&server, pie).unwrap();
+        assert_eq!(rgb_at(&server, 50, 30), (255, 0, 0));
+        assert_eq!(rgb_at(&server, 50, 70), (255, 255, 255));
+
+        let slice = ShapeSpec {
+            fill: Some("#00ff00".into()),
+            start_angle: Some(0.0),
+            end_angle: Some(90.0),
+            ..shape(ShapeName::Pie, &box_)
+        };
+        draw_shape(&server, slice).unwrap();
+        assert_eq!(rgb_at(&server, 65, 65), (0, 255, 0));
+        assert_eq!(rgb_at(&server, 35, 65), (255, 255, 255));
+
+        let arc = ShapeSpec {
+            outline: Some("#000000".into()),
+            start_angle: Some(90.0),
+            end_angle: Some(180.0),
+            ..shape(ShapeName::Arc, &box_)
+        };
+        draw_shape(&server, arc).unwrap();
+        assert_eq!(rgb_at(&server, 50, 90), (0, 0, 0));
+        assert_eq!(rgb_at(&server, 35, 65), (255, 255, 255));
+    }
+
+    #[test]
+    fn refuses_options_that_do_not_fit_the_shape() {
+        let server = server();
+        let box_ = [[10.0, 10.0], [90.0, 90.0]];
+        let black = || Some("#000000".to_string());
+        let cases = [
+            ShapeSpec {
+                outline: black(),
+                ..shape(ShapeName::Arc, &box_)
+            },
+            ShapeSpec {
+                outline: black(),
+                start_angle: Some(0.0),
+                ..shape(ShapeName::Pie, &box_)
+            },
+            ShapeSpec {
+                outline: black(),
+                start_angle: Some(0.0),
+                end_angle: Some(90.0),
+                ..shape(ShapeName::Ellipse, &box_)
+            },
+            ShapeSpec {
+                fill: black(),
+                start_angle: Some(0.0),
+                end_angle: Some(90.0),
+                ..shape(ShapeName::Arc, &box_)
+            },
+            ShapeSpec {
+                outline: black(),
+                radius: Some(5.0),
+                ..shape(ShapeName::Ellipse, &box_)
+            },
+            ShapeSpec {
+                outline: black(),
+                radius: Some(-5.0),
+                ..shape(ShapeName::Rectangle, &box_)
+            },
+            ShapeSpec {
+                outline: black(),
+                smooth: Some(true),
+                ..shape(ShapeName::Rectangle, &box_)
+            },
+        ];
+        for params in cases {
+            assert!(draw_shape(&server, params).is_err());
+        }
     }
 
     #[test]

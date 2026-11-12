@@ -1,6 +1,6 @@
 use crate::canvas::Brush;
 use crate::tool::ShapeKind;
-use gpui_kit::{Hsla, Pixels, Point, point};
+use gpui_kit::{Hsla, Pixels, Point, point, px};
 
 /// A line through `points`: a brush stroke or a shape's outline. Points are
 /// in canvas coordinates, with the origin at its top-left.
@@ -81,10 +81,151 @@ impl Stroke {
     }
 }
 
+/// Which part of an ellipse [`Stroke::arc`] draws.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ArcKind {
+    /// The curve alone.
+    Arc,
+    /// A slice, closed through the center.
+    Pie,
+    /// The curve closed by a straight line between its ends.
+    Chord,
+}
+
+impl Stroke {
+    /// A rectangle between opposite corners `start` and `end` with corners
+    /// rounded to `radius`, drawn with `base`'s color, width and fill.
+    pub fn rounded_rectangle(
+        start: Point<Pixels>,
+        end: Point<Pixels>,
+        radius: f32,
+        base: Stroke,
+    ) -> Self {
+        let (left, right) = (start.x.min(end.x).as_f32(), start.x.max(end.x).as_f32());
+        let (top, bottom) = (start.y.min(end.y).as_f32(), start.y.max(end.y).as_f32());
+        let radius = radius.min((right - left) / 2.0).min((bottom - top) / 2.0);
+        if radius <= 0.0 {
+            return Stroke::shape(ShapeKind::Rectangle, start, end, base);
+        }
+        // Each corner is a quarter turn, clockwise from the top-right
+        let corners = [
+            (right - radius, top + radius, -90.0),
+            (right - radius, bottom - radius, 0.0),
+            (left + radius, bottom - radius, 90.0),
+            (left + radius, top + radius, 180.0),
+        ];
+        let segments = arc_segments(radius, radius, 90.0);
+        let points = corners
+            .iter()
+            .flat_map(|&(x, y, from)| {
+                (0..=segments).map(move |i| {
+                    let angle = (from + 90.0 * i as f32 / segments as f32).to_radians();
+                    point(px(x + radius * angle.cos()), px(y + radius * angle.sin()))
+                })
+            })
+            .collect();
+        Stroke {
+            points,
+            closed: true,
+            filled: base.filled,
+            ..base
+        }
+    }
+
+    /// Part of the ellipse in the box between opposite corners `start` and
+    /// `end`, from `from` to `to` degrees. 0° points right and angles run
+    /// clockwise, as y runs down; `to` at or before `from` goes on round past
+    /// 360°. An arc is never filled.
+    pub fn arc(
+        start: Point<Pixels>,
+        end: Point<Pixels>,
+        from: f32,
+        to: f32,
+        kind: ArcKind,
+        base: Stroke,
+    ) -> Self {
+        let (left, right) = (start.x.min(end.x).as_f32(), start.x.max(end.x).as_f32());
+        let (top, bottom) = (start.y.min(end.y).as_f32(), start.y.max(end.y).as_f32());
+        let (cx, cy) = ((left + right) / 2.0, (top + bottom) / 2.0);
+        let (rx, ry) = ((right - left) / 2.0, (bottom - top) / 2.0);
+        let mut sweep = (to - from).rem_euclid(360.0);
+        if sweep == 0.0 {
+            sweep = 360.0;
+        }
+        let segments = arc_segments(rx, ry, sweep);
+        let mut points: Vec<Point<Pixels>> = (0..=segments)
+            .map(|i| {
+                let angle = (from + sweep * i as f32 / segments as f32).to_radians();
+                point(px(cx + rx * angle.cos()), px(cy + ry * angle.sin()))
+            })
+            .collect();
+        if kind == ArcKind::Pie {
+            points.insert(0, point(px(cx), px(cy)));
+        }
+        Stroke {
+            points,
+            closed: kind != ArcKind::Arc,
+            filled: base.filled && kind != ArcKind::Arc,
+            sharp_corners: kind == ArcKind::Pie,
+            ..base
+        }
+    }
+}
+
+/// How many straight segments draw `sweep` degrees of an ellipse with radii
+/// `rx` and `ry` smoothly, at the same density as a whole ellipse.
+fn arc_segments(rx: f32, ry: f32, sweep: f32) -> usize {
+    let whole = ((rx + ry) * 2.0).clamp(24.0, 720.0);
+    (whole * sweep / 360.0).ceil().max(2.0) as usize
+}
+
+/// Points along a smooth curve through `points`, a Catmull-Rom spline, for
+/// strokes and polygons drawn as curves. A `closed` curve also runs from the
+/// last point back to the first.
+pub fn smooth(points: &[Point<Pixels>], closed: bool) -> Vec<Point<Pixels>> {
+    let n = points.len();
+    if n < 3 {
+        return points.to_vec();
+    }
+    let at = |i: isize| {
+        let i = if closed {
+            i.rem_euclid(n as isize)
+        } else {
+            i.clamp(0, n as isize - 1)
+        };
+        let p = points[i as usize];
+        (p.x.as_f32(), p.y.as_f32())
+    };
+    let spans = if closed { n } else { n - 1 };
+    let mut curve = Vec::new();
+    for i in 0..spans as isize {
+        let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+        // About one segment every 4 pixels
+        let length = ((p2.0 - p1.0).powi(2) + (p2.1 - p1.1).powi(2)).sqrt();
+        let steps = (length / 4.0).ceil().clamp(4.0, 64.0) as usize;
+        for step in 0..steps {
+            let t = step as f32 / steps as f32;
+            let blend = |a: f32, b: f32, c: f32, d: f32| {
+                0.5 * (2.0 * b
+                    + (c - a) * t
+                    + (2.0 * a - 5.0 * b + 4.0 * c - d) * t * t
+                    + (3.0 * b - a - 3.0 * c + d) * t * t * t)
+            };
+            curve.push(point(
+                px(blend(p0.0, p1.0, p2.0, p3.0)),
+                px(blend(p0.1, p1.1, p2.1, p3.1)),
+            ));
+        }
+    }
+    if !closed {
+        curve.push(points[n - 1]);
+    }
+    curve
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui_kit::px;
 
     fn at(x: f32, y: f32) -> Point<Pixels> {
         point(px(x), px(y))
@@ -142,5 +283,103 @@ mod tests {
         assert!(!open.closed && !open.filled);
         let done = Stroke::polygon(points, true, filled());
         assert!(done.closed && done.filled && done.sharp_corners);
+    }
+
+    #[test]
+    fn smooth_curves_pass_through_every_point() {
+        let points = vec![at(0.0, 0.0), at(40.0, 30.0), at(80.0, 0.0), at(120.0, 30.0)];
+        let curve = smooth(&points, false);
+        assert!(curve.len() > 20);
+        for p in &points {
+            assert!(curve.iter().any(|c| (*c - *p).magnitude() < 0.01), "{p:?}");
+        }
+        assert_eq!(curve.first(), points.first());
+        assert_eq!(curve.last(), points.last());
+    }
+
+    #[test]
+    fn short_lines_stay_as_they_are() {
+        let points = vec![at(0.0, 0.0), at(10.0, 10.0)];
+        assert_eq!(smooth(&points, false), points);
+    }
+
+    #[test]
+    fn rounded_corners_are_cut_inside_the_box() {
+        let rect = Stroke::rounded_rectangle(at(0.0, 0.0), at(100.0, 60.0), 10.0, filled());
+        assert!(rect.closed && rect.filled && !rect.sharp_corners);
+        for p in &rect.points {
+            assert!(p.x >= px(-0.01) && p.x <= px(100.01) && p.y >= px(-0.01) && p.y <= px(60.01));
+        }
+        // No point reaches the corner itself
+        assert!(
+            rect.points
+                .iter()
+                .all(|p| (*p - at(0.0, 0.0)).magnitude() > 2.0)
+        );
+        // A radius of zero is a plain rectangle
+        let plain = Stroke::rounded_rectangle(at(0.0, 0.0), at(100.0, 60.0), 0.0, filled());
+        assert_eq!(plain.points.len(), 4);
+    }
+
+    #[test]
+    fn arcs_run_clockwise_from_their_start_angle() {
+        let half = Stroke::arc(
+            at(0.0, 0.0),
+            at(100.0, 100.0),
+            180.0,
+            360.0,
+            ArcKind::Arc,
+            filled(),
+        );
+        assert!(!half.closed && !half.filled);
+        let (first, last) = (half.points[0], *half.points.last().unwrap());
+        assert!((first - at(0.0, 50.0)).magnitude() < 0.01, "{first:?}");
+        assert!((last - at(100.0, 50.0)).magnitude() < 0.01, "{last:?}");
+        // Through the top, where y is smallest
+        assert!(half.points.iter().all(|p| p.y <= px(50.01)));
+
+        let pie = Stroke::arc(
+            at(0.0, 0.0),
+            at(100.0, 100.0),
+            0.0,
+            90.0,
+            ArcKind::Pie,
+            filled(),
+        );
+        assert!(pie.closed && pie.filled);
+        assert_eq!(pie.points[0], at(50.0, 50.0));
+        let chord = Stroke::arc(
+            at(0.0, 0.0),
+            at(100.0, 100.0),
+            0.0,
+            90.0,
+            ArcKind::Chord,
+            filled(),
+        );
+        assert!(chord.closed && chord.filled);
+        assert_eq!(chord.points.len() + 1, pie.points.len());
+    }
+
+    #[test]
+    fn an_arc_ending_before_it_starts_goes_on_round() {
+        let arc = Stroke::arc(
+            at(0.0, 0.0),
+            at(100.0, 100.0),
+            270.0,
+            90.0,
+            ArcKind::Arc,
+            filled(),
+        );
+        // From the top, round the right side, to the bottom
+        assert!(arc.points.iter().all(|p| p.x >= px(49.99)));
+        let whole = Stroke::arc(
+            at(0.0, 0.0),
+            at(100.0, 100.0),
+            30.0,
+            30.0,
+            ArcKind::Arc,
+            filled(),
+        );
+        assert!(whole.points.iter().any(|p| p.x < px(1.0)));
     }
 }
