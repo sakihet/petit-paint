@@ -2,8 +2,8 @@ use anyhow::{Result, anyhow};
 use gpui_kit::{Hsla, Pixels, Point, Rgba, Size, point, px, size};
 use std::rc::Rc;
 use tiny_skia::{
-    Color, ColorU8, FillRule, IntRect, LineCap, LineJoin, Paint, PathBuilder, Pixmap, PixmapPaint,
-    PremultipliedColorU8, Stroke as SkiaStroke, Transform,
+    BlendMode, Color, ColorU8, FillRule, IntRect, LineCap, LineJoin, Paint, PathBuilder, Pixmap,
+    PixmapPaint, PremultipliedColorU8, Stroke as SkiaStroke, Transform,
 };
 
 use crate::pattern::Pattern;
@@ -333,42 +333,44 @@ impl Canvas {
     /// Burns `stroke` into the canvas and returns the change that undoes it,
     /// or `None` when the stroke lies entirely outside the canvas.
     pub fn draw_stroke(&mut self, stroke: &Stroke) -> Option<Change> {
-        let layer = self.render_stroke(stroke)?;
-        self.stamp(&layer.pixels, layer.at)
+        self.draw_strokes(std::slice::from_ref(stroke))
     }
 
     /// Burns `strokes` into the canvas in order, as one change, and returns
     /// the change that undoes them all. Returns `None` when every stroke
     /// lies outside the canvas.
     pub fn draw_strokes(&mut self, strokes: &[Stroke]) -> Option<Change> {
-        let layers: Vec<StrokeLayer> = strokes
+        let layers: Vec<(StrokeLayer, BlendMode)> = strokes
             .iter()
-            .filter_map(|stroke| self.render_stroke(stroke))
+            .filter_map(|stroke| Some((self.render_stroke(stroke)?, stroke.blend)))
             .collect();
-        let left = layers.iter().map(|layer| layer.at.x).min()?;
-        let top = layers.iter().map(|layer| layer.at.y).min()?;
+        let left = layers.iter().map(|(layer, _)| layer.at.x).min()?;
+        let top = layers.iter().map(|(layer, _)| layer.at.y).min()?;
         let right = layers
             .iter()
-            .map(|layer| layer.at.x + layer.pixels.width() as i32)
+            .map(|(layer, _)| layer.at.x + layer.pixels.width() as i32)
             .max()?;
         let bottom = layers
             .iter()
-            .map(|layer| layer.at.y + layer.pixels.height() as i32)
+            .map(|(layer, _)| layer.at.y + layer.pixels.height() as i32)
             .max()?;
-        // Blending the layers together first and then onto the canvas comes
-        // out the same as blending each onto the canvas in turn
-        let mut pixels = Pixmap::new((right - left) as u32, (bottom - top) as u32)?;
-        for layer in &layers {
-            pixels.draw_pixmap(
-                layer.at.x - left,
-                layer.at.y - top,
+        // Layers are clipped to the canvas, so this is too
+        let undo = self.snapshot(IntRect::from_ltrb(left, top, right, bottom)?)?;
+        for (layer, blend_mode) in &layers {
+            self.pixmap.draw_pixmap(
+                layer.at.x,
+                layer.at.y,
                 layer.pixels.as_ref(),
-                &PixmapPaint::default(),
+                &PixmapPaint {
+                    blend_mode: *blend_mode,
+                    ..Default::default()
+                },
                 Transform::identity(),
                 None,
             );
         }
-        self.stamp(&pixels, point(left, top))
+        self.version += 1;
+        Some(undo)
     }
 
     /// Renders `stroke` on its own transparent layer, clipped to the canvas,
@@ -961,7 +963,16 @@ impl Canvas {
             right = right.max(p.x.as_f32());
             bottom = bottom.max(p.y.as_f32());
         }
-        self.clip(left - reach, top - reach, right + reach, bottom + reach)
+        let (mut left, mut top, mut right, mut bottom) =
+            (left - reach, top - reach, right + reach, bottom + reach);
+        // Rendering only this much of the stroke keeps it inside its clip
+        if let Some(clip) = stroke.clip {
+            left = left.max(clip.x as f32);
+            top = top.max(clip.y as f32);
+            right = right.min((clip.x + clip.width as i32) as f32);
+            bottom = bottom.min((clip.y + clip.height as i32) as f32);
+        }
+        self.clip(left, top, right, bottom)
     }
 
     /// Returns a change that restores `rect` to its current pixels.
@@ -1416,6 +1427,55 @@ mod tests {
         canvas.draw_stroke(&fill).unwrap();
         assert_eq!(rgb_at(&canvas, 21, 50), (255, 0, 0));
         assert_eq!(rgb_at(&canvas, 18, 50), (255, 255, 255));
+    }
+
+    #[test]
+    fn adding_brightens_and_multiplying_darkens() {
+        let mut canvas = Canvas::new(30, 10, rgb(0x404040).into()).unwrap();
+        let dot = |x: f32, color: u32, blend_mode: BlendMode| Stroke {
+            blend: blend_mode,
+            ..stroke(&[(x, 5.0)], color, 8.0)
+        };
+        canvas
+            .draw_strokes(&[
+                dot(5.0, 0x404040, BlendMode::Plus),
+                dot(15.0, 0x808080, BlendMode::Multiply),
+                dot(25.0, 0x808080, BlendMode::SourceOver),
+            ])
+            .unwrap();
+        assert_eq!(rgb_at(&canvas, 5, 5), (128, 128, 128));
+        assert_eq!(rgb_at(&canvas, 15, 5), (32, 32, 32));
+        assert_eq!(rgb_at(&canvas, 25, 5), (128, 128, 128));
+    }
+
+    #[test]
+    fn clipped_strokes_stay_inside_their_clip() {
+        let mut canvas = canvas(100, 100);
+        let clipped = Stroke {
+            clip: Some(PixelRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 50,
+            }),
+            ..stroke(&[(50.0, 10.0), (50.0, 90.0)], 0x000000, 10.0)
+        };
+        canvas.draw_stroke(&clipped).unwrap();
+        assert_eq!(rgb_at(&canvas, 50, 49), (0, 0, 0));
+        assert_eq!(rgb_at(&canvas, 50, 50), (255, 255, 255));
+        assert!(canvas.reaches(&clipped));
+
+        let elsewhere = Stroke {
+            clip: Some(PixelRect {
+                x: 0,
+                y: 60,
+                width: 20,
+                height: 20,
+            }),
+            ..stroke(&[(50.0, 10.0), (50.0, 40.0)], 0x000000, 10.0)
+        };
+        assert!(!canvas.reaches(&elsewhere));
+        assert!(canvas.draw_stroke(&elsewhere).is_none());
     }
 
     #[test]

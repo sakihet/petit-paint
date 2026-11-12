@@ -1,6 +1,7 @@
-use crate::canvas::Brush;
+use crate::canvas::{Brush, PixelRect};
 use crate::tool::ShapeKind;
 use gpui_kit::{Hsla, Pixels, Point, point, px};
+use tiny_skia::BlendMode;
 
 /// A line through `points`: a brush stroke or a shape's outline. Points are
 /// in canvas coordinates, with the origin at its top-left.
@@ -22,6 +23,10 @@ pub struct Stroke {
     pub brush: Brush,
     /// Seeds the airbrush's spray pattern.
     pub seed: u64,
+    /// How the finished stroke combines with the pixels under it.
+    pub blend: BlendMode,
+    /// Keeps the stroke inside this part of the canvas.
+    pub clip: Option<PixelRect>,
 }
 
 impl Stroke {

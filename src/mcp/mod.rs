@@ -19,6 +19,7 @@ use crate::{
     DEFAULT_FONT_SIZE, DEFAULT_WIDTH, MAX_CANVAS_SIDE, MAX_FONT_SIZE, MAX_WIDTH, MIN_FONT_SIZE,
     MIN_WIDTH, tolerance_from_percent, tolerance_percent,
 };
+use tiny_skia::BlendMode;
 
 mod images;
 
@@ -137,6 +138,53 @@ impl ShapeName {
     }
 }
 
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+enum BlendName {
+    /// Paint over what is there.
+    Normal,
+    /// Add to the colors under it, so light glows on dark colors.
+    Add,
+    /// Lighten the colors under it, more gently than add.
+    Screen,
+    /// Darken the colors under it, as a shadow does.
+    Multiply,
+}
+
+impl From<BlendName> for BlendMode {
+    fn from(name: BlendName) -> Self {
+        match name {
+            BlendName::Normal => BlendMode::SourceOver,
+            BlendName::Add => BlendMode::Plus,
+            BlendName::Screen => BlendMode::Screen,
+            BlendName::Multiply => BlendMode::Multiply,
+        }
+    }
+}
+
+/// How a stroke or shape lands on the image, which both take.
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct Placement {
+    /// How it combines with the colors under it. Normal when left out.
+    blend: Option<BlendName>,
+    /// Two opposite corners of a rectangle, as [x, y] pairs, to draw inside of. The
+    /// rest of the image is left as it is.
+    clip: Option<[[i32; 2]; 2]>,
+}
+
+impl Placement {
+    fn apply(&self, strokes: &mut [Stroke]) -> Result<()> {
+        let clip = self.clip.map(to_rect).transpose()?;
+        for stroke in strokes {
+            stroke.blend = self.blend.map_or(BlendMode::SourceOver, BlendMode::from);
+            stroke.clip = clip;
+        }
+        Ok(())
+    }
+}
+
 /// A line through points drawn with a brush.
 #[derive(Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -152,6 +200,8 @@ struct StrokeSpec {
     brush: Option<BrushName>,
     /// Draw a smooth curve through the points instead of straight lines between them.
     smooth: Option<bool>,
+    #[serde(flatten)]
+    placement: Placement,
 }
 
 impl StrokeSpec {
@@ -163,14 +213,16 @@ impl StrokeSpec {
         if self.smooth == Some(true) {
             points = smooth(&points, false);
         }
-        Ok(Stroke {
+        let mut stroke = Stroke {
             points,
             color: parse_color(&self.color)?,
             width: parse_width(self.width)?,
             brush: self.brush.map_or(Brush::Pen, Brush::from),
             seed,
             ..Default::default()
-        })
+        };
+        self.placement.apply(std::slice::from_mut(&mut stroke))?;
+        Ok(stroke)
     }
 }
 
@@ -200,6 +252,8 @@ struct ShapeSpec {
     /// For an arc, pie or chord: where it ends, in degrees, going clockwise from
     /// start_angle.
     end_angle: Option<f32>,
+    #[serde(flatten)]
+    placement: Placement,
 }
 
 impl ShapeSpec {
@@ -292,6 +346,7 @@ impl ShapeSpec {
                 ..Default::default()
             }));
         }
+        self.placement.apply(&mut strokes)?;
         Ok(strokes)
     }
 }
@@ -992,6 +1047,14 @@ mod tests {
             radius: None,
             start_angle: None,
             end_angle: None,
+            placement: placement(),
+        }
+    }
+
+    fn placement() -> Placement {
+        Placement {
+            blend: None,
+            clip: None,
         }
     }
 
@@ -1006,6 +1069,7 @@ mod tests {
             width: None,
             brush: None,
             smooth: None,
+            placement: placement(),
         }
     }
 
@@ -1457,6 +1521,60 @@ mod tests {
         for params in cases {
             assert!(draw_shape(&server, params).is_err());
         }
+    }
+
+    #[test]
+    fn adds_light_and_clips_to_a_rectangle() {
+        let server = server();
+        let dark = ShapeSpec {
+            fill: Some("#202020".into()),
+            ..shape(ShapeName::Rectangle, &[[0.0, 0.0], [100.0, 100.0]])
+        };
+        draw_shape(&server, dark).unwrap();
+        let glow = ShapeSpec {
+            fill: Some("#404040".into()),
+            placement: Placement {
+                blend: Some(BlendName::Add),
+                clip: Some([[0, 0], [100, 50]]),
+            },
+            ..shape(ShapeName::Ellipse, &[[20.0, 20.0], [80.0, 80.0]])
+        };
+        draw_shape(&server, glow).unwrap();
+        // Added onto the dark color above the clip's edge, untouched below it
+        assert_eq!(rgb_at(&server, 50, 40), (96, 96, 96));
+        assert_eq!(rgb_at(&server, 50, 60), (32, 32, 32));
+
+        let outside = ShapeSpec {
+            fill: Some("#ffffff".into()),
+            placement: Placement {
+                blend: None,
+                clip: Some([[0, 60], [10, 70]]),
+            },
+            ..shape(ShapeName::Ellipse, &[[20.0, 20.0], [80.0, 40.0]])
+        };
+        assert!(
+            draw_shape(&server, outside)
+                .unwrap_err()
+                .contains("outside")
+        );
+    }
+
+    #[test]
+    fn placement_works_in_draw() {
+        let server = server();
+        let drew = draw(
+            &server,
+            rmcp::serde_json::json!([
+                {"type": "stroke", "points": [[50, 0], [50, 100]], "color": "#000000", "width": 10,
+                 "clip": [[0, 0], [100, 50]]},
+                {"type": "shape", "shape": "rectangle", "points": [[0, 0], [20, 20]], "fill": "#808080",
+                 "blend": "multiply"},
+            ]),
+        );
+        drew.unwrap();
+        assert_eq!(rgb_at(&server, 50, 40), (0, 0, 0));
+        assert_eq!(rgb_at(&server, 50, 60), (255, 255, 255));
+        assert_eq!(rgb_at(&server, 10, 10), (128, 128, 128));
     }
 
     #[test]
