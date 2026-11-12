@@ -14,6 +14,7 @@ It has only been tested on macOS.
 - Zoom
 - Open PNG, JPEG, BMP, WebP and GIF images, also by dropping them on the window
 - Save as PNG, JPEG, BMP, WebP or GIF, chosen by the file extension
+- An MCP server, so coding agents can draw images with it
 
 ## Keyboard shortcuts
 
@@ -46,6 +47,37 @@ On Windows and Linux, use `Ctrl` in place of `Cmd`.
 ```sh
 cargo run
 ```
+
+## Drawing from coding agents (MCP)
+
+`petit-paint mcp` runs an [MCP](https://modelcontextprotocol.io/) server over stdio instead of opening a window, so coding agents such as Claude Code can draw images with petit-paint.
+
+To use it with Claude Code, install petit-paint and add the server:
+
+```sh
+cargo install --path .
+claude mcp add petit-paint -- petit-paint mcp
+```
+
+Then start Claude Code again and ask it to draw, for example "Draw a sunset over the sea with petit-paint and save it as sunset.png". Relative paths are taken from the directory Claude Code runs in.
+
+Images are kept in memory by id until they are saved. Coordinates are in image pixels from the top-left, and colors are `#rrggbb` or `#rrggbbaa`.
+
+| Tool | What it does |
+| --- | --- |
+| `new_image` | Create a blank image, transparent or with a background color |
+| `open_image` / `save_image` | Open or save a PNG, JPEG, BMP, WebP or GIF file |
+| `view_image` | Return the image as PNG so the agent can look at it |
+| `list_images` / `close_image` | List the open images, or close one to free its memory |
+| `draw_stroke` | Draw a line through points with a brush |
+| `draw_shape` | Draw a line, rectangle, ellipse or polygon with an outline, a fill or both |
+| `draw` | Draw many strokes and shapes in one call, as one undo step |
+| `fill` | Fill a region with a color or a pattern, like the fill tool |
+| `draw_text` | Write text |
+| `erase` / `clear` | Erase a rectangle or the whole image to the background |
+| `resize` / `crop` / `flip` / `turn` | Change the image's size, shape or orientation |
+| `pick_color` | Read the color of a pixel |
+| `undo` / `redo` | Take back or redo changes, separately for each image |
 
 ## License
 
