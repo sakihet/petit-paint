@@ -11,6 +11,7 @@ use gpui_kit::{Hsla, Pixels, Point, point};
 pub struct Stroke {
     pub points: Vec<Point<Pixels>>,
     pub color: Hsla,
+    /// Zero draws only the fill, with no outline.
     pub width: Pixels,
     /// Connects the last point back to the first.
     pub closed: bool,

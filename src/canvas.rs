@@ -337,6 +337,40 @@ impl Canvas {
         self.stamp(&layer.pixels, layer.at)
     }
 
+    /// Burns `strokes` into the canvas in order, as one change, and returns
+    /// the change that undoes them all. Returns `None` when every stroke
+    /// lies outside the canvas.
+    pub fn draw_strokes(&mut self, strokes: &[Stroke]) -> Option<Change> {
+        let layers: Vec<StrokeLayer> = strokes
+            .iter()
+            .filter_map(|stroke| self.render_stroke(stroke))
+            .collect();
+        let left = layers.iter().map(|layer| layer.at.x).min()?;
+        let top = layers.iter().map(|layer| layer.at.y).min()?;
+        let right = layers
+            .iter()
+            .map(|layer| layer.at.x + layer.pixels.width() as i32)
+            .max()?;
+        let bottom = layers
+            .iter()
+            .map(|layer| layer.at.y + layer.pixels.height() as i32)
+            .max()?;
+        // Blending the layers together first and then onto the canvas comes
+        // out the same as blending each onto the canvas in turn
+        let mut pixels = Pixmap::new((right - left) as u32, (bottom - top) as u32)?;
+        for layer in &layers {
+            pixels.draw_pixmap(
+                layer.at.x - left,
+                layer.at.y - top,
+                layer.pixels.as_ref(),
+                &PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
+        }
+        self.stamp(&pixels, point(left, top))
+    }
+
     /// Renders `stroke` on its own transparent layer, clipped to the canvas,
     /// exactly as [`Self::draw_stroke`] will blend it in. Used to preview the
     /// stroke being drawn.
@@ -1062,6 +1096,10 @@ fn draw_line(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Tran
     if stroke.filled {
         pixels.fill_path(&path, &paint, FillRule::Winding, transform, None);
     }
+    // A filled shape with no outline
+    if stroke.width <= px(0.0) {
+        return;
+    }
     let style = SkiaStroke {
         width: stroke.width.as_f32(),
         // Markers have flat tips; round caps make the rest join smoothly
@@ -1319,6 +1357,64 @@ mod tests {
             0x000000,
             4.0,
         )
+    }
+
+    #[test]
+    fn draws_several_strokes_as_one_change() {
+        let mut canvas = canvas(100, 100);
+        let before = canvas.pixmap.clone();
+        let fill = Stroke {
+            width: px(0.0),
+            filled: true,
+            closed: true,
+            ..stroke(
+                &[(20.0, 20.0), (80.0, 20.0), (80.0, 80.0), (20.0, 80.0)],
+                0xff0000,
+                0.0,
+            )
+        };
+        let outline = Stroke {
+            closed: true,
+            sharp_corners: true,
+            ..stroke(
+                &[(20.0, 20.0), (80.0, 20.0), (80.0, 80.0), (20.0, 80.0)],
+                0x0000ff,
+                6.0,
+            )
+        };
+        let undo = canvas.draw_strokes(&[fill, outline]).unwrap();
+        // The outline is drawn over the fill
+        assert_eq!(rgb_at(&canvas, 50, 50), (255, 0, 0));
+        assert_eq!(rgb_at(&canvas, 50, 20), (0, 0, 255));
+        assert_eq!(rgb_at(&canvas, 50, 10), (255, 255, 255));
+        canvas.apply(undo);
+        assert_eq!(canvas.pixmap.data(), before.data());
+    }
+
+    #[test]
+    fn a_fill_without_an_outline_stays_inside_its_points() {
+        let mut canvas = canvas(100, 100);
+        let fill = Stroke {
+            width: px(0.0),
+            filled: true,
+            closed: true,
+            ..stroke(
+                &[(20.0, 20.0), (80.0, 20.0), (80.0, 80.0), (20.0, 80.0)],
+                0xff0000,
+                0.0,
+            )
+        };
+        canvas.draw_stroke(&fill).unwrap();
+        assert_eq!(rgb_at(&canvas, 21, 50), (255, 0, 0));
+        assert_eq!(rgb_at(&canvas, 18, 50), (255, 255, 255));
+    }
+
+    #[test]
+    fn strokes_all_outside_draw_nothing() {
+        let mut canvas = canvas(50, 50);
+        let outside = stroke(&[(200.0, 200.0), (300.0, 200.0)], 0x000000, 4.0);
+        assert!(canvas.draw_strokes(&[outside]).is_none());
+        assert!(canvas.draw_strokes(&[]).is_none());
     }
 
     #[test]

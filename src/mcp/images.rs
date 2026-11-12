@@ -9,6 +9,7 @@ use crate::MAX_CANVAS_SIDE;
 use crate::canvas::Canvas;
 use crate::file::{read_image, write_image};
 use crate::history::History;
+use crate::stroke::Stroke;
 
 /// Longest side of the picture view_image returns. Larger images are scaled
 /// down to it, which keeps the reply small for the agent reading it.
@@ -20,12 +21,34 @@ pub struct Image {
     pub history: History,
     /// The file it was opened from or last saved to.
     pub path: Option<PathBuf>,
+    /// Strokes drawn so far, to seed each airbrush stroke differently.
+    strokes: u64,
 }
 
 impl Image {
     pub fn size(&self) -> Size<u32> {
         let pixels = self.canvas.pixels();
         size(pixels.width(), pixels.height())
+    }
+
+    /// Draws `strokes` in order as one undo step.
+    pub fn draw(&mut self, strokes: &[Stroke]) -> Result<()> {
+        let Some(undo) = self.canvas.draw_strokes(strokes) else {
+            let size = self.size();
+            bail!(
+                "nothing was drawn, as it lies entirely outside the {}×{} image",
+                size.width,
+                size.height
+            );
+        };
+        self.history.record(undo);
+        Ok(())
+    }
+
+    /// A seed for the next stroke's airbrush spray, different each time.
+    pub fn next_seed(&mut self) -> u64 {
+        self.strokes += 1;
+        self.strokes
     }
 }
 
@@ -64,6 +87,7 @@ impl Images {
             canvas,
             history: History::default(),
             path,
+            strokes: 0,
         };
         self.images.insert(self.last_id, image);
         self.last_id
@@ -138,7 +162,7 @@ fn fit(pixels: &Pixmap, max_side: u32) -> Pixmap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui_kit::rgb;
+    use gpui_kit::{point, px, rgb};
 
     fn white() -> Hsla {
         rgb(0xffffff).into()
@@ -207,6 +231,40 @@ mod tests {
         let mut images = Images::default();
         assert!(images.open(Path::new("/nonexistent/drawing.png")).is_err());
         assert_eq!(images.iter().count(), 0);
+    }
+
+    #[test]
+    fn drawing_is_one_undo_step() {
+        let mut images = Images::default();
+        let id = images.create(40, 40, white()).unwrap();
+        let image = images.get_mut(id).unwrap();
+        let before = image.canvas.pixels().clone();
+        let line = |x: f32| Stroke {
+            points: vec![point(px(x), px(5.0)), point(px(x), px(35.0))],
+            color: rgb(0x000000).into(),
+            width: px(4.0),
+            ..Default::default()
+        };
+        image.draw(&[line(10.0), line(30.0)]).unwrap();
+        assert_ne!(image.canvas.pixels().data(), before.data());
+        assert!(image.history.undo(&mut image.canvas));
+        assert_eq!(image.canvas.pixels().data(), before.data());
+        assert!(!image.history.can_undo());
+    }
+
+    #[test]
+    fn drawing_outside_the_image_is_an_error() {
+        let mut images = Images::default();
+        let id = images.create(40, 30, white()).unwrap();
+        let image = images.get_mut(id).unwrap();
+        let outside = Stroke {
+            points: vec![point(px(100.0), px(100.0))],
+            width: px(4.0),
+            ..Default::default()
+        };
+        let error = image.draw(&[outside]).unwrap_err();
+        assert!(error.to_string().contains("40×30"), "{error}");
+        assert!(!image.history.can_undo());
     }
 
     #[test]
