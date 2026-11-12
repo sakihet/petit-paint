@@ -22,6 +22,7 @@ use zoom::DEFAULT_ZOOM_INDEX;
 mod assets;
 mod canvas;
 mod file;
+mod filter;
 mod history;
 mod mcp;
 mod pan;

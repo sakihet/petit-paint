@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use crate::canvas::{
     Brush, Canvas, ClipMask, DEFAULT_FILL_TOLERANCE, Fill, Orientation, PixelRect,
 };
+use crate::filter::Filter;
 use crate::pattern::{PATTERNS, Pattern};
 use crate::stroke::{ArcKind, Gradient, Stroke, smooth};
 use crate::text::{FontChoice, TextRenderer};
@@ -34,8 +35,9 @@ with gradients, polygons and strokes drawn as smooth curves, and anything blende
 light, multiply for shadow) or clipped. A clip is a rectangle or a mask: a shape, or the \
 region around a pixel of about the same color, which keeps shading inside something already \
 drawn. Masks combine with all and any, and one with outside is cut out of the rest, as for \
-a crescent moon; draw can name masks once for many items. Coordinates are in image \
-pixels from the top-left. Colors are #rrggbb or #rrggbbaa. Call view_image to look at the result, and save_image to write \
+a crescent moon; draw can name masks once for many items. filter adds grain, blurs, or \
+breaks shading into painterly patches, so clean drawing looks made by hand. Coordinates \
+are in image pixels from the top-left. Colors are #rrggbb or #rrggbbaa. Call view_image to look at the result, and save_image to write \
 it to a file. Relative paths are taken from the server's working directory.";
 
 /// Draws images for MCP clients such as coding agents, without a window.
@@ -778,6 +780,80 @@ struct DrawParams {
     masks: Option<BTreeMap<String, MaskSpec>>,
 }
 
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+enum FilterName {
+    /// Grain, like paint on paper, so flat colors and smooth gradients look less
+    /// perfect.
+    Noise,
+    /// A Gaussian blur, to soften shadows, glows and edges that are far away or out of
+    /// focus.
+    Blur,
+    /// Breaks smooth shading into flat patches like brush strokes, keeping edges sharp.
+    Painterly,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct FilterParams {
+    /// The image's id.
+    image: u32,
+    filter: FilterName,
+    /// For noise: how strong the grain is, in percent from 0 to 100. 10 when left out.
+    amount: Option<f32>,
+    /// For noise: grain in color instead of gray.
+    color: Option<bool>,
+    /// For blur: how far it spreads, from 1 to 64 pixels, 4 when left out. For
+    /// painterly: how large the patches are, from 1 to 16 pixels, 4 when left out.
+    radius: Option<f32>,
+    /// For noise: fixes the grain, so the same seed gives the same grain. Different
+    /// each time when left out.
+    seed: Option<u64>,
+    /// Where to apply it, leaving the rest of the image as it is: two opposite corners
+    /// of a rectangle as [x, y] pairs, or a mask, which can be a shape or the region
+    /// around a pixel. The whole image when left out.
+    clip: Option<ClipSpec>,
+}
+
+impl FilterParams {
+    fn build(&self, seed: u64) -> Result<Filter> {
+        let noise = matches!(self.filter, FilterName::Noise);
+        if !noise && (self.amount.is_some() || self.color.is_some() || self.seed.is_some()) {
+            bail!("amount, color and seed are for noise");
+        }
+        let radius = |max: f32| -> Result<f32> {
+            let radius = self.radius.unwrap_or(4.0);
+            if !(1.0..=max).contains(&radius) {
+                bail!("radius must be between 1 and {max}, not {radius}");
+            }
+            Ok(radius)
+        };
+        Ok(match self.filter {
+            FilterName::Noise => {
+                if self.radius.is_some() {
+                    bail!("radius is for blur and painterly");
+                }
+                let amount = self.amount.unwrap_or(10.0);
+                if !(0.0..=100.0).contains(&amount) {
+                    bail!("amount must be between 0 and 100, not {amount}");
+                }
+                Filter::Noise {
+                    amount: amount / 100.0,
+                    color: self.color == Some(true),
+                    seed: self.seed.unwrap_or(seed),
+                }
+            }
+            FilterName::Blur => Filter::Blur {
+                radius: radius(64.0)?,
+            },
+            FilterName::Painterly => Filter::Painterly {
+                radius: radius(16.0)?.round() as u32,
+            },
+        })
+    }
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct FillParams {
@@ -1143,6 +1219,33 @@ impl PaintServer {
             "Filled around ({x}, {y}) on image {}",
             params.image
         ))
+    }
+
+    #[tool(
+        description = "Apply a filter to an image, or to part of it: noise for grain, blur to \
+        soften, or painterly to break smooth shading into patches like brush strokes. Use it \
+        to make clean drawing look painted by hand."
+    )]
+    fn filter(&self, Parameters(params): Parameters<FilterParams>) -> Result<String, String> {
+        let mut images = self.images();
+        let image = images.get_mut(params.image).map_err(message)?;
+        let filter = params.build(image.next_seed()).map_err(message)?;
+        let masks = Masks {
+            canvas: &image.canvas,
+            named: &BTreeMap::new(),
+            naming: false,
+        };
+        let (clip, mask) = match &params.clip {
+            None => (None, None),
+            Some(ClipSpec::Rectangle(rect)) => (Some(to_rect(*rect).map_err(message)?), None),
+            Some(ClipSpec::Mask(mask)) => (None, Some(mask.build(&masks).map_err(message)?)),
+        };
+        let undo = image
+            .canvas
+            .filter(filter, clip, mask.as_deref())
+            .ok_or_else(|| outside(image.size()))?;
+        image.history.record(undo);
+        Ok(format!("Filtered image {}", params.image))
     }
 
     #[tool(description = "Write text on an image.")]
@@ -2075,6 +2178,76 @@ mod tests {
         for (fill, expected) in cases {
             let error = wrong(fill);
             assert!(error.contains(expected), "{expected}: {error}");
+        }
+    }
+
+    fn filter(server: &PaintServer, params: rmcp::serde_json::Value) -> Result<String, String> {
+        let mut params = params;
+        params["image"] = 1.into();
+        server.filter(Parameters(rmcp::serde_json::from_value(params).unwrap()))
+    }
+
+    #[test]
+    fn blurs_inside_a_clip_and_undoes_it() {
+        let server = server();
+        let left = ShapeSpec {
+            fill: Some("#000000".into()),
+            ..shape(ShapeName::Rectangle, &[[0.0, 0.0], [50.0, 100.0]])
+        };
+        draw_shape(&server, left).unwrap();
+        let clip = rmcp::serde_json::json!({"shape": "rectangle", "points": [[0, 0], [100, 50]]});
+        filter(
+            &server,
+            rmcp::serde_json::json!({"filter": "blur", "radius": 6, "clip": clip}),
+        )
+        .unwrap();
+        let (softened, sharp) = (rgb_at(&server, 50, 20), rgb_at(&server, 50, 80));
+        assert!((40..220).contains(&softened.0), "{softened:?}");
+        assert_eq!(sharp, (255, 255, 255));
+        server.undo(image(1)).unwrap();
+        assert_eq!(rgb_at(&server, 50, 20), (255, 255, 255));
+    }
+
+    #[test]
+    fn grain_is_the_same_for_the_same_seed() {
+        let grained = |seed: u64| {
+            let server = server();
+            let params = rmcp::serde_json::json!({"filter": "noise", "amount": 20, "seed": seed});
+            filter(&server, params).unwrap();
+            (0..100).map(|x| rgb_at(&server, x, 10)).collect::<Vec<_>>()
+        };
+        assert_eq!(grained(1), grained(1));
+        assert_ne!(grained(1), grained(2));
+        assert!(grained(1).iter().any(|&color| color != (255, 255, 255)));
+    }
+
+    #[test]
+    fn refuses_options_that_do_not_fit_the_filter() {
+        let server = server();
+        let wrong = [
+            (
+                rmcp::serde_json::json!({"filter": "blur", "amount": 10}),
+                "amount, color and seed are for noise",
+            ),
+            (
+                rmcp::serde_json::json!({"filter": "noise", "radius": 2}),
+                "radius is for blur and painterly",
+            ),
+            (
+                rmcp::serde_json::json!({"filter": "noise", "amount": 150}),
+                "amount must be between 0 and 100, not 150",
+            ),
+            (
+                rmcp::serde_json::json!({"filter": "painterly", "radius": 40}),
+                "radius must be between 1 and 16, not 40",
+            ),
+            (
+                rmcp::serde_json::json!({"filter": "blur", "clip": [[200, 200], [300, 300]]}),
+                "nothing was changed, as it lies entirely outside the 100×100 image",
+            ),
+        ];
+        for (params, error) in wrong {
+            assert_eq!(filter(&server, params).unwrap_err(), error);
         }
     }
 

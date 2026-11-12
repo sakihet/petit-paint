@@ -6,6 +6,7 @@ use tiny_skia::{
     PixmapPaint, PremultipliedColorU8, Stroke as SkiaStroke, Transform,
 };
 
+use crate::filter::{self, Filter};
 use crate::pattern::Pattern;
 use crate::stroke::{Gradient, Stroke};
 use crate::text::{FontChoice, TextRenderer};
@@ -769,6 +770,60 @@ impl Canvas {
         })
     }
 
+    /// Applies `filter` inside `clip` and `mask`, or to the whole canvas
+    /// when neither is given, and returns the change that undoes it. The
+    /// filtered pixels fade into the rest where the mask's edge is soft.
+    /// Returns `None` when the area lies entirely outside the canvas.
+    pub fn filter(
+        &mut self,
+        filter: Filter,
+        clip: Option<PixelRect>,
+        mask: Option<&ClipMask>,
+    ) -> Option<Change> {
+        let (mut left, mut top) = (0.0f32, 0.0f32);
+        let (mut right, mut bottom) = (self.pixmap.width() as f32, self.pixmap.height() as f32);
+        if let Some(clip) = clip {
+            left = left.max(clip.x as f32);
+            top = top.max(clip.y as f32);
+            right = right.min((clip.x + clip.width as i32) as f32);
+            bottom = bottom.min((clip.y + clip.height as i32) as f32);
+        }
+        if let Some(mask) = mask {
+            (left, top, right, bottom) = mask.limit((left, top, right, bottom));
+        }
+        let rect = self.clip(left, top, right, bottom)?;
+        let undo = self.snapshot(rect)?;
+        let filtered = filter::apply(filter, &self.pixmap, rect);
+        let width = self.pixmap.width() as i32;
+        for (i, after) in filtered.into_iter().enumerate() {
+            let x = rect.x() + i as i32 % rect.width() as i32;
+            let y = rect.y() + i as i32 / rect.width() as i32;
+            let coverage = mask.map_or(1.0, |mask| mask.at(x, y) as f32 / 255.0);
+            if coverage == 0.0 {
+                continue;
+            }
+            let pixel = &mut self.pixmap.pixels_mut()[(y * width + x) as usize];
+            let before = [pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()];
+            let mixed: [u8; 4] = std::array::from_fn(|c| {
+                let before = before[c] as f32 / 255.0;
+                ((before + (after[c] - before) * coverage) * 255.0)
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            });
+            // Premultiplied colors cannot exceed their alpha
+            let alpha = mixed[3];
+            *pixel = PremultipliedColorU8::from_rgba(
+                mixed[0].min(alpha),
+                mixed[1].min(alpha),
+                mixed[2].min(alpha),
+                alpha,
+            )
+            .unwrap_or(*pixel);
+        }
+        self.version += 1;
+        Some(undo)
+    }
+
     /// Returns the color at `position`, or `None` when it is outside the canvas.
     pub fn color_at(&self, position: Point<Pixels>) -> Option<Hsla> {
         let (x, y) = self.pixel_at(position)?;
@@ -1474,7 +1529,7 @@ fn add_grain(pixels: &mut Pixmap, at: Point<i32>, brush: Brush) {
 
 /// Returns a number in `0.0..1.0` fixed for the pixel at (`x`, `y`) and the
 /// `layer` of noise.
-fn noise(x: i32, y: i32, layer: u64) -> f32 {
+pub(crate) fn noise(x: i32, y: i32, layer: u64) -> f32 {
     let position = ((x as u32 as u64) << 32) | y as u32 as u64;
     Random(position ^ layer.wrapping_mul(0xd6e8_feb8_6659_fd93)).next()
 }
