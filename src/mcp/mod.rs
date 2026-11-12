@@ -116,6 +116,9 @@ enum BrushName {
     /// A flat bristle brush loaded with oil paint: streaky, running dry along a long
     /// stroke, and mixing with the wet paint under it.
     Oil,
+    /// Drags the colors already on the image along the line, like a finger through wet
+    /// paint, to blend edges and soften shading. It takes no color.
+    Smudge,
 }
 
 impl From<BrushName> for Brush {
@@ -129,6 +132,7 @@ impl From<BrushName> for Brush {
             BrushName::Airbrush => Brush::Airbrush,
             BrushName::Calligraphy => Brush::Calligraphy,
             BrushName::Oil => Brush::Oil,
+            BrushName::Smudge => Brush::Smudge,
         }
     }
 }
@@ -469,8 +473,8 @@ struct StrokeSpec {
     /// The points the line passes through, in order, as [x, y] pairs. A single point
     /// leaves a dot.
     points: Vec<[f32; 2]>,
-    /// The line's color as #rrggbb or #rrggbbaa.
-    color: String,
+    /// The line's color as #rrggbb or #rrggbbaa. The smudge brush takes none.
+    color: Option<String>,
     /// Width in pixels, from 1 to 32. 4 when left out.
     width: Option<f32>,
     /// The brush to draw with. The pen when left out.
@@ -614,14 +618,23 @@ impl StrokeSpec {
                 bail!("pressure must be between 0 and 1");
             }
         }
+        let brush = self.brush.map_or(Brush::Pen, Brush::from);
+        let color = match (&self.color, brush) {
+            (Some(_), Brush::Smudge) => {
+                bail!("smudge drags the colors already on the image, so it takes no color")
+            }
+            (Some(color), _) => parse_color(color)?,
+            (None, Brush::Smudge) => gpui_kit::black(),
+            (None, _) => bail!("give the line a color"),
+        };
         let taper = self.taper.as_ref().map(TaperSpec::ends).transpose()?;
         let pressure = pressure_along(&original, &points, self.pressure.as_deref(), taper);
         let mut stroke = Stroke {
             points,
             pressure,
-            color: parse_color(&self.color)?,
+            color,
             width: parse_width(self.width)?,
-            brush: self.brush.map_or(Brush::Pen, Brush::from),
+            brush,
             seed,
             ..Default::default()
         };
@@ -1759,7 +1772,7 @@ mod tests {
     fn stroke(points: &[[f32; 2]]) -> StrokeSpec {
         StrokeSpec {
             points: points.to_vec(),
-            color: "#000000".into(),
+            color: Some("#000000".into()),
             width: None,
             brush: None,
             smooth: None,
@@ -2550,6 +2563,41 @@ mod tests {
             error,
             "item 1: jitter must be between 0 and 100, not 120; nothing was drawn"
         );
+    }
+
+    #[test]
+    fn smudges_what_was_drawn_before_it_in_the_same_call() {
+        let server = server();
+        let smeared = rmcp::serde_json::json!([
+            {"type": "shape", "shape": "rectangle", "points": [[0, 0], [50, 100]], "fill": "#000000"},
+            {"type": "stroke", "points": [[35, 50], [85, 50]], "width": 20, "brush": "smudge"},
+        ]);
+        draw(&server, smeared).unwrap();
+        let (dragged, far) = (rgb_at(&server, 60, 50), rgb_at(&server, 84, 50));
+        assert!(
+            dragged.0 < 160,
+            "black is dragged into the white: {dragged:?}"
+        );
+        assert!(far.0 > dragged.0, "and fades along the stroke: {far:?}");
+        assert_eq!(rgb_at(&server, 60, 20), (255, 255, 255));
+        assert_eq!(rgb_at(&server, 20, 20), (0, 0, 0));
+
+        let wrong = [
+            (
+                rmcp::serde_json::json!({"type": "stroke", "points": [[0, 0], [9, 9]], "brush": "smudge", "color": "#000000"}),
+                "item 1: smudge drags the colors already on the image, so it takes no color; nothing was drawn",
+            ),
+            (
+                rmcp::serde_json::json!({"type": "stroke", "points": [[0, 0], [9, 9]]}),
+                "item 1: give the line a color; nothing was drawn",
+            ),
+        ];
+        for (item, error) in wrong {
+            assert_eq!(
+                draw(&server, rmcp::serde_json::json!([item])).unwrap_err(),
+                error
+            );
+        }
     }
 
     #[test]

@@ -2,8 +2,8 @@ use anyhow::{Result, anyhow};
 use gpui_kit::{Hsla, Pixels, Point, Rgba, Size, point, px, size};
 use std::rc::Rc;
 use tiny_skia::{
-    BlendMode, Color, ColorU8, FillRule, IntRect, LineCap, LineJoin, Paint, PathBuilder, Pixmap,
-    PixmapPaint, PremultipliedColorU8, Stroke as SkiaStroke, Transform,
+    Color, ColorU8, FillRule, IntRect, LineCap, LineJoin, Paint, PathBuilder, Pixmap, PixmapPaint,
+    PremultipliedColorU8, Stroke as SkiaStroke, Transform,
 };
 
 use crate::filter::{self, Filter};
@@ -265,6 +265,9 @@ pub enum Brush {
     /// A flat bristle brush loaded with oil paint, which streaks, runs dry
     /// and mixes with the wet paint under it.
     Oil,
+    /// Drags the colors already on the canvas along the line, blending
+    /// them, like a finger through wet paint. Not in the toolbar yet.
+    Smudge,
 }
 
 /// Brushes in toolbar order.
@@ -290,6 +293,7 @@ impl Brush {
             Brush::Airbrush => "Airbrush",
             Brush::Calligraphy => "Calligraphy",
             Brush::Oil => "Oil paint",
+            Brush::Smudge => "Smudge",
         }
     }
 }
@@ -476,30 +480,30 @@ impl Canvas {
     /// Burns `strokes` into the canvas in order, as one change, and returns
     /// the change that undoes them all. Returns `None` when every stroke
     /// lies outside the canvas.
+    ///
+    /// Each stroke is rendered over the ones before it, so oil paint mixes
+    /// with them and a smudge drags them.
     pub fn draw_strokes(&mut self, strokes: &[Stroke]) -> Option<Change> {
-        let layers: Vec<(StrokeLayer, BlendMode)> = strokes
+        let rects: Vec<IntRect> = strokes
             .iter()
-            .filter_map(|stroke| Some((self.render_stroke(stroke)?, stroke.blend)))
+            .filter_map(|stroke| self.stroke_rect(stroke))
             .collect();
-        let left = layers.iter().map(|(layer, _)| layer.at.x).min()?;
-        let top = layers.iter().map(|(layer, _)| layer.at.y).min()?;
-        let right = layers
-            .iter()
-            .map(|(layer, _)| layer.at.x + layer.pixels.width() as i32)
-            .max()?;
-        let bottom = layers
-            .iter()
-            .map(|(layer, _)| layer.at.y + layer.pixels.height() as i32)
-            .max()?;
-        // Layers are clipped to the canvas, so this is too
+        let left = rects.iter().map(|rect| rect.left()).min()?;
+        let top = rects.iter().map(|rect| rect.top()).min()?;
+        let right = rects.iter().map(|rect| rect.right()).max()?;
+        let bottom = rects.iter().map(|rect| rect.bottom()).max()?;
+        // Each rectangle is clipped to the canvas, so this is too
         let undo = self.snapshot(IntRect::from_ltrb(left, top, right, bottom)?)?;
-        for (layer, blend_mode) in &layers {
+        for stroke in strokes {
+            let Some(layer) = self.render_stroke(stroke) else {
+                continue;
+            };
             self.pixmap.draw_pixmap(
                 layer.at.x,
                 layer.at.y,
                 layer.pixels.as_ref(),
                 &PixmapPaint {
-                    blend_mode: *blend_mode,
+                    blend_mode: stroke.blend,
                     ..Default::default()
                 },
                 Transform::identity(),
@@ -531,6 +535,7 @@ impl Canvas {
             Brush::Airbrush => spray(&mut pixels, stroke, opaque, transform),
             Brush::Calligraphy => draw_nib(&mut pixels, stroke, opaque, transform),
             Brush::Oil => paint_oil(&mut pixels, stroke, opaque, transform),
+            Brush::Smudge => smudge(&mut pixels, stroke, &self.pixmap, rect),
         }
         if matches!(stroke.brush, Brush::NaturalPencil | Brush::Crayon) {
             add_grain(&mut pixels, Point::new(rect.x(), rect.y()), stroke.brush);
@@ -1823,6 +1828,85 @@ fn dab(pixels: &mut Pixmap, center: (f32, f32), radius: f32, color: Color, alpha
     }
 }
 
+/// Drags the colors of the canvas, `under`, along `stroke` within `rect`,
+/// and leaves the result in `pixels`, which cover `rect`. The brush picks
+/// up a patch of color where it starts and smears it ahead, picking up
+/// more as it goes, so the drag fades out along the stroke. Pixels the
+/// brush does not touch stay transparent.
+fn smudge(pixels: &mut Pixmap, stroke: &Stroke, under: &Pixmap, rect: IntRect) {
+    // How much of what the brush carries goes onto the canvas at its middle
+    const STRENGTH: f32 = 0.8;
+    let (width, height) = (rect.width() as i32, rect.height() as i32);
+    let read = |x: i32, y: i32| {
+        let (x, y) = (rect.x() + x, rect.y() + y);
+        let p = if x >= 0 && y >= 0 {
+            under.pixel(x as u32, y as u32)
+        } else {
+            None
+        };
+        let p = p.unwrap_or(PremultipliedColorU8::TRANSPARENT);
+        [p.red(), p.green(), p.blue(), p.alpha()].map(|c| c as f32)
+    };
+    let mut work: Vec<[f32; 4]> = (0..height)
+        .flat_map(|y| (0..width).map(move |x| (x, y)))
+        .map(|(x, y)| read(x, y))
+        .collect();
+    let mut touched = vec![false; work.len()];
+
+    let full = (stroke.width.as_f32() / 2.0).max(1.0);
+    let reach = full.ceil() as i32;
+    let side = 2 * reach + 1;
+    let pressure = Pressure::new(stroke);
+    let samples = along_line(&stroke.points, (full * 0.2).max(1.0));
+    // The patch the brush carries, one color for each pixel around its middle
+    let mut carried: Option<Vec<[f32; 4]>> = None;
+    for ((x, y), _, distance) in samples {
+        let radius = (full * pressure.at(distance)).max(0.5);
+        let (cx, cy) = (
+            (x - rect.x() as f32).round() as i32,
+            (y - rect.y() as f32).round() as i32,
+        );
+        let patch = carried.get_or_insert_with(|| {
+            (0..side * side)
+                .map(|i| {
+                    let (px, py) = (cx + i % side - reach, cy + i / side - reach);
+                    if px >= 0 && py >= 0 && px < width && py < height {
+                        work[(py * width + px) as usize]
+                    } else {
+                        read(px, py)
+                    }
+                })
+                .collect()
+        });
+        for (i, held) in patch.iter_mut().enumerate() {
+            let (dx, dy) = (i as i32 % side - reach, i as i32 / side - reach);
+            let (px, py) = (cx + dx, cy + dy);
+            if px < 0 || py < 0 || px >= width || py >= height {
+                continue;
+            }
+            let off = ((dx * dx + dy * dy) as f32).sqrt() / radius;
+            if off >= 1.0 {
+                continue;
+            }
+            let weight = STRENGTH * (1.0 - off * off);
+            let index = (py * width + px) as usize;
+            let mixed: [f32; 4] =
+                std::array::from_fn(|c| work[index][c] + (held[c] - work[index][c]) * weight);
+            work[index] = mixed;
+            *held = mixed;
+            touched[index] = true;
+        }
+    }
+    for ((pixel, color), touched) in pixels.pixels_mut().iter_mut().zip(work).zip(touched) {
+        if !touched {
+            continue;
+        }
+        let [r, g, b, a] = color.map(|c| c.round().clamp(0.0, 255.0) as u8);
+        *pixel = PremultipliedColorU8::from_rgba(r.min(a), g.min(a), b.min(a), a)
+            .unwrap_or(PremultipliedColorU8::TRANSPARENT);
+    }
+}
+
 /// Mixes oil paint just laid in `pixels`, whose top-left is at `at` on the
 /// canvas, with the wet paint `under` it, most where the stroke is thin.
 fn mix_wet_paint(pixels: &mut Pixmap, under: &Pixmap, at: Point<i32>) {
@@ -1995,6 +2079,7 @@ fn to_skia_color(color: Hsla) -> Color {
 mod tests {
     use super::*;
     use gpui_kit::{point, rgb};
+    use tiny_skia::BlendMode;
 
     use crate::pattern::PATTERNS;
 
