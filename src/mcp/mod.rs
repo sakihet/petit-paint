@@ -201,6 +201,9 @@ struct Placement {
     /// Move the line, or the shape's outline, up to about this many pixels to either
     /// side in gentle waves, as if drawn by hand, from 0 to 16.
     roughen: Option<f32>,
+    /// Let the color wander a little from place to place, as paint mixed unevenly
+    /// does: how far, in percent from 0 to 100. 5 to 15 looks natural.
+    jitter: Option<f32>,
 }
 
 impl Placement {
@@ -211,6 +214,10 @@ impl Placement {
             && !(0.0..=16.0).contains(&amount)
         {
             bail!("roughen must be between 0 and 16, not {amount}");
+        }
+        let jitter = self.jitter.unwrap_or(0.0);
+        if !(0.0..=100.0).contains(&jitter) {
+            bail!("jitter must be between 0 and 100, not {jitter}");
         }
         let (clip, mask) = match &self.clip {
             None => (None, None),
@@ -229,6 +236,8 @@ impl Placement {
                 stroke.pressure = resample_pressure(&pressure, &rough);
                 stroke.points = rough;
             }
+            stroke.seed = seed;
+            stroke.jitter = jitter / 100.0;
             stroke.blend = self.blend.map_or(BlendMode::SourceOver, BlendMode::from);
             stroke.clip = clip;
             stroke.mask = mask.clone();
@@ -1739,6 +1748,7 @@ mod tests {
             blend: None,
             clip: None,
             roughen: None,
+            jitter: None,
         }
     }
 
@@ -2508,6 +2518,37 @@ mod tests {
         assert_eq!(
             error,
             "item 1: roughen must be between 0 and 16, not 20; nothing was drawn"
+        );
+    }
+
+    #[test]
+    fn jitters_colors_from_place_to_place() {
+        let server = server();
+        let uneven = rmcp::serde_json::json!([
+            {"type": "shape", "shape": "rectangle", "points": [[0, 0], [100, 100]], "fill": "#808080",
+             "jitter": 20},
+        ]);
+        draw(&server, uneven).unwrap();
+        let reds: Vec<u8> = (0..100).map(|x| rgb_at(&server, x, 50).0).collect();
+        let (low, high) = (*reds.iter().min().unwrap(), *reds.iter().max().unwrap());
+        assert!(low < 115 && high > 141, "from {low} to {high}");
+        assert!(low >= 77 && high <= 179, "from {low} to {high}");
+        // Blotches, not speckles: neighbors are close
+        assert!(
+            reds.windows(2).all(|pair| pair[0].abs_diff(pair[1]) <= 8),
+            "{reds:?}"
+        );
+
+        let error = draw(
+            &server,
+            rmcp::serde_json::json!([
+                {"type": "stroke", "points": [[10, 10], [90, 90]], "color": "#000000", "jitter": 120},
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "item 1: jitter must be between 0 and 100, not 120; nothing was drawn"
         );
     }
 

@@ -535,6 +535,9 @@ impl Canvas {
         if matches!(stroke.brush, Brush::NaturalPencil | Brush::Crayon) {
             add_grain(&mut pixels, Point::new(rect.x(), rect.y()), stroke.brush);
         }
+        if stroke.jitter > 0.0 {
+            jitter(&mut pixels, Point::new(rect.x(), rect.y()), stroke);
+        }
 
         let opacity = color.alpha()
             * if stroke.brush == Brush::Marker {
@@ -1542,6 +1545,44 @@ fn add_grain(pixels: &mut Pixmap, at: Point<i32>, brush: Brush) {
         )
         .unwrap_or(*pixel);
     }
+}
+
+/// Lets the color of `stroke`, drawn on `pixels` whose top-left is at `at`
+/// on the canvas, wander by up to its jitter: mostly lighter and darker
+/// together, a little apart in hue. The changes are blotches about as wide
+/// as the stroke, fixed to the canvas position and the stroke's seed.
+fn jitter(pixels: &mut Pixmap, at: Point<i32>, stroke: &Stroke) {
+    let size = (stroke.width.as_f32() * 1.5).clamp(8.0, 32.0);
+    let layer = stroke.seed.wrapping_mul(4);
+    let width = pixels.width() as i32;
+    for (i, pixel) in pixels.pixels_mut().iter_mut().enumerate() {
+        if pixel.alpha() == 0 {
+            continue;
+        }
+        let x = (at.x + i as i32 % width) as f32 / size;
+        let y = (at.y + i as i32 / width) as f32 / size;
+        let shared = blotches(x, y, layer) - 0.5;
+        let color = pixel.demultiply();
+        let channels = [color.red(), color.green(), color.blue()];
+        let [red, green, blue] = std::array::from_fn(|c| {
+            let own = blotches(x, y, layer + 1 + c as u64) - 0.5;
+            let change = stroke.jitter * 2.0 * (0.7 * shared + 0.3 * own) * 255.0;
+            (channels[c] as f32 + change).round().clamp(0.0, 255.0) as u8
+        });
+        *pixel = ColorU8::from_rgba(red, green, blue, color.alpha()).premultiply();
+    }
+}
+
+/// A number from 0 to 1 that changes smoothly across the plane, with
+/// features about 1 apart, and differs by `layer`.
+fn blotches(x: f32, y: f32, layer: u64) -> f32 {
+    let (x0, y0) = (x.floor(), y.floor());
+    let ease = |t: f32| t * t * (3.0 - 2.0 * t);
+    let (tx, ty) = (ease(x - x0), ease(y - y0));
+    let at = |dx: f32, dy: f32| noise((x0 + dx) as i32, (y0 + dy) as i32, layer);
+    let top = at(0.0, 0.0) + (at(1.0, 0.0) - at(0.0, 0.0)) * tx;
+    let bottom = at(0.0, 1.0) + (at(1.0, 1.0) - at(0.0, 1.0)) * tx;
+    top + (bottom - top) * ty
 }
 
 /// Returns a number in `0.0..1.0` fixed for the pixel at (`x`, `y`) and the

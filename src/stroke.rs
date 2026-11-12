@@ -25,8 +25,12 @@ pub struct Stroke {
     /// Miter joins instead of round ones, for rectangles and polygons.
     pub sharp_corners: bool,
     pub brush: Brush,
-    /// Seeds the airbrush's spray pattern.
+    /// Seeds the airbrush's spray pattern, the oil brush's bristles and
+    /// the jitter.
     pub seed: u64,
+    /// How far the color wanders from place to place, from 0 to 1, as
+    /// paint mixed unevenly does.
+    pub jitter: f32,
     /// How the finished stroke combines with the pixels under it.
     pub blend: BlendMode,
     /// Keeps the stroke inside this part of the canvas.
