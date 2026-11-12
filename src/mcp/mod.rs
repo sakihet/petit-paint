@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 use gpui_kit::{Hsla, Pixels, Point, point, px, rgba};
 use images::Images;
@@ -242,7 +242,8 @@ impl<'de> Deserialize<'de> for ClipSpec {
 /// An area with soft edges to draw inside of, or outside of. It is one of: a shape,
 /// as {"shape": "ellipse", "points": [[x, y], [x, y]]} with the options draw_shape
 /// takes; the region around a pixel that has about the same color, as fill finds it,
-/// as {"region": [x, y]}; or one of draw's named masks, as {"mask": "name"}.
+/// as {"region": [x, y]}; one of draw's named masks, as {"mask": "name"}; or a
+/// combination, as {"all": [...]} or {"any": [...]} of rectangles and masks.
 #[derive(Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct MaskSpec {
@@ -266,6 +267,12 @@ struct MaskSpec {
     tolerance: Option<f32>,
     /// The name of one of draw's masks.
     mask: Option<String>,
+    /// Rectangles and masks to draw where every one of them covers, such as the left
+    /// half of a face. One with "outside": true is cut out, as for a crescent moon.
+    all: Option<Vec<ClipSpec>>,
+    /// Rectangles and masks to draw where any one of them covers, such as clouds made of
+    /// several ellipses.
+    any: Option<Vec<ClipSpec>>,
     /// Draw outside the area instead of inside it.
     outside: Option<bool>,
 }
@@ -275,6 +282,40 @@ struct MaskSpec {
 struct Masks<'a> {
     canvas: &'a Canvas,
     named: &'a BTreeMap<String, Arc<ClipMask>>,
+    /// Whether the masks being made are draw's named masks, which cannot
+    /// use each other.
+    naming: bool,
+}
+
+impl ClipSpec {
+    fn build(&self, masks: &Masks) -> Result<ClipMask> {
+        match self {
+            ClipSpec::Rectangle(rect) => {
+                let PixelRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                } = to_rect(*rect)?;
+                let corner = |x: i32, y: i32| point(px(x as f32), px(y as f32));
+                let outline = Stroke::shape(
+                    ShapeKind::Rectangle,
+                    corner(x, y),
+                    corner(x + width as i32, y + height as i32),
+                    Stroke::default(),
+                );
+                let size = masks.canvas.pixels();
+                masks.canvas.shape_mask(&outline).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the rectangle lies entirely outside the {}×{} image",
+                        size.width(),
+                        size.height()
+                    )
+                })
+            }
+            ClipSpec::Mask(spec) => Ok((*spec.build(masks)?).clone()),
+        }
+    }
 }
 
 impl MaskSpec {
@@ -283,9 +324,11 @@ impl MaskSpec {
             self.shape.is_some(),
             self.region.is_some(),
             self.mask.is_some(),
+            self.all.is_some(),
+            self.any.is_some(),
         ];
         if kinds.iter().filter(|&&given| given).count() != 1 {
-            bail!("a mask takes one of shape, region or mask");
+            bail!("a mask takes one of shape, region, mask, all or any");
         }
         let size = masks.canvas.pixels();
         let outside = || {
@@ -333,15 +376,46 @@ impl MaskSpec {
             let tolerance = parse_tolerance(self.tolerance)?;
             let mask = masks.canvas.region_mask(point(px(x), px(y)), tolerance);
             Arc::new(mask.ok_or_else(outside)?)
-        } else {
-            let name = self.mask.as_deref().unwrap_or_default();
+        } else if let Some(name) = &self.mask {
             if has_shape_options || self.tolerance.is_some() {
                 bail!("a named mask takes nothing but its name and outside");
+            }
+            if masks.naming {
+                bail!("draw's named masks cannot use other named masks");
             }
             let mask = masks.named.get(name).ok_or_else(|| {
                 anyhow::anyhow!("there is no mask named {name:?}; name it in draw's masks")
             })?;
             mask.clone()
+        } else {
+            let (word, parts) = match (&self.all, &self.any) {
+                (Some(parts), _) => ("all", parts),
+                (_, Some(parts)) => ("any", parts),
+                _ => unreachable!("one of the kinds is given"),
+            };
+            if has_shape_options || self.tolerance.is_some() {
+                bail!("a combined mask takes nothing but {word} and outside");
+            }
+            if parts.is_empty() {
+                bail!("{word} takes one or more rectangles or masks");
+            }
+            let parts = parts
+                .iter()
+                .enumerate()
+                .map(|(index, part)| {
+                    part.build(masks)
+                        .with_context(|| format!("mask {} in {word}", index + 1))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let combined = if word == "all" {
+                ClipMask::all(parts)
+            } else {
+                ClipMask::any(parts)
+            };
+            Arc::new(
+                combined
+                    .ok_or_else(|| anyhow::anyhow!("the masks in all have no area in common"))?,
+            )
         };
         Ok(if self.outside == Some(true) {
             Arc::new((*mask).clone().inverted())
@@ -943,6 +1017,7 @@ impl PaintServer {
         let masks = Masks {
             canvas: &image.canvas,
             named: &BTreeMap::new(),
+            naming: false,
         };
         let stroke = params.stroke.build(seed, &masks).map_err(message)?;
         image.draw(&[stroke]).map_err(message)?;
@@ -962,6 +1037,7 @@ impl PaintServer {
         let masks = Masks {
             canvas: &image.canvas,
             named: &BTreeMap::new(),
+            naming: false,
         };
         let strokes = params.shape.build(&masks).map_err(message)?;
         image.draw(&strokes).map_err(message)?;
@@ -988,12 +1064,9 @@ impl PaintServer {
             let masks = Masks {
                 canvas: &image.canvas,
                 named: &BTreeMap::new(),
+                naming: true,
             };
-            let mask = if spec.mask.is_some() {
-                Err(anyhow::anyhow!("a named mask cannot be another named mask"))
-            } else {
-                spec.build(&masks)
-            };
+            let mask = spec.build(&masks);
             let mask =
                 mask.map_err(|error| format!("mask {name:?}: {error:#}; nothing was drawn"))?;
             named.insert(name.clone(), mask);
@@ -1004,6 +1077,7 @@ impl PaintServer {
             let masks = Masks {
                 canvas: &image.canvas,
                 named: &named,
+                naming: false,
             };
             let built = match item {
                 DrawItem::Stroke(stroke) => stroke.build(seed, &masks).map(|s| vec![s]),
@@ -2060,6 +2134,112 @@ mod tests {
     }
 
     #[test]
+    fn cuts_a_crescent_moon_out_of_a_circle() {
+        let server = server();
+        draw(
+            &server,
+            rmcp::serde_json::json!([
+                {"type": "shape", "shape": "rectangle", "points": [[0, 0], [100, 100]], "fill": "#ffff00",
+                 "clip": {"all": [
+                     {"shape": "ellipse", "points": [[10, 10], [90, 90]]},
+                     {"shape": "ellipse", "points": [[30, 0], [110, 80]], "outside": true},
+                 ]}},
+            ]),
+        )
+        .unwrap();
+        assert_eq!(rgb_at(&server, 20, 60), (255, 255, 0));
+        assert_eq!(rgb_at(&server, 60, 40), (255, 255, 255));
+        assert_eq!(rgb_at(&server, 5, 5), (255, 255, 255));
+    }
+
+    #[test]
+    fn joins_masks_and_nests_them_with_named_masks() {
+        let server = server();
+        let params = rmcp::serde_json::json!({
+            "image": 1,
+            "masks": {"cloud": {"any": [
+                {"shape": "ellipse", "points": [[10, 30], [50, 60]]},
+                {"shape": "ellipse", "points": [[40, 20], [80, 60]]},
+            ]}},
+            "items": [
+                {"type": "shape", "shape": "rectangle", "points": [[0, 0], [100, 100]], "fill": "#0000ff",
+                 "clip": {"mask": "cloud"}},
+                // The left half of the cloud only
+                {"type": "shape", "shape": "rectangle", "points": [[0, 0], [100, 100]], "fill": "#ff0000",
+                 "clip": {"all": [{"mask": "cloud"}, [[0, 0], [45, 100]]]}},
+            ],
+        });
+        server
+            .draw(Parameters(rmcp::serde_json::from_value(params).unwrap()))
+            .unwrap();
+        assert_eq!(rgb_at(&server, 20, 45), (255, 0, 0));
+        assert_eq!(rgb_at(&server, 60, 40), (0, 0, 255));
+        assert_eq!(rgb_at(&server, 60, 80), (255, 255, 255));
+        assert_eq!(rgb_at(&server, 20, 80), (255, 255, 255));
+    }
+
+    #[test]
+    fn explains_which_mask_in_a_combination_is_wrong() {
+        let server = server();
+        let wrong = |masks: rmcp::serde_json::Value, clip: rmcp::serde_json::Value| {
+            let params = rmcp::serde_json::json!({
+                "image": 1,
+                "masks": masks,
+                "items": [{"type": "stroke", "points": [[10, 10], [90, 90]], "color": "#000000", "clip": clip}],
+            });
+            match rmcp::serde_json::from_value::<DrawParams>(params) {
+                Err(error) => error.to_string(),
+                Ok(params) => server.draw(Parameters(params)).unwrap_err(),
+            }
+        };
+        let none = rmcp::serde_json::json!({});
+        let ellipse = rmcp::serde_json::json!({"shape": "ellipse", "points": [[0, 0], [20, 20]]});
+        let cases = [
+            (
+                none.clone(),
+                rmcp::serde_json::json!({"all": []}),
+                "one or more",
+            ),
+            (
+                none.clone(),
+                rmcp::serde_json::json!({"any": [ellipse, {"shape": "ellipse"}]}),
+                "mask 2 in any: a shape mask takes points",
+            ),
+            (
+                none.clone(),
+                rmcp::serde_json::json!({"all": [{"any": [ellipse, {"region": [500, 0]}]}]}),
+                "mask 1 in all: mask 2 in any: (500, 0) is outside",
+            ),
+            (
+                none.clone(),
+                rmcp::serde_json::json!({"all": [ellipse, {"shape": "ellipse", "points": [[60, 60], [90, 90]]}]}),
+                "no area in common",
+            ),
+            (
+                none.clone(),
+                rmcp::serde_json::json!({"all": [ellipse], "points": [[0, 0], [1, 1]]}),
+                "nothing but all",
+            ),
+            (
+                none.clone(),
+                rmcp::serde_json::json!({"all": [[[200, 200], [300, 300]]]}),
+                "rectangle lies entirely outside",
+            ),
+            (
+                rmcp::serde_json::json!({"a": {"shape": "rectangle", "points": [[0, 0], [9, 9]]},
+                                         "b": {"any": [{"mask": "a"}]}}),
+                rmcp::serde_json::json!({"mask": "b"}),
+                "mask \"b\": mask 1 in any: draw's named masks cannot use other named masks",
+            ),
+        ];
+        for (masks, clip, expected) in cases {
+            let error = wrong(masks, clip.clone());
+            assert!(error.contains(expected), "{clip}: {expected}: {error}");
+        }
+        assert!(server.undo(image(1)).is_err());
+    }
+
+    #[test]
     fn explains_wrong_masks_and_draws_nothing() {
         let server = server();
         let wrong = |masks: rmcp::serde_json::Value, clip: rmcp::serde_json::Value| {
@@ -2083,12 +2263,12 @@ mod tests {
             (
                 none.clone(),
                 rmcp::serde_json::json!({}),
-                "one of shape, region or mask",
+                "one of shape, region, mask, all or any",
             ),
             (
                 none.clone(),
                 rmcp::serde_json::json!({"shape": "ellipse", "region": [5, 5]}),
-                "one of shape, region or mask",
+                "one of shape, region, mask, all or any",
             ),
             (
                 none.clone(),
@@ -2124,7 +2304,7 @@ mod tests {
             (
                 rmcp::serde_json::json!({"a": {"mask": "b"}}),
                 rmcp::serde_json::json!({"mask": "a"}),
-                "mask \"a\": a named mask cannot be another",
+                "mask \"a\": draw's named masks cannot use other named masks",
             ),
         ];
         for (masks, clip, expected) in cases {

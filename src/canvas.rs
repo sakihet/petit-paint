@@ -310,6 +310,86 @@ impl ClipMask {
         }
     }
 
+    /// Lets strokes cover everywhere.
+    fn everywhere() -> Self {
+        ClipMask {
+            x: 0,
+            y: 0,
+            coverage: tiny_skia::Mask::new(1, 1).expect("1×1 is a valid size"),
+            inverted: true,
+        }
+    }
+
+    /// Where every one of `masks` lets strokes cover, or `None` when they
+    /// have no area in common.
+    pub fn all(masks: Vec<ClipMask>) -> Option<ClipMask> {
+        if masks.iter().all(|mask| mask.inverted) {
+            // Outside every area is outside all of them joined
+            return Some(Self::any(masks.into_iter().map(Self::inverted).collect())?.inverted());
+        }
+        // Only where every area that is not inverted overlaps
+        let (left, top, right, bottom) = masks
+            .iter()
+            .filter(|mask| !mask.inverted)
+            .map(ClipMask::bounds)
+            .reduce(|a, b| (a.0.max(b.0), a.1.max(b.1), a.2.min(b.2), a.3.min(b.3)))?;
+        Self::combine(&masks, (left, top, right, bottom), |coverages| {
+            coverages.fold(1.0, |covered, coverage| covered * coverage)
+        })
+    }
+
+    /// Where any one of `masks` lets strokes cover.
+    pub fn any(masks: Vec<ClipMask>) -> Option<ClipMask> {
+        if masks.iter().any(|mask| mask.inverted) {
+            // Everywhere but where they all leave uncovered
+            let uncovered = Self::all(masks.into_iter().map(Self::inverted).collect());
+            return Some(uncovered.map_or_else(Self::everywhere, Self::inverted));
+        }
+        let (left, top, right, bottom) = masks
+            .iter()
+            .map(ClipMask::bounds)
+            .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))?;
+        Self::combine(&masks, (left, top, right, bottom), |coverages| {
+            1.0 - coverages.fold(1.0, |uncovered, coverage| uncovered * (1.0 - coverage))
+        })
+    }
+
+    /// A mask over the box from (`left`, `top`) to (`right`, `bottom`)
+    /// whose coverage `mix` makes from each of `masks`' coverages, from 0 to
+    /// 1. Returns `None` for an empty box.
+    fn combine(
+        masks: &[ClipMask],
+        (left, top, right, bottom): (i32, i32, i32, i32),
+        mix: impl Fn(&mut dyn Iterator<Item = f32>) -> f32,
+    ) -> Option<ClipMask> {
+        if right <= left || bottom <= top {
+            return None;
+        }
+        let (width, height) = ((right - left) as u32, (bottom - top) as u32);
+        let coverage = (top..bottom)
+            .flat_map(|y| (left..right).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let mut coverages = masks.iter().map(|mask| mask.at(x, y) as f32 / 255.0);
+                (mix(&mut coverages) * 255.0).round() as u8
+            })
+            .collect();
+        Some(ClipMask {
+            x: left,
+            y: top,
+            coverage: tiny_skia::Mask::from_vec(
+                coverage,
+                tiny_skia::IntSize::from_wh(width, height)?,
+            )?,
+            inverted: false,
+        })
+    }
+
+    /// The box `coverage` fills, as left, top, right and bottom.
+    fn bounds(&self) -> (i32, i32, i32, i32) {
+        let (width, height) = (self.coverage.width() as i32, self.coverage.height() as i32);
+        (self.x, self.y, self.x + width, self.y + height)
+    }
+
     /// How much of the canvas pixel at (`x`, `y`) a stroke may cover, from 0
     /// to 255.
     fn at(&self, x: i32, y: i32) -> u8 {
@@ -1784,6 +1864,75 @@ mod tests {
         assert_eq!(rgb_at(&canvas, 10, 10), (255, 255, 255));
         assert_eq!(rgb_at(&canvas, 28, 50), (255, 255, 255));
         assert!(canvas.region_mask(point(px(150.0), px(50.0)), 10).is_none());
+    }
+
+    fn mask_at(mask: &ClipMask, x: i32, y: i32) -> u8 {
+        mask.at(x, y)
+    }
+
+    #[test]
+    fn combines_masks_where_all_or_any_cover() {
+        let canvas = canvas(100, 100);
+        let left = canvas.shape_mask(&square(0.0, 0.0, 60.0)).unwrap();
+        let right = canvas.shape_mask(&square(40.0, 40.0, 60.0)).unwrap();
+
+        let both = ClipMask::all(vec![left.clone(), right.clone()]).unwrap();
+        assert_eq!(mask_at(&both, 50, 50), 255);
+        assert_eq!(mask_at(&both, 10, 10), 0);
+        assert_eq!(mask_at(&both, 90, 90), 0);
+        // Kept as small as the overlap
+        assert_eq!(both.bounds(), (39, 39, 61, 61));
+
+        let either = ClipMask::any(vec![left.clone(), right.clone()]).unwrap();
+        assert_eq!(mask_at(&either, 10, 10), 255);
+        assert_eq!(mask_at(&either, 90, 90), 255);
+        assert_eq!(mask_at(&either, 90, 10), 0);
+
+        let apart = canvas.shape_mask(&square(80.0, 0.0, 10.0)).unwrap();
+        assert!(ClipMask::all(vec![left.clone(), apart]).is_none());
+    }
+
+    #[test]
+    fn cuts_one_mask_out_of_another() {
+        let canvas = canvas(100, 100);
+        let moon = Stroke::shape(
+            crate::tool::ShapeKind::Ellipse,
+            point(px(10.0), px(10.0)),
+            point(px(90.0), px(90.0)),
+            Stroke::default(),
+        );
+        let bite = Stroke::shape(
+            crate::tool::ShapeKind::Ellipse,
+            point(px(30.0), px(0.0)),
+            point(px(110.0), px(80.0)),
+            Stroke::default(),
+        );
+        let crescent = ClipMask::all(vec![
+            canvas.shape_mask(&moon).unwrap(),
+            canvas.shape_mask(&bite).unwrap().inverted(),
+        ])
+        .unwrap();
+        // The lower left of the moon is left; the bitten part and the sky are not
+        assert_eq!(mask_at(&crescent, 20, 60), 255);
+        assert_eq!(mask_at(&crescent, 60, 40), 0);
+        assert_eq!(mask_at(&crescent, 5, 5), 0);
+    }
+
+    #[test]
+    fn combining_outsides_follows_de_morgan() {
+        let canvas = canvas(100, 100);
+        let a = canvas.shape_mask(&square(0.0, 0.0, 30.0)).unwrap();
+        let b = canvas.shape_mask(&square(70.0, 70.0, 30.0)).unwrap();
+        // Outside both: neither square
+        let outside_both = ClipMask::all(vec![a.clone().inverted(), b.clone().inverted()]).unwrap();
+        assert_eq!(mask_at(&outside_both, 50, 50), 255);
+        assert_eq!(mask_at(&outside_both, 10, 10), 0);
+        assert_eq!(mask_at(&outside_both, 90, 90), 0);
+        // Outside either: everywhere, as the squares do not overlap
+        let outside_either = ClipMask::any(vec![a.inverted(), b.inverted()]).unwrap();
+        for (x, y) in [(10, 10), (50, 50), (90, 90)] {
+            assert_eq!(mask_at(&outside_either, x, y), 255);
+        }
     }
 
     #[test]
