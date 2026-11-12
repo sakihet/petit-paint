@@ -66,6 +66,9 @@ const DEFAULT_WIDTH: f32 = 4.0;
 const MIN_WIDTH: f32 = 1.0;
 const MAX_WIDTH: f32 = 32.0;
 const DEFAULT_FONT_SIZE: f32 = 24.0;
+/// Range of the font size slider, in pixels.
+const MIN_FONT_SIZE: f32 = 8.0;
+const MAX_FONT_SIZE: f32 = 144.0;
 const DEFAULT_CANVAS_SIZE: Size<Pixels> = Size {
     width: px(800.0),
     height: px(600.0),
@@ -268,8 +271,8 @@ impl PaintApp {
 
         let font_size_slider = cx.new(|_| {
             SliderState::new()
-                .min(8.0)
-                .max(144.0)
+                .min(MIN_FONT_SIZE)
+                .max(MAX_FONT_SIZE)
                 .step(1.0)
                 .default_value(DEFAULT_FONT_SIZE)
         });
@@ -329,7 +332,7 @@ impl PaintApp {
                 else {
                     return;
                 };
-                this.fill_tolerance = (percent / 100.0 * 255.0).round() as u8;
+                this.fill_tolerance = tolerance_from_percent(*percent);
                 cx.notify();
             }),
         ];
@@ -951,6 +954,11 @@ impl PaintApp {
 /// A fill tolerance as a percentage of the full channel range.
 fn tolerance_percent(tolerance: u8) -> f32 {
     (tolerance as f32 / 255.0 * 100.0).round()
+}
+
+/// The fill tolerance that `percent` of the full channel range stands for.
+fn tolerance_from_percent(percent: f32) -> u8 {
+    (percent / 100.0 * 255.0).round() as u8
 }
 
 /// Moves `color` to the front of `recent`, adding it if new and dropping the
