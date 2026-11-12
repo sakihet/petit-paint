@@ -35,9 +35,11 @@ with gradients, polygons and strokes drawn as smooth curves, and anything blende
 light, multiply for shadow) or clipped. A clip is a rectangle or a mask: a shape, or the \
 region around a pixel of about the same color, which keeps shading inside something already \
 drawn. Masks combine with all and any, and one with outside is cut out of the rest, as for \
-a crescent moon; draw can name masks once for many items. filter adds grain, blurs, or \
-breaks shading into painterly patches, so clean drawing looks made by hand. Coordinates \
-are in image pixels from the top-left. Colors are #rrggbb or #rrggbbaa. Call view_image to look at the result, and save_image to write \
+a crescent moon; draw can name masks once for many items. To look drawn by hand rather \
+than by a computer: taper or press strokes so lines thin and swell, roughen outlines, \
+jitter colors, blend edges with the smudge brush, shade with hatch's strokes instead of \
+gradients, and finish with filter's grain, blur or painterly patches. Coordinates are in \
+image pixels from the top-left. Colors are #rrggbb or #rrggbbaa. Call view_image to look at the result, and save_image to write \
 it to a file. Relative paths are taken from the server's working directory.";
 
 /// Draws images for MCP clients such as coding agents, without a window.
