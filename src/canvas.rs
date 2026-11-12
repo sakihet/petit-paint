@@ -261,10 +261,13 @@ pub enum Brush {
     Airbrush,
     /// A flat nib held at 45°, so the line is thick or thin by direction.
     Calligraphy,
+    /// A flat bristle brush loaded with oil paint, which streaks, runs dry
+    /// and mixes with the wet paint under it.
+    Oil,
 }
 
 /// Brushes in toolbar order.
-pub const BRUSHES: [Brush; 7] = [
+pub const BRUSHES: [Brush; 8] = [
     Brush::Pen,
     Brush::Pencil,
     Brush::NaturalPencil,
@@ -272,6 +275,7 @@ pub const BRUSHES: [Brush; 7] = [
     Brush::Marker,
     Brush::Airbrush,
     Brush::Calligraphy,
+    Brush::Oil,
 ];
 
 impl Brush {
@@ -284,6 +288,7 @@ impl Brush {
             Brush::Marker => "Marker",
             Brush::Airbrush => "Airbrush",
             Brush::Calligraphy => "Calligraphy",
+            Brush::Oil => "Oil paint",
         }
     }
 }
@@ -524,6 +529,7 @@ impl Canvas {
             }
             Brush::Airbrush => spray(&mut pixels, stroke, opaque, transform),
             Brush::Calligraphy => draw_nib(&mut pixels, stroke, opaque, transform),
+            Brush::Oil => paint_oil(&mut pixels, stroke, opaque, transform),
         }
         if matches!(stroke.brush, Brush::NaturalPencil | Brush::Crayon) {
             add_grain(&mut pixels, Point::new(rect.x(), rect.y()), stroke.brush);
@@ -546,6 +552,9 @@ impl Canvas {
                 )
                 .unwrap_or(*pixel);
             }
+        }
+        if stroke.brush == Brush::Oil {
+            mix_wet_paint(&mut pixels, &self.pixmap, Point::new(rect.x(), rect.y()));
         }
         if let Some(mask) = &stroke.mask {
             let width = pixels.width() as i32;
@@ -1470,6 +1479,218 @@ fn noise(x: i32, y: i32, layer: u64) -> f32 {
     Random(position ^ layer.wrapping_mul(0xd6e8_feb8_6659_fd93)).next()
 }
 
+/// A point along a line, the direction the line runs there, and how far
+/// along the line it is.
+type LinePoint = ((f32, f32), (f32, f32), f32);
+
+/// Points `spacing` apart along `points`.
+fn along_line(points: &[Point<Pixels>], spacing: f32) -> Vec<LinePoint> {
+    let xy = |p: &Point<Pixels>| (p.x.as_f32(), p.y.as_f32());
+    let mut samples: Vec<((f32, f32), f32)> = Vec::new();
+    let Some(first) = points.first() else {
+        return Vec::new();
+    };
+    samples.push((xy(first), 0.0));
+    let (mut travelled, mut since) = (0.0, 0.0);
+    for pair in points.windows(2) {
+        let (a, b) = (xy(&pair[0]), xy(&pair[1]));
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let length = (dx * dx + dy * dy).sqrt();
+        let mut at = spacing - since;
+        while at <= length {
+            let t = at / length;
+            samples.push(((a.0 + dx * t, a.1 + dy * t), travelled + at));
+            at += spacing;
+        }
+        since = length - (at - spacing);
+        travelled += length;
+    }
+    if let Some(last) = points.last()
+        && since > 0.0
+    {
+        samples.push((xy(last), travelled));
+    }
+    (0..samples.len())
+        .map(|i| {
+            let before = samples[i.saturating_sub(1)].0;
+            let after = samples[(i + 1).min(samples.len() - 1)].0;
+            let (dx, dy) = (after.0 - before.0, after.1 - before.1);
+            let length = (dx * dx + dy * dy).sqrt();
+            let direction = if length > 0.0 {
+                (dx / length, dy / length)
+            } else {
+                (1.0, 0.0)
+            };
+            (samples[i].0, direction, samples[i].1)
+        })
+        .collect()
+}
+
+/// `color` made lighter by `amount` toward white, or darker toward black
+/// when `amount` is negative, keeping its alpha.
+fn shade(color: Color, amount: f32) -> Color {
+    let towards = |c: f32| {
+        if amount >= 0.0 {
+            c + (1.0 - c) * amount
+        } else {
+            c * (1.0 + amount)
+        }
+    };
+    Color::from_rgba(
+        towards(color.red()),
+        towards(color.green()),
+        towards(color.blue()),
+        color.alpha(),
+    )
+    .unwrap_or(color)
+}
+
+/// Drags a flat bristle brush along the line by pressing it down every
+/// pixel. Each bristle leaves a streak in a slightly different shade that
+/// wanders a little, and runs dry at its own point along a long stroke. The
+/// edge facing the light, from the top-left, catches a highlight and the
+/// other edge a shadow, like thick paint.
+fn paint_oil(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Transform) {
+    let width = stroke.width.as_f32().max(1.0);
+    let points = match stroke.points.as_slice() {
+        [] => return,
+        // A click leaves a short dab
+        [only] => vec![
+            point(only.x - px(width / 4.0), only.y),
+            point(only.x + px(width / 4.0), only.y),
+        ],
+        points => points.to_vec(),
+    };
+    let samples = along_line(&points, 1.0);
+    let bristles = (width / 1.5).round().clamp(4.0, 24.0) as usize;
+    let gap = width / bristles as f32;
+    let radius = (gap * 0.8).max(0.7);
+    // Paint lasts about this far before most bristles are dry
+    let dry_length = width * 30.0 + 120.0;
+    // The brush is pressed down over this distance, less for a short dab
+    let length = samples.last().map_or(0.0, |&(_, _, distance)| distance);
+    let pressing = (width * 0.4).min(length * 0.3).max(0.01);
+    let mut random = Random(stroke.seed ^ 0x0f1e_2d3c_4b5a_6978);
+    let (tx, ty) = (transform.tx, transform.ty);
+    for bristle in 0..bristles {
+        let across = (bristle as f32 + 0.5) / bristles as f32 - 0.5;
+        let bristle_color = shade(color, (random.next() - 0.5) * 0.24);
+        // Bristles toward the edges carry less paint and dry first
+        let dries_at = (0.35 + 0.65 * random.next()) * (1.0 - across.abs() * 0.6);
+        let layer = random.next().to_bits() as u64;
+        for &((x, y), (dx, dy), distance) in &samples {
+            let load = 1.0 - distance / dry_length;
+            // Broken streaks once the paint thins below what this bristle needs
+            let skips = noise((distance / 4.0) as i32, bristle as i32, layer) * 0.5 + 0.25;
+            if load <= dries_at * skips {
+                continue;
+            }
+            // The bristle wanders slowly from side to side
+            let wander = smooth_noise(distance / 12.0, layer) - 0.5;
+            let offset = across * width + wander * gap * 0.8;
+            // Pressed down gently at first
+            let press = (distance / pressing).min(1.0);
+            let alpha = 0.7 * load.sqrt() * (0.3 + 0.7 * press);
+            dab(
+                pixels,
+                (x - dy * offset + tx, y + dx * offset + ty),
+                radius,
+                bristle_color,
+                alpha,
+            );
+        }
+    }
+    // Ridges along both edges: lit where the edge faces the top-left
+    let ridge = (width / 14.0).clamp(0.7, 2.0);
+    for side in [-1.0f32, 1.0] {
+        let edge = side * (width / 2.0 - ridge);
+        for &((x, y), (dx, dy), distance) in samples.iter().step_by(2) {
+            let (nx, ny) = (-dy * side, dx * side);
+            let facing = -(nx + ny) * std::f32::consts::FRAC_1_SQRT_2;
+            let load = 1.0 - distance / dry_length;
+            if load <= 0.2 || facing.abs() <= 0.2 {
+                continue;
+            }
+            let ridge_color = shade(color, if facing > 0.0 { 0.4 } else { -0.4 });
+            let alpha = (facing.abs() * load * 0.5).min(0.5);
+            dab(
+                pixels,
+                (x - dy * edge + tx, y + dx * edge + ty),
+                ridge,
+                ridge_color,
+                alpha,
+            );
+        }
+    }
+}
+
+/// A number from 0 to 1 that changes smoothly with `t` and differs by
+/// `layer`.
+fn smooth_noise(t: f32, layer: u64) -> f32 {
+    let (whole, part) = (t.floor(), t.fract());
+    let at = |i: f32| noise(i as i32, 0, layer);
+    let ease = part * part * (3.0 - 2.0 * part);
+    at(whole) + (at(whole + 1.0) - at(whole)) * ease
+}
+
+/// Blends a soft round dot of `color` at `alpha`, `radius` around `center`
+/// in pixel coordinates, over `pixels`.
+fn dab(pixels: &mut Pixmap, center: (f32, f32), radius: f32, color: Color, alpha: f32) {
+    let (width, height) = (pixels.width() as i32, pixels.height() as i32);
+    let reach = radius + 0.5;
+    let (left, right) = (
+        (center.0 - reach).floor() as i32,
+        (center.0 + reach).ceil() as i32,
+    );
+    let (top, bottom) = (
+        (center.1 - reach).floor() as i32,
+        (center.1 + reach).ceil() as i32,
+    );
+    let color = color.to_color_u8();
+    for y in top.max(0)..bottom.min(height) {
+        for x in left.max(0)..right.min(width) {
+            let (fx, fy) = (x as f32 + 0.5 - center.0, y as f32 + 0.5 - center.1);
+            let coverage = (radius + 0.5 - (fx * fx + fy * fy).sqrt()).clamp(0.0, 1.0);
+            let a = (coverage * alpha * 255.0).round() as u8;
+            if a == 0 {
+                continue;
+            }
+            let source = ColorU8::from_rgba(color.red(), color.green(), color.blue(), a);
+            let target = &mut pixels.pixels_mut()[(y * width + x) as usize];
+            *target = source_over(source.premultiply(), *target);
+        }
+    }
+}
+
+/// Mixes oil paint just laid in `pixels`, whose top-left is at `at` on the
+/// canvas, with the wet paint `under` it, most where the stroke is thin.
+fn mix_wet_paint(pixels: &mut Pixmap, under: &Pixmap, at: Point<i32>) {
+    let width = pixels.width() as i32;
+    for (i, pixel) in pixels.pixels_mut().iter_mut().enumerate() {
+        if pixel.alpha() == 0 {
+            continue;
+        }
+        let (x, y) = (at.x + i as i32 % width, at.y + i as i32 / width);
+        let Some(below) = under.pixel(x as u32, y as u32) else {
+            continue;
+        };
+        if below.alpha() == 0 {
+            continue;
+        }
+        let (paint, below) = (pixel.demultiply(), below.demultiply());
+        let thin = 1.0 - paint.alpha() as f32 / 255.0;
+        let mix = (0.05 + 0.45 * thin) * below.alpha() as f32 / 255.0;
+        let blend = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * mix).round() as u8;
+        *pixel = ColorU8::from_rgba(
+            blend(paint.red(), below.red()),
+            blend(paint.green(), below.green()),
+            blend(paint.blue(), below.blue()),
+            paint.alpha(),
+        )
+        .premultiply();
+    }
+}
+
 /// Sweeps a flat nib, `width` long and tilted 45°, along the line.
 fn draw_nib(pixels: &mut Pixmap, stroke: &Stroke, color: Color, transform: Transform) {
     let half = stroke.width.as_f32() / 2.0 * std::f32::consts::FRAC_1_SQRT_2;
@@ -1950,6 +2171,82 @@ mod tests {
         };
         assert!(canvas.reaches(&everywhere_else));
         assert!(canvas.shape_mask(&square(200.0, 200.0, 20.0)).is_none());
+    }
+
+    fn oil(points: &[(f32, f32)], color: u32, width: f32) -> Stroke {
+        Stroke {
+            brush: Brush::Oil,
+            seed: 7,
+            ..stroke(points, color, width)
+        }
+    }
+
+    /// How much of the stroke covers the pixel, judged by how far it moved
+    /// from white toward `color`'s darkest channel.
+    fn inked(canvas: &Canvas, x: u32, y: u32) -> u8 {
+        let (r, g, b) = rgb_at(canvas, x, y);
+        255 - r.min(g).min(b)
+    }
+
+    #[test]
+    fn oil_paint_covers_its_middle_in_streaks() {
+        let mut canvas = canvas(200, 60);
+        canvas.draw_stroke(&oil(&[(10.0, 30.0), (190.0, 30.0)], 0x000000, 24.0));
+        assert!(inked(&canvas, 60, 30) > 200, "{}", inked(&canvas, 60, 30));
+        assert_eq!(inked(&canvas, 60, 5), 0);
+        // Across the stroke the paint is uneven, not one flat color
+        let across: Vec<u8> = (20..40).map(|y| inked(&canvas, 60, y)).collect();
+        let (low, high) = (across.iter().min().unwrap(), across.iter().max().unwrap());
+        assert!(high - low > 20, "{across:?}");
+    }
+
+    #[test]
+    fn oil_paint_runs_dry_along_a_long_stroke() {
+        let mut canvas = canvas(1100, 40);
+        canvas.draw_stroke(&oil(&[(10.0, 20.0), (1090.0, 20.0)], 0x000000, 12.0));
+        let coverage = |from: u32| -> u32 {
+            (from..from + 60)
+                .flat_map(|x| (12..28).map(move |y| (x, y)))
+                .map(|(x, y)| inked(&canvas, x, y) as u32)
+                .sum()
+        };
+        let (start, end) = (coverage(40), coverage(400));
+        assert!(end * 2 < start, "{start} {end}");
+    }
+
+    #[test]
+    fn oil_paint_mixes_with_wet_paint_but_not_with_bare_canvas() {
+        let red_over = |background: Hsla| {
+            let mut canvas = Canvas::new(100, 60, background).unwrap();
+            canvas.draw_stroke(&oil(&[(10.0, 30.0), (90.0, 30.0)], 0xff0000, 24.0));
+            let p = canvas.pixmap.pixel(50, 30).unwrap().demultiply();
+            (p.red(), p.green(), p.blue())
+        };
+        let over_blue = red_over(rgb(0x0000ff).into());
+        assert!(over_blue.2 > 20, "{over_blue:?}");
+        let over_nothing = red_over(gpui_kit::transparent_black());
+        assert!(over_nothing.2 < 20, "{over_nothing:?}");
+    }
+
+    #[test]
+    fn oil_paint_comes_out_the_same_for_the_same_seed() {
+        let paint = |seed| {
+            let mut canvas = canvas(120, 40);
+            canvas.draw_stroke(&Stroke {
+                seed,
+                ..oil(&[(10.0, 20.0), (110.0, 20.0)], 0x336699, 16.0)
+            });
+            canvas.pixmap.data().to_vec()
+        };
+        assert_eq!(paint(1), paint(1));
+        assert_ne!(paint(1), paint(2));
+    }
+
+    #[test]
+    fn an_oil_click_leaves_a_dab() {
+        let mut canvas = canvas(60, 60);
+        canvas.draw_stroke(&oil(&[(30.0, 30.0)], 0x000000, 20.0));
+        assert!(inked(&canvas, 30, 30) > 150);
     }
 
     #[test]

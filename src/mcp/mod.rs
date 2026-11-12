@@ -111,6 +111,9 @@ enum BrushName {
     Airbrush,
     /// A flat nib held at 45°, so the line is thick or thin by direction.
     Calligraphy,
+    /// A flat bristle brush loaded with oil paint: streaky, running dry along a long
+    /// stroke, and mixing with the wet paint under it.
+    Oil,
 }
 
 impl From<BrushName> for Brush {
@@ -123,6 +126,7 @@ impl From<BrushName> for Brush {
             BrushName::Marker => Brush::Marker,
             BrushName::Airbrush => Brush::Airbrush,
             BrushName::Calligraphy => Brush::Calligraphy,
+            BrushName::Oil => Brush::Oil,
         }
     }
 }

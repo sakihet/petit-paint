@@ -23,6 +23,7 @@ icon_assets!(
         Highlighter,
         SprayCan,
         PenTool,
+        Palette,
         Slash,
         Square,
         Circle,
