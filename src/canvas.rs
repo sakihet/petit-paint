@@ -6,8 +6,9 @@ use tiny_skia::{
     PremultipliedColorU8, Stroke as SkiaStroke, Transform,
 };
 
-use crate::Stroke;
 use crate::pattern::Pattern;
+use crate::stroke::Stroke;
+use crate::text::{FontChoice, TextRenderer};
 
 /// What the fill tool paints: color 1 where the pattern is set and color 2
 /// elsewhere.
@@ -637,6 +638,33 @@ impl Canvas {
         );
         self.version += 1;
         Some(undo)
+    }
+
+    /// Draws text rendered by `TextRenderer::render` so it starts at
+    /// `anchor`, and returns the change that undoes it.
+    pub fn stamp_text(
+        &mut self,
+        (pixels, margin): &(Pixmap, u32),
+        anchor: Point<i32>,
+    ) -> Option<Change> {
+        self.stamp(pixels, point(anchor.x - *margin as i32, anchor.y))
+    }
+
+    /// Draws `text` starting at `anchor`, its top-left, and returns the
+    /// change that undoes it. Lines are separated by `\n`.
+    // For the MCP server's draw_text tool, which is not in yet
+    #[allow(dead_code)]
+    pub fn draw_text(
+        &mut self,
+        renderer: &mut TextRenderer,
+        text: &str,
+        font: FontChoice,
+        size: f32,
+        color: Hsla,
+        anchor: Point<i32>,
+    ) -> Option<Change> {
+        let rendered = renderer.render(text, font, size, color)?;
+        self.stamp_text(&rendered, anchor)
     }
 
     /// Lifts the pixels in `rect` off the canvas, or only those `mask`
@@ -1739,6 +1767,51 @@ mod tests {
         assert_eq!(rgb_at(&canvas, 0, 2), (255, 255, 255));
         assert_eq!(rgb_at(&canvas, 0, 5), (0, 0, 0));
         assert_eq!(rgb_at(&canvas, 2, 2), (0, 0, 0));
+    }
+
+    #[test]
+    fn draws_text_from_its_anchor_and_can_be_undone() {
+        let mut canvas = canvas(200, 60);
+        let before = canvas.pixmap.clone();
+        let mut renderer = TextRenderer::new();
+        let black = rgb(0x000000).into();
+        let undo = canvas
+            .draw_text(
+                &mut renderer,
+                "Hi",
+                FontChoice::SansSerif,
+                32.0,
+                black,
+                point(20, 10),
+            )
+            .unwrap();
+        let drawn: Vec<(u32, u32)> = (0..60)
+            .flat_map(|y| (0..200).map(move |x| (x, y)))
+            .filter(|&(x, y)| rgb_at(&canvas, x, y) != (255, 255, 255))
+            .collect();
+        assert!(!drawn.is_empty());
+        assert!(drawn.iter().all(|&(x, y)| x >= 20 && y >= 10));
+        canvas.apply(undo);
+        assert_eq!(canvas.pixmap.data(), before.data());
+    }
+
+    #[test]
+    fn empty_text_draws_nothing() {
+        let mut canvas = canvas(20, 20);
+        let mut renderer = TextRenderer::new();
+        let black = rgb(0x000000).into();
+        assert!(
+            canvas
+                .draw_text(
+                    &mut renderer,
+                    "",
+                    FontChoice::Serif,
+                    16.0,
+                    black,
+                    point(0, 0)
+                )
+                .is_none()
+        );
     }
 
     #[test]

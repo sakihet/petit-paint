@@ -11,6 +11,7 @@ use selection::{SelectDrag, SelectShape, Selection};
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
+use stroke::Stroke;
 use text::{FontChoice, TextRenderer};
 use tiny_skia::Pixmap;
 use tool::{SelectTool, ShapeKind, TOOLS, Tool};
@@ -23,6 +24,7 @@ mod file;
 mod pan;
 mod pattern;
 mod selection;
+mod stroke;
 mod text;
 mod tool;
 mod ui;
@@ -93,27 +95,6 @@ macro_rules! with_modifier {
     ($key:literal) => {
         concat!("ctrl-", $key)
     };
-}
-
-/// A line through `points`: a brush stroke or a shape's outline. Points are
-/// in canvas coordinates, with the origin at its top-left.
-///
-/// While it is being drawn it is previewed as a vector path; when finished
-/// it is burned into the canvas pixels.
-#[derive(Clone, Default)]
-struct Stroke {
-    points: Vec<Point<Pixels>>,
-    color: Hsla,
-    width: Pixels,
-    /// Connects the last point back to the first.
-    closed: bool,
-    /// Fills the inside with `color` as well.
-    filled: bool,
-    /// Miter joins instead of round ones, for rectangles and polygons.
-    sharp_corners: bool,
-    brush: Brush,
-    /// Seeds the airbrush's spray pattern.
-    seed: u64,
 }
 
 /// Text being typed, previewed on the canvas until it is placed.
@@ -612,12 +593,11 @@ impl PaintApp {
         let Some(edit) = self.text_edit.take() else {
             return;
         };
-        if let Some((pixels, margin)) = &edit.preview {
-            let at = point(edit.anchor.x - *margin as i32, edit.anchor.y);
-            if let Some(undo) = self.canvas.stamp(pixels, at) {
-                self.record(undo, cx);
-                self.remember_color(self.color);
-            }
+        if let Some(preview) = &edit.preview
+            && let Some(undo) = self.canvas.stamp_text(preview, edit.anchor)
+        {
+            self.record(undo, cx);
+            self.remember_color(self.color);
         }
         cx.notify();
     }
@@ -646,48 +626,7 @@ impl PaintApp {
 
     /// The outline of a shape dragged from `start` to `end`.
     fn shape_stroke(&self, start: Point<Pixels>, end: Point<Pixels>) -> Stroke {
-        let base = Stroke {
-            color: self.active_color(),
-            width: self.width,
-            filled: self.shape_filled && self.shape_kind.fillable(),
-            ..Default::default()
-        };
-        let (left, right) = (start.x.min(end.x), start.x.max(end.x));
-        let (top, bottom) = (start.y.min(end.y), start.y.max(end.y));
-        match self.shape_kind {
-            ShapeKind::Line | ShapeKind::Polygon => Stroke {
-                points: vec![start, end],
-                ..base
-            },
-            ShapeKind::Rectangle => Stroke {
-                points: vec![
-                    point(left, top),
-                    point(right, top),
-                    point(right, bottom),
-                    point(left, bottom),
-                ],
-                closed: true,
-                sharp_corners: true,
-                ..base
-            },
-            ShapeKind::Ellipse => {
-                let center = point((left + right) / 2.0, (top + bottom) / 2.0);
-                let (rx, ry) = ((right - left) / 2.0, (bottom - top) / 2.0);
-                // Enough segments that edges stay smooth at the largest zoom
-                let segments = ((rx + ry).as_f32() * 2.0).clamp(24.0, 720.0) as usize;
-                let points = (0..segments)
-                    .map(|i| {
-                        let angle = i as f32 / segments as f32 * std::f32::consts::TAU;
-                        center + point(rx * angle.cos(), ry * angle.sin())
-                    })
-                    .collect();
-                Stroke {
-                    points,
-                    closed: true,
-                    ..base
-                }
-            }
-        }
+        Stroke::shape(self.shape_kind, start, end, self.shape_style())
     }
 
     /// The polygon so far, with an edge to the mouse, or the finished polygon.
@@ -696,13 +635,15 @@ impl PaintApp {
         if !finished {
             points.extend(self.polygon_hover);
         }
+        Stroke::polygon(points, finished, self.shape_style())
+    }
+
+    /// The color, width and fill the shape tool draws with.
+    fn shape_style(&self) -> Stroke {
         Stroke {
-            points,
             color: self.active_color(),
             width: self.width,
-            closed: finished,
-            filled: finished && self.shape_filled,
-            sharp_corners: true,
+            filled: self.shape_filled,
             ..Default::default()
         }
     }
