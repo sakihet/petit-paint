@@ -378,24 +378,7 @@ impl Canvas {
     /// The whole stroke is drawn opaque and then made translucent at once, so
     /// a translucent stroke does not darken where it crosses itself.
     pub fn render_stroke(&self, stroke: &Stroke) -> Option<StrokeLayer> {
-        let width = stroke.width.as_f32();
-        // How far the brush reaches past the points it passes through.
-        // Anti-aliasing adds about a pixel; miter joins reach up to twice the
-        // width (tiny-skia's miter limit is 4)
-        let reach = match stroke.brush {
-            Brush::Airbrush => width,
-            Brush::Calligraphy => width / 2.0,
-            _ if stroke.sharp_corners => width * 2.0,
-            _ => width / 2.0,
-        } + 2.0;
-        let (mut left, mut top, mut right, mut bottom) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-        for p in &stroke.points {
-            left = left.min(p.x.as_f32());
-            top = top.min(p.y.as_f32());
-            right = right.max(p.x.as_f32());
-            bottom = bottom.max(p.y.as_f32());
-        }
-        let rect = self.clip(left - reach, top - reach, right + reach, bottom + reach)?;
+        let rect = self.stroke_rect(stroke)?;
         let mut pixels = Pixmap::new(rect.width(), rect.height())?;
         let transform = Transform::from_translate(-rect.x() as f32, -rect.y() as f32);
 
@@ -953,6 +936,34 @@ impl Canvas {
         let right = (right.ceil() as i32).min(self.pixmap.width() as i32);
         let bottom = (bottom.ceil() as i32).min(self.pixmap.height() as i32);
         IntRect::from_ltrb(left, top, right, bottom)
+    }
+
+    /// Whether `stroke` would draw anywhere on the canvas.
+    pub fn reaches(&self, stroke: &Stroke) -> bool {
+        self.stroke_rect(stroke).is_some()
+    }
+
+    /// The part of the canvas `stroke` can draw on, or `None` when it lies
+    /// entirely outside.
+    fn stroke_rect(&self, stroke: &Stroke) -> Option<IntRect> {
+        let width = stroke.width.as_f32();
+        // How far the brush reaches past the points it passes through.
+        // Anti-aliasing adds about a pixel; miter joins reach up to twice the
+        // width (tiny-skia's miter limit is 4)
+        let reach = match stroke.brush {
+            Brush::Airbrush => width,
+            Brush::Calligraphy => width / 2.0,
+            _ if stroke.sharp_corners => width * 2.0,
+            _ => width / 2.0,
+        } + 2.0;
+        let (mut left, mut top, mut right, mut bottom) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for p in &stroke.points {
+            left = left.min(p.x.as_f32());
+            top = top.min(p.y.as_f32());
+            right = right.max(p.x.as_f32());
+            bottom = bottom.max(p.y.as_f32());
+        }
+        self.clip(left - reach, top - reach, right + reach, bottom + reach)
     }
 
     /// Returns a change that restores `rect` to its current pixels.
