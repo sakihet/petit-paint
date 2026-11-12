@@ -277,8 +277,8 @@ impl PaintApp {
                 let Some(path) = path else {
                     return Ok(None);
                 };
-                let format = save_format(&path).unwrap_or(ImageFormat::Png);
-                std::fs::write(&path, encode_image(&pixels, format)?)?;
+                // Paths here always end in an extension saving writes
+                write_image(&path, &pixels)?;
                 anyhow::Ok(Some(path))
             }
             .await;
@@ -308,7 +308,7 @@ impl PaintApp {
 }
 
 /// Reads the image file at `path`, if it fits on the canvas.
-fn read_image(path: &Path) -> anyhow::Result<Pixmap> {
+pub fn read_image(path: &Path) -> anyhow::Result<Pixmap> {
     let bytes = std::fs::read(path)?;
     let pixels = decode_image(&bytes).map_err(|_| {
         anyhow::anyhow!(
@@ -324,6 +324,19 @@ fn read_image(path: &Path) -> anyhow::Result<Pixmap> {
         );
     }
     Ok(pixels)
+}
+
+/// Writes `pixels` to `path` in the format its extension names, refusing
+/// extensions that saving does not write.
+pub fn write_image(path: &Path, pixels: &Pixmap) -> anyhow::Result<()> {
+    let format = save_format(path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} does not end in .png, .jpg, .jpeg, .bmp, .webp or .gif",
+            path.display()
+        )
+    })?;
+    std::fs::write(path, encode_image(pixels, format)?)?;
+    Ok(())
 }
 
 /// Decodes a PNG, JPEG, BMP, WebP or GIF image, taking a GIF's first frame.

@@ -5,6 +5,7 @@ use gpui_kit::component::{
     slider::{SliderEvent, SliderState, SliderValue},
 };
 use gpui_kit::*;
+use history::History;
 use pan::PanDrag;
 use pattern::{PATTERNS, Pattern};
 use selection::{SelectDrag, SelectShape, Selection};
@@ -21,6 +22,7 @@ use zoom::DEFAULT_ZOOM_INDEX;
 mod assets;
 mod canvas;
 mod file;
+mod history;
 mod mcp;
 mod pan;
 mod pattern;
@@ -71,8 +73,6 @@ const DEFAULT_CANVAS_SIZE: Size<Pixels> = Size {
 /// Largest canvas side in pixels. Undo steps that replace the whole canvas
 /// (clear, resize) keep a full copy of it, 64MB each at this size.
 const MAX_CANVAS_SIDE: u32 = 4096;
-/// Number of undo steps kept; older ones are dropped.
-const MAX_HISTORY: usize = 100;
 /// How close, in displayed pixels, a click must be to a polygon's first
 /// point to close it.
 const POLYGON_CLOSE_DISTANCE: f32 = 8.0;
@@ -153,8 +153,7 @@ struct ResizeDrag {
 struct PaintApp {
     tool: Tool,
     canvas: Canvas,
-    undo_stack: Vec<Change>,
-    redo_stack: Vec<Change>,
+    history: History,
     /// Displayed canvas size. Matches `canvas` except while a resize handle is dragged.
     canvas_size: Size<Pixels>,
     /// The stroke being drawn, not yet burned into `canvas`.
@@ -345,8 +344,7 @@ impl PaintApp {
 
         Self {
             canvas,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
+            history: History::default(),
             canvas_size: DEFAULT_CANVAS_SIZE,
             current_stroke: None,
             straight_from: None,
@@ -695,11 +693,7 @@ impl PaintApp {
 
     /// Records `undo`, the change that reverts an edit just made to the canvas.
     fn record(&mut self, undo: Change, cx: &mut Context<Self>) {
-        self.undo_stack.push(undo);
-        if self.undo_stack.len() > MAX_HISTORY {
-            self.undo_stack.remove(0);
-        }
-        self.redo_stack.clear();
+        self.history.record(undo);
         cx.notify();
     }
 
@@ -883,10 +877,9 @@ impl PaintApp {
         self.commit_text(cx);
         // Dropping floating pixels records their move, which this then undoes
         self.deselect(cx);
-        let Some(change) = self.undo_stack.pop() else {
+        if !self.history.undo(&mut self.canvas) {
             return;
-        };
-        self.redo_stack.push(self.canvas.apply(change));
+        }
         self.canvas_size = self.canvas.size();
         cx.notify();
     }
@@ -897,10 +890,9 @@ impl PaintApp {
         }
         self.commit_text(cx);
         self.deselect(cx);
-        let Some(change) = self.redo_stack.pop() else {
+        if !self.history.redo(&mut self.canvas) {
             return;
-        };
-        self.undo_stack.push(self.canvas.apply(change));
+        }
         self.canvas_size = self.canvas.size();
         cx.notify();
     }

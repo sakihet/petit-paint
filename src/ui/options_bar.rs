@@ -235,7 +235,7 @@ impl PaintApp {
                     .child(
                         icon_button("undo", IconName::Undo2)
                             .tooltip_with_action("Undo", &Undo, Some(KEY_CONTEXT))
-                            .disabled(self.undo_stack.is_empty())
+                            .disabled(!self.history.can_undo())
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.undo(&Undo, window, cx)),
                             ),
@@ -243,7 +243,7 @@ impl PaintApp {
                     .child(
                         icon_button("redo", IconName::Redo2)
                             .tooltip_with_action("Redo", &Redo, Some(KEY_CONTEXT))
-                            .disabled(self.redo_stack.is_empty())
+                            .disabled(!self.history.can_redo())
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.redo(&Redo, window, cx)),
                             ),
