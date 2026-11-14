@@ -15,6 +15,21 @@ pub enum Filter {
     /// four squares `radius` pixels across at its corners is most even, so
     /// smooth shading breaks into flat patches while edges stay sharp.
     Painterly { radius: u32 },
+    /// Colors shifted around the color wheel by `hue` degrees, then made
+    /// warmer (orange) or cooler (blue), more or less saturated, brighter or
+    /// darker, and of more or less contrast, each by an amount from -1 to 1
+    /// where 0 leaves them as they are.
+    Adjust(Adjustment),
+}
+
+/// How [`Filter::Adjust`] changes colors.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Adjustment {
+    pub hue: f32,
+    pub saturation: f32,
+    pub brightness: f32,
+    pub contrast: f32,
+    pub warmth: f32,
 }
 
 /// A premultiplied pixel with channels from 0 to 1.
@@ -32,6 +47,7 @@ pub fn apply(filter: Filter, pixels: &Pixmap, rect: IntRect) -> Vec<Rgba> {
         } => noise(pixels, rect, amount, color, seed),
         Filter::Blur { radius } => blur(pixels, rect, radius),
         Filter::Painterly { radius } => painterly(pixels, rect, radius as i32),
+        Filter::Adjust(adjustment) => adjust(pixels, rect, adjustment),
     }
 }
 
@@ -192,6 +208,72 @@ fn painterly(pixels: &Pixmap, rect: IntRect, radius: i32) -> Vec<Rgba> {
     out
 }
 
+fn adjust(pixels: &Pixmap, rect: IntRect, adjustment: Adjustment) -> Vec<Rgba> {
+    let Adjustment {
+        hue,
+        saturation,
+        brightness,
+        contrast,
+        warmth,
+    } = adjustment;
+    // Turning the hue around the gray axis, keeping brightness, as CSS's
+    // hue-rotate does
+    let (sin, cos) = hue.to_radians().sin_cos();
+    let turn = [
+        [
+            0.213 + cos * 0.787 - sin * 0.213,
+            0.715 - cos * 0.715 - sin * 0.715,
+            0.072 - cos * 0.072 + sin * 0.928,
+        ],
+        [
+            0.213 - cos * 0.213 + sin * 0.143,
+            0.715 + cos * 0.285 + sin * 0.140,
+            0.072 - cos * 0.072 - sin * 0.283,
+        ],
+        [
+            0.213 - cos * 0.213 - sin * 0.787,
+            0.715 - cos * 0.715 + sin * 0.715,
+            0.072 + cos * 0.928 + sin * 0.072,
+        ],
+    ];
+    // Full contrast pushes every color most of the way to black or white
+    let spread = if contrast >= 0.0 {
+        1.0 + contrast * 4.0
+    } else {
+        1.0 + contrast
+    };
+    let mut out = Vec::with_capacity((rect.width() * rect.height()) as usize);
+    for y in rect.top()..rect.bottom() {
+        for x in rect.left()..rect.right() {
+            let pixel = at(pixels, x, y);
+            let alpha = pixel[3];
+            if alpha == 0.0 {
+                out.push(pixel);
+                continue;
+            }
+            let mut c = [0, 1, 2].map(|channel| pixel[channel] / alpha);
+            c[0] += warmth * 0.15;
+            c[1] += warmth * 0.03;
+            c[2] -= warmth * 0.15;
+            if hue != 0.0 {
+                c = turn.map(|row| row[0] * c[0] + row[1] * c[1] + row[2] * c[2]);
+            }
+            let gray = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+            let adjusted = c.map(|c| {
+                let c = gray + (c - gray) * (1.0 + saturation);
+                let c = if brightness >= 0.0 {
+                    c + (1.0 - c) * brightness
+                } else {
+                    c * (1.0 + brightness)
+                };
+                ((c - 0.5) * spread + 0.5).clamp(0.0, 1.0) * alpha
+            });
+            out.push([adjusted[0], adjusted[1], adjusted[2], alpha]);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,6 +343,115 @@ mod tests {
         assert!(gray(9) < 0.01 && gray(10) > 0.99, "the edge stays sharp");
         // Every square holds the speck, but spread over the square
         assert!(gray(15) > 0.9, "the speck fades: {}", gray(15));
+    }
+
+    /// `rgb`, opaque, after `adjustment`.
+    fn adjusted(rgb: [u8; 3], adjustment: Adjustment) -> [u8; 3] {
+        let mut pixels = Pixmap::new(1, 1).unwrap();
+        pixels.pixels_mut()[0] =
+            tiny_skia::PremultipliedColorU8::from_rgba(rgb[0], rgb[1], rgb[2], 255).unwrap();
+        let out = apply(Filter::Adjust(adjustment), &pixels, whole(&pixels));
+        [0, 1, 2].map(|c| (out[0][c] * 255.0).round() as u8)
+    }
+
+    #[test]
+    fn adjusting_nothing_keeps_colors() {
+        assert_eq!(
+            adjusted([200, 100, 50], Adjustment::default()),
+            [200, 100, 50]
+        );
+    }
+
+    #[test]
+    fn adjusts_hue_saturation_brightness_contrast_and_warmth() {
+        let red = [200, 40, 40];
+        let turned = adjusted(
+            red,
+            Adjustment {
+                hue: 120.0,
+                ..Default::default()
+            },
+        );
+        assert!(turned[1] > turned[0] && turned[1] > turned[2], "{turned:?}");
+        let gray = adjusted(
+            red,
+            Adjustment {
+                saturation: -1.0,
+                ..Default::default()
+            },
+        );
+        assert!(gray[0] == gray[1] && gray[1] == gray[2], "{gray:?}");
+        let vivid = adjusted(
+            [150, 100, 100],
+            Adjustment {
+                saturation: 0.5,
+                ..Default::default()
+            },
+        );
+        assert!(vivid[0] > 150 && vivid[1] < 100, "{vivid:?}");
+        let brighter = adjusted(
+            red,
+            Adjustment {
+                brightness: 0.5,
+                ..Default::default()
+            },
+        );
+        assert_eq!(brighter, [228, 148, 148]);
+        let darker = adjusted(
+            red,
+            Adjustment {
+                brightness: -0.5,
+                ..Default::default()
+            },
+        );
+        assert_eq!(darker, [100, 20, 20]);
+        let flat = adjusted(
+            [255, 0, 128],
+            Adjustment {
+                contrast: -1.0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(flat, [128, 128, 128]);
+        let punchy = adjusted(
+            [160, 96, 128],
+            Adjustment {
+                contrast: 0.5,
+                ..Default::default()
+            },
+        );
+        assert!(punchy[0] > 200 && punchy[1] < 40, "{punchy:?}");
+        let warm = adjusted(
+            [128, 128, 128],
+            Adjustment {
+                warmth: 1.0,
+                ..Default::default()
+            },
+        );
+        assert!(warm[0] > 128 && warm[2] < 128, "{warm:?}");
+        let cool = adjusted(
+            [128, 128, 128],
+            Adjustment {
+                warmth: -1.0,
+                ..Default::default()
+            },
+        );
+        assert!(cool[0] < 128 && cool[2] > 128, "{cool:?}");
+    }
+
+    #[test]
+    fn adjusting_keeps_transparency() {
+        let mut pixels = Pixmap::new(2, 1).unwrap();
+        pixels.pixels_mut()[1] =
+            tiny_skia::PremultipliedColorU8::from_rgba(50, 25, 0, 128).unwrap();
+        let brighter = Adjustment {
+            brightness: 0.5,
+            ..Default::default()
+        };
+        let out = apply(Filter::Adjust(brighter), &pixels, whole(&pixels));
+        assert_eq!(out[0], [0.0; 4]);
+        assert_eq!(out[1][3], 128.0 / 255.0);
+        assert!(out[1].iter().all(|&c| c <= out[1][3]));
     }
 
     #[test]

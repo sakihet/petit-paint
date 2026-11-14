@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use crate::canvas::{
     Brush, Canvas, ClipMask, DEFAULT_FILL_TOLERANCE, Fill, Orientation, PixelRect,
 };
-use crate::filter::Filter;
+use crate::filter::{Adjustment, Filter};
 use crate::pattern::{PATTERNS, Pattern};
 use crate::stroke::{ArcKind, Gradient, Stroke, roughen, smooth};
 use crate::text::{FontChoice, TextRenderer};
@@ -1230,6 +1230,55 @@ impl FilterParams {
 
 #[derive(Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
+struct AdjustParams {
+    /// The image's id.
+    image: u32,
+    /// Turns every color around the color wheel, in degrees from -180 to 180: 120
+    /// turns red to green, and green to blue.
+    hue: Option<f32>,
+    /// From -100, gray, to 100, twice as vivid.
+    saturation: Option<f32>,
+    /// From -100, black, to 100, white.
+    brightness: Option<f32>,
+    /// From -100, flat gray, to 100, almost only black and white.
+    contrast: Option<f32>,
+    /// From -100, cool and blue, to 100, warm and orange, as for evening light.
+    warmth: Option<f32>,
+    /// Where to adjust, leaving the rest of the image as it is: two opposite corners
+    /// of a rectangle as [x, y] pairs, or a mask, which can be a shape or the region
+    /// around a pixel. The whole image when left out.
+    clip: Option<ClipSpec>,
+}
+
+impl AdjustParams {
+    fn build(&self) -> Result<Adjustment> {
+        let percent = |name: &str, value: Option<f32>| -> Result<f32> {
+            let value = value.unwrap_or(0.0);
+            if !(-100.0..=100.0).contains(&value) {
+                bail!("{name} must be between -100 and 100, not {value}");
+            }
+            Ok(value / 100.0)
+        };
+        let hue = self.hue.unwrap_or(0.0);
+        if !(-180.0..=180.0).contains(&hue) {
+            bail!("hue must be between -180 and 180, not {hue}");
+        }
+        let adjustment = Adjustment {
+            hue,
+            saturation: percent("saturation", self.saturation)?,
+            brightness: percent("brightness", self.brightness)?,
+            contrast: percent("contrast", self.contrast)?,
+            warmth: percent("warmth", self.warmth)?,
+        };
+        if adjustment == Adjustment::default() {
+            bail!("give at least one of hue, saturation, brightness, contrast and warmth");
+        }
+        Ok(adjustment)
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 struct FillParams {
     /// The image's id.
     image: u32,
@@ -1629,22 +1678,21 @@ impl PaintServer {
         let mut images = self.images();
         let image = images.get_mut(params.image).map_err(message)?;
         let filter = params.build(image.next_seed()).map_err(message)?;
-        let masks = Masks {
-            canvas: &image.canvas,
-            named: &BTreeMap::new(),
-            naming: false,
-        };
-        let (clip, mask) = match &params.clip {
-            None => (None, None),
-            Some(ClipSpec::Rectangle(rect)) => (Some(to_rect(*rect).map_err(message)?), None),
-            Some(ClipSpec::Mask(mask)) => (None, Some(mask.build(&masks).map_err(message)?)),
-        };
-        let undo = image
-            .canvas
-            .filter(filter, clip, mask.as_deref())
-            .ok_or_else(|| outside(image.size()))?;
-        image.history.record(undo);
+        apply_filter(image, filter, params.clip.as_ref())?;
         Ok(format!("Filtered image {}", params.image))
+    }
+
+    #[tool(
+        description = "Adjust the colors of an image, or of part of it: turn the hue, change \
+        saturation, brightness and contrast, or make it warmer or cooler. Use it to set the \
+        mood of a finished picture, or to tint the shadows or light inside a mask."
+    )]
+    fn adjust(&self, Parameters(params): Parameters<AdjustParams>) -> Result<String, String> {
+        let mut images = self.images();
+        let image = images.get_mut(params.image).map_err(message)?;
+        let adjustment = params.build().map_err(message)?;
+        apply_filter(image, Filter::Adjust(adjustment), params.clip.as_ref())?;
+        Ok(format!("Adjusted image {}", params.image))
     }
 
     #[tool(description = "Write text on an image.")]
@@ -1922,6 +1970,31 @@ fn check_inside(image: &images::Image, x: f32, y: f32) -> Result<()> {
             size.height
         );
     }
+    Ok(())
+}
+
+/// Applies `filter` to `image` inside `clip`, or to the whole image, as one
+/// undo step.
+fn apply_filter(
+    image: &mut images::Image,
+    filter: Filter,
+    clip: Option<&ClipSpec>,
+) -> Result<(), String> {
+    let masks = Masks {
+        canvas: &image.canvas,
+        named: &BTreeMap::new(),
+        naming: false,
+    };
+    let (clip, mask) = match clip {
+        None => (None, None),
+        Some(ClipSpec::Rectangle(rect)) => (Some(to_rect(*rect).map_err(message)?), None),
+        Some(ClipSpec::Mask(mask)) => (None, Some(mask.build(&masks).map_err(message)?)),
+    };
+    let undo = image
+        .canvas
+        .filter(filter, clip, mask.as_deref())
+        .ok_or_else(|| outside(image.size()))?;
+    image.history.record(undo);
     Ok(())
 }
 
@@ -2653,6 +2726,62 @@ mod tests {
         ];
         for (params, error) in wrong {
             assert_eq!(filter(&server, params).unwrap_err(), error);
+        }
+    }
+
+    fn adjust(server: &PaintServer, params: rmcp::serde_json::Value) -> Result<String, String> {
+        let mut params = params;
+        params["image"] = 1.into();
+        server.adjust(Parameters(rmcp::serde_json::from_value(params).unwrap()))
+    }
+
+    #[test]
+    fn adjusts_colors_inside_a_mask_and_undoes_it() {
+        let server = server();
+        let red = ShapeSpec {
+            fill: Some("#c83232".into()),
+            ..shape(ShapeName::Rectangle, &[[0.0, 0.0], [100.0, 100.0]])
+        };
+        draw_shape(&server, red).unwrap();
+        let clip = rmcp::serde_json::json!({"shape": "rectangle", "points": [[0, 0], [100, 50]]});
+        adjust(
+            &server,
+            rmcp::serde_json::json!({"saturation": -100, "clip": clip}),
+        )
+        .unwrap();
+        let gray = rgb_at(&server, 50, 20);
+        assert!(gray.0 == gray.1 && gray.1 == gray.2, "{gray:?}");
+        assert_eq!(rgb_at(&server, 50, 80), (200, 50, 50));
+        server.undo(image(1)).unwrap();
+        assert_eq!(rgb_at(&server, 50, 20), (200, 50, 50));
+        adjust(&server, rmcp::serde_json::json!({"warmth": -100})).unwrap();
+        let cool = rgb_at(&server, 50, 80);
+        assert!(cool.0 < 200 && cool.2 > 50, "{cool:?}");
+    }
+
+    #[test]
+    fn refuses_adjustments_out_of_range_or_missing() {
+        let server = server();
+        let wrong = [
+            (
+                rmcp::serde_json::json!({}),
+                "give at least one of hue, saturation, brightness, contrast and warmth",
+            ),
+            (
+                rmcp::serde_json::json!({"hue": 200}),
+                "hue must be between -180 and 180, not 200",
+            ),
+            (
+                rmcp::serde_json::json!({"contrast": -150}),
+                "contrast must be between -100 and 100, not -150",
+            ),
+            (
+                rmcp::serde_json::json!({"brightness": 10, "clip": [[200, 200], [300, 300]]}),
+                "nothing was changed, as it lies entirely outside the 100×100 image",
+            ),
+        ];
+        for (params, error) in wrong {
+            assert_eq!(adjust(&server, params).unwrap_err(), error);
         }
     }
 
