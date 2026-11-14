@@ -1,3 +1,57 @@
+## [0.3.0] - 2026-11-14
+
+### 🚀 Features
+
+- Add crayon and natural pencil brushes
+- Add pattern fills to the fill tool
+- Preview fill patterns at the canvas zoom
+- Keep brush strokes straight while shift is held
+- Add free-form selection
+- Add an mcp subcommand that serves over stdio
+- Add mcp tools to create, open, save and view images
+- Add mcp tools to draw strokes and shapes
+- Add an mcp draw tool for many strokes and shapes at once
+- Add mcp tools to fill, write text, and edit and read images
+- Add smooth curves, rounded rectangles and arcs to mcp shapes
+- Blend and clip mcp strokes and shapes
+- Fill mcp shapes with gradients
+- Let view_image show part of an image scaled up
+- Clip mcp strokes and shapes to shape and region masks
+- Combine mcp masks with all and any
+- Add an oil paint brush
+- Add an mcp filter tool for noise, blur and painterly patches
+- Taper mcp strokes and vary their width with pressure
+- Roughen mcp strokes and shapes
+- Jitter the colors of mcp strokes and shapes
+- Add a smudge brush to the mcp server
+- Add an mcp hatch tool
+- Add a watercolor brush
+- Add an mcp adjust tool for hue, saturation, brightness, contrast and warmth
+
+### 🐛 Bug Fixes
+
+- Name the file when an image cannot be read or written
+
+### 📚 Documentation
+
+- Describe the mcp server in the readme
+- Describe the richer mcp drawing options
+- Describe masks in the readme
+- Describe combining masks in the readme
+- Describe the hand-drawn tools in the readme
+- Describe the watercolor brush and the adjust tool
+- Describe the v0.3 brushes, patterns, selection and shift in the readme
+- Update the screenshot
+
+### 🚜 Refactor
+
+- Build strokes, shapes and text without a window
+- Share undo history and image file io outside the window
+- Share the font size range and fill tolerance with the mcp server
+
+### 🧪 Testing
+
+- Run the mcp server over stdio in an integration test
 ## [0.2.0] - 2026-11-10
 
 ### 🚀 Features
