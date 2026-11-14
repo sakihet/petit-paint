@@ -118,6 +118,10 @@ enum BrushName {
     /// A flat bristle brush loaded with oil paint: streaky, running dry along a long
     /// stroke, and mixing with the wet paint under it.
     Oil,
+    /// A wash of watercolor: translucent, bleeding unevenly past the brush, drying to a
+    /// darker rim and grainy where the pigment settles into the paper. Washes laid over
+    /// each other deepen like glazes.
+    Watercolor,
     /// Drags the colors already on the image along the line, like a finger through wet
     /// paint, to blend edges and soften shading. It takes no color.
     Smudge,
@@ -134,6 +138,7 @@ impl From<BrushName> for Brush {
             BrushName::Airbrush => Brush::Airbrush,
             BrushName::Calligraphy => Brush::Calligraphy,
             BrushName::Oil => Brush::Oil,
+            BrushName::Watercolor => Brush::Watercolor,
             BrushName::Smudge => Brush::Smudge,
         }
     }

@@ -24,6 +24,7 @@ icon_assets!(
         SprayCan,
         PenTool,
         Palette,
+        Droplet,
         Slash,
         Square,
         Circle,

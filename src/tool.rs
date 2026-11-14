@@ -129,6 +129,7 @@ pub fn brush_icon(brush: Brush) -> IconName {
         Brush::Airbrush => IconName::SprayCan,
         Brush::Calligraphy => IconName::PenTool,
         Brush::Oil => IconName::Palette,
+        Brush::Watercolor => IconName::Droplet,
         Brush::Smudge => IconName::Brush,
     }
 }

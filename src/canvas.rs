@@ -265,13 +265,16 @@ pub enum Brush {
     /// A flat bristle brush loaded with oil paint, which streaks, runs dry
     /// and mixes with the wet paint under it.
     Oil,
+    /// A wash of watercolor that bleeds past the brush unevenly, dries to a
+    /// darker rim and settles into the paper's grain.
+    Watercolor,
     /// Drags the colors already on the canvas along the line, blending
     /// them, like a finger through wet paint. Not in the toolbar yet.
     Smudge,
 }
 
 /// Brushes in toolbar order.
-pub const BRUSHES: [Brush; 8] = [
+pub const BRUSHES: [Brush; 9] = [
     Brush::Pen,
     Brush::Pencil,
     Brush::NaturalPencil,
@@ -280,6 +283,7 @@ pub const BRUSHES: [Brush; 8] = [
     Brush::Airbrush,
     Brush::Calligraphy,
     Brush::Oil,
+    Brush::Watercolor,
 ];
 
 impl Brush {
@@ -293,6 +297,7 @@ impl Brush {
             Brush::Airbrush => "Airbrush",
             Brush::Calligraphy => "Calligraphy",
             Brush::Oil => "Oil paint",
+            Brush::Watercolor => "Watercolor",
             Brush::Smudge => "Smudge",
         }
     }
@@ -538,6 +543,13 @@ impl Canvas {
             Brush::Airbrush => spray(&mut pixels, stroke, opaque, transform),
             Brush::Calligraphy => draw_nib(&mut pixels, stroke, opaque, transform),
             Brush::Oil => paint_oil(&mut pixels, stroke, opaque, transform),
+            Brush::Watercolor => paint_watercolor(
+                &mut pixels,
+                stroke,
+                opaque,
+                transform,
+                Point::new(rect.x(), rect.y()),
+            ),
             Brush::Smudge => smudge(&mut pixels, stroke, &self.pixmap, rect),
         }
         if matches!(stroke.brush, Brush::NaturalPencil | Brush::Crayon) {
@@ -1267,6 +1279,7 @@ impl Canvas {
         let reach = match stroke.brush {
             Brush::Airbrush => width,
             Brush::Calligraphy => width / 2.0,
+            Brush::Watercolor => width / 2.0 + watercolor_bleed(width) * 1.5,
             _ if stroke.sharp_corners => width * 2.0,
             _ => width / 2.0,
         } + 2.0;
@@ -1790,6 +1803,69 @@ impl<'a> Pressure<'a> {
             1.0
         };
         self.pressure[next - 1] + (self.pressure[next] - self.pressure[next - 1]) * t
+    }
+}
+
+/// How far watercolor of `width` bleeds past the brush's edge.
+fn watercolor_bleed(width: f32) -> f32 {
+    (width / 4.0).clamp(1.5, 12.0)
+}
+
+/// Lays a wash of watercolor along the line, in `pixels` whose top-left is
+/// at `at` on the canvas. The paint spreads past the brush's edge, further
+/// in some places than others, pools into a darker rim where it dries, and
+/// settles into the paper's grain, which stays put from stroke to stroke.
+fn paint_watercolor(
+    pixels: &mut Pixmap,
+    stroke: &Stroke,
+    color: Color,
+    transform: Transform,
+    at: Point<i32>,
+) {
+    let width = stroke.width.as_f32().max(1.0);
+    let bleed = watercolor_bleed(width);
+    let Some(mut brush) = Pixmap::new(pixels.width(), pixels.height()) else {
+        return;
+    };
+    draw_line(&mut brush, stroke, Color::BLACK, transform);
+    let whole =
+        IntRect::from_xywh(0, 0, brush.width(), brush.height()).expect("a pixmap is never empty");
+    let spread = filter::apply(Filter::Blur { radius: bleed }, &brush, whole);
+    // How large the wet edge's wobbles and the wash's blotches are
+    let size = (width * 0.6).clamp(4.0, 24.0);
+    let layer = stroke.seed.wrapping_mul(8);
+    // A thin line wobbles less, so it does not break apart
+    let calm = (width / 20.0).clamp(0.3, 1.0);
+    let columns = pixels.width() as i32;
+    for (i, pixel) in pixels.pixels_mut().iter_mut().enumerate() {
+        let wet = spread[i][3];
+        if wet < 0.05 {
+            continue;
+        }
+        let (x, y) = (at.x + i as i32 % columns, at.y + i as i32 / columns);
+        let (fx, fy) = (x as f32 / size, y as f32 / size);
+        // The edge runs where the wobbling wetness crosses this
+        const EDGE: f32 = 0.4;
+        let wobble = (0.6 * (blotches(fx, fy, layer) - 0.5)
+            + 0.25 * (blotches(fx * 3.0, fy * 3.0, layer + 1) - 0.5))
+            * calm;
+        let wetness = wet + wobble;
+        let inside = ((wetness - EDGE) / 0.06).clamp(0.0, 1.0);
+        if inside == 0.0 {
+            continue;
+        }
+        // Pigment carried to the edge as the water dries
+        let rim = (1.0 - (wetness - EDGE) / 0.3).clamp(0.0, 1.0);
+        let rim = rim * rim;
+        // Thicker and thinner patches across the wash
+        let wash = 0.85 + 0.3 * blotches(fx / 2.0, fy / 2.0, layer + 2);
+        // Pigment settles in the paper's pits
+        let grain = 0.5 * noise(x, y, 2) + 0.5 * noise(x.div_euclid(2), y.div_euclid(2), 3);
+        let granulation = 0.7 + 0.5 * grain;
+        let density = ((0.35 + 0.55 * rim) * wash * granulation).min(1.0);
+        let paint = shade(color, -0.2 * rim).to_color_u8();
+        let alpha = (inside * density * 255.0).round() as u8;
+        *pixel = ColorU8::from_rgba(paint.red(), paint.green(), paint.blue(), alpha).premultiply();
     }
 }
 
@@ -2508,6 +2584,62 @@ mod tests {
         let mut canvas = canvas(60, 60);
         canvas.draw_stroke(&oil(&[(30.0, 30.0)], 0x000000, 20.0));
         assert!(inked(&canvas, 30, 30) > 150);
+    }
+
+    fn watercolor(points: &[(f32, f32)], color: u32, width: f32) -> Stroke {
+        Stroke {
+            brush: Brush::Watercolor,
+            seed: 7,
+            ..stroke(points, color, width)
+        }
+    }
+
+    #[test]
+    fn watercolor_is_translucent_with_a_darker_rim() {
+        let mut canvas = canvas(200, 80);
+        canvas.draw_stroke(&watercolor(&[(20.0, 40.0), (180.0, 40.0)], 0x000000, 30.0));
+        // Averaged along the stroke, so the grain and blotches even out
+        let along =
+            |y: u32| -> u32 { (40..160).map(|x| inked(&canvas, x, y) as u32).sum::<u32>() / 120 };
+        let middle = along(40);
+        assert!((60..200).contains(&middle), "{middle}");
+        let rim = (22..34).chain(47..59).map(along).max().unwrap();
+        assert!(rim > middle + 15, "rim {rim}, middle {middle}");
+        assert_eq!(inked(&canvas, 100, 2), 0);
+    }
+
+    #[test]
+    fn watercolor_edges_bleed_unevenly() {
+        let mut canvas = canvas(300, 80);
+        canvas.draw_stroke(&watercolor(&[(20.0, 40.0), (280.0, 40.0)], 0x000000, 30.0));
+        // Where the wash ends above the line, column by column
+        let edges: Vec<u32> = (40..260)
+            .map(|x| (0..40).find(|&y| inked(&canvas, x, y) > 0).unwrap_or(40))
+            .collect();
+        let (low, high) = (edges.iter().min().unwrap(), edges.iter().max().unwrap());
+        assert!(high - low >= 3, "{edges:?}");
+    }
+
+    #[test]
+    fn watercolor_granulates() {
+        let mut canvas = canvas(200, 80);
+        canvas.draw_stroke(&watercolor(&[(20.0, 40.0), (180.0, 40.0)], 0x000000, 30.0));
+        // Neighboring pixels in the middle of the wash differ
+        let steps = (60..140)
+            .filter(|&x| inked(&canvas, x, 40).abs_diff(inked(&canvas, x + 1, 40)) > 8)
+            .count();
+        assert!(steps > 10, "{steps}");
+    }
+
+    #[test]
+    fn watercolor_washes_deepen_where_they_overlap() {
+        let mut canvas = canvas(200, 80);
+        let wash = watercolor(&[(20.0, 40.0), (180.0, 40.0)], 0x3366cc, 30.0);
+        canvas.draw_stroke(&wash);
+        let once = rgb_at(&canvas, 100, 40);
+        canvas.draw_stroke(&wash);
+        let twice = rgb_at(&canvas, 100, 40);
+        assert!(twice.0 < once.0 && twice.1 < once.1, "{once:?} {twice:?}");
     }
 
     #[test]
