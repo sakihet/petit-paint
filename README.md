@@ -9,6 +9,9 @@ It has only been tested on macOS.
 ## Features
 
 - Tools: select, brush, eraser, eyedropper, fill, shape, text
+- Brushes: pen, pencil, natural pencil, crayon, marker, airbrush, calligraphy, oil paint and watercolor
+- Fill with a color or an 8x8 pattern
+- Rectangle and free-form selection
 - Undo and redo
 - Copy, cut, paste and crop to selections
 - Zoom
@@ -38,6 +41,9 @@ On Windows and Linux, use `Ctrl` in place of `Cmd`.
 | Crop to selection | `Cmd+Shift+X` |
 | Deselect | `Esc` |
 | Finish polygon | `Enter` |
+| Straight brush or eraser line, at 45° steps | Drag with `Shift` held |
+| Square, circle, or line and polygon edges at 45° steps | Drag a shape with `Shift` held |
+| Straight edge in a free-form selection | Drag with `Shift` held |
 | Zoom in / out | `Cmd+=` / `Cmd+-` |
 | Reset zoom | `Cmd+0` |
 | Pan | Drag with `Space` held |
@@ -61,7 +67,7 @@ claude mcp add petit-paint -- petit-paint mcp
 
 Then start Claude Code again and ask it to draw, for example "Draw a sunset over the sea with petit-paint and save it as sunset.png". Relative paths are taken from the directory Claude Code runs in.
 
-Images are kept in memory by id until they are saved. Coordinates are in image pixels from the top-left, and colors are `#rrggbb` or `#rrggbbaa`.
+Images are kept in memory by id until they are saved. They are separate from any open app window, which the MCP server does not draw into. Coordinates are in image pixels from the top-left, and colors are `#rrggbb` or `#rrggbbaa`.
 
 | Tool | What it does |
 | --- | --- |
@@ -84,7 +90,7 @@ Images are kept in memory by id until they are saved. Coordinates are in image p
 
 Shapes can be filled with linear or radial gradients and rectangles can have rounded corners. Strokes and polygons can be drawn as smooth curves through their points. Any stroke or shape can be blended with what is under it (normal, add, screen or multiply) and clipped: to a rectangle, to a shape, or to the region around a pixel that has about the same color, keeping inside or outside it with soft edges. Masks combine with `all` and `any`, so one can be cut out of another, as for a crescent moon. `draw` can name masks once for many of its items to use.
 
-To look drawn by hand: strokes can taper toward their ends and swell and thin with pressure at each point, outlines can be roughened, colors jittered from place to place, and edges blended with the smudge brush, which drags the colors already there. The watercolor brush lays translucent washes that bleed at their edges, dry to a darker rim and settle into the paper's grain.
+To look drawn by hand: strokes can taper toward their ends and swell and thin with pressure at each point, outlines can be roughened, colors jittered from place to place, and edges blended with the smudge brush (MCP only), which drags the colors already there. The watercolor brush lays translucent washes that bleed at their edges, dry to a darker rim and settle into the paper's grain.
 
 ## License
 
